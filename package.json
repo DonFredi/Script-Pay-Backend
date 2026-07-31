@@ -1,0 +1,48 @@
+{
+  "name": "scriptpay-backend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "nest build",
+    "start": "nest start",
+    "start:dev": "nest start --watch",
+    "start:prod": "node dist/main",
+    "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",
+    "test": "jest",
+    "test:e2e": "jest --config ./test/jest-e2e.json",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev"
+  },
+  "dependencies": {
+    "@nestjs/bullmq": "^11.0.0",
+    "@nestjs/common": "^11.0.0",
+    "@nestjs/config": "^4.0.0",
+    "@nestjs/core": "^11.0.0",
+    "@nestjs/platform-express": "^11.0.0",
+    "@nestjs/schedule": "^5.0.0",
+    "@nestjs/throttler": "^6.0.0",
+    "@prisma/client": "^6.0.0",
+    "@sentry/node": "^8.0.0",
+    "argon2": "^0.41.0",
+    "bullmq": "^5.0.0",
+    "cookie-parser": "^1.4.6",
+    "jose": "^5.9.0",
+    "nanoid": "^5.0.0",
+    "nestjs-pino": "^4.0.0",
+    "pino": "^9.0.0",
+    "reflect-metadata": "^0.2.0",
+    "resend": "^4.0.0",
+    "rxjs": "^7.8.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^11.0.24",
+    "@nestjs/testing": "^11.0.0",
+    "@types/cookie-parser": "^1.4.7",
+    "@types/node": "^20.0.0",
+    "jest": "^29.0.0",
+    "prisma": "^6.0.0",
+    "ts-jest": "^29.0.0",
+    "typescript": "^5.0.0"
+  }
+}

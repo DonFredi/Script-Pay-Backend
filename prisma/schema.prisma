@@ -1,0 +1,270 @@
+// ScriptPay — Core data model
+// Design principles:
+// - Every tenant-scoped table carries tenant_id and is protected by Postgres RLS (see migration notes at bottom).
+// - Transactions are append-only where possible; state changes are recorded, not overwritten in place, to preserve an audit trail.
+// - Money is stored as integer minor units (cents) to avoid floating point errors — never Float/Decimal-as-JS-number.
+// - WebhookEvent is the idempotency guard: every inbound Daraja callback is recorded by its natural key BEFORE processing.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  SUPER_ADMIN   // ScriptPay staff
+  TENANT_ADMIN  // owns a tenant account
+  TENANT_STAFF  // scoped access within a tenant
+}
+
+enum TransactionChannel {
+  STK_PUSH
+  PAYBILL
+  TILL
+}
+
+enum TransactionStatus {
+  PENDING
+  PROCESSING
+  SETTLED
+  FAILED
+  REVERSED
+}
+
+enum ApiKeyScope {
+  PAYMENTS_INITIATE
+  PAYMENTS_READ
+  RECONCILIATION_READ
+  WEBHOOKS_MANAGE
+}
+
+// Immutable-by-convention record of every sensitive action: admin actions
+// (tenant creation, key issuance/revocation) AND every M-Pesa interaction
+// (outbound Daraja calls, not just inbound callbacks — WebhookEvent covers those).
+// Never updated or deleted by application code — an audit trail that can be
+// edited after the fact isn't an audit trail.
+model AuditLog {
+  id         String   @id @default(uuid())
+  tenantId   String?
+  actorType  String   // "user" | "api_key" | "system"
+  actorId    String?  // User.id, ApiKey.id, or null for system-initiated actions
+  action     String   // e.g. "tenant.created", "api_key.revoked", "daraja.stk_push_initiated", "daraja.stk_push_failed"
+  targetType String?  // e.g. "Transaction", "ApiKey", "Tenant"
+  targetId   String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+  @@index([action, createdAt])
+  @@map("audit_logs")
+}
+
+model Tenant {
+  id                String        @id @default(uuid())
+  name              String
+  businessShortcode String        // Paybill/Till number
+  status            String        @default("active") // active | suspended | pending_kyc
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+
+// Encrypted at rest — never stored in plaintext. Format: "iv:authTag:ciphertext"
+  // (all hex), self-contained in one column. Consumer Key isn't secret enough to
+  // need encryption (Safaricom docs treat it like a client ID), but Consumer
+  // Secret and Passkey genuinely are.
+  mpesaConsumerKey           String?
+  mpesaConsumerSecretEncrypted String?
+  mpesaPasskeyEncrypted        String?
+  mpesaCredentialsConfiguredAt DateTime?
+
+
+  users             User[]
+  apiKeys           ApiKey[]
+  transactions      Transaction[]
+  ledgerEntries     LedgerEntry[]
+  webhookEvents     WebhookEvent[]
+  reconciliations   ReconciliationRecord[]
+
+  @@map("tenants")
+}
+
+model User {
+  id            String   @id @default(uuid())
+  username      String?
+  email         String   @unique
+  // argon2id hash — Firebase previously owned password storage; now this backend
+  // does, directly. Never store or log the plaintext password anywhere else.
+  passwordHash  String
+  emailVerified Boolean  @default(false)
+  role          Role
+  tenantId      String?  // null for SUPER_ADMIN, and null for a user who hasn't completed onboarding yet
+  tenant        Tenant?  @relation(fields: [tenantId], references: [id])
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  refreshTokens           RefreshToken[]
+  emailVerificationTokens EmailVerificationToken[]
+  passwordResetTokens     PasswordResetToken[]
+
+  @@index([tenantId])
+  @@map("users")
+}
+
+// Single-use, hashed, short-lived tokens for the "click a link in an email" flows.
+// Same design as RefreshToken/ApiKey: only a hash is ever persisted, and a used
+// token can never be replayed.
+model EmailVerificationToken {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id])
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  usedAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+  @@map("email_verification_tokens")
+}
+
+model PasswordResetToken {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id])
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  usedAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+// Backend-issued session tokens — this is what actually gates API access, NOT the
+// Firebase ID token, which is only ever verified once (at /auth/login or /auth/signup)
+// to prove identity before we mint our own tokens. Storing refresh tokens (hashed,
+// never plaintext) lets us revoke a single session, detect reuse of an already-rotated
+// token (a strong signal of theft), and control session lifetime independent of Firebase.
+model RefreshToken {
+  id              String        @id @default(uuid())
+  userId          String
+  user            User          @relation(fields: [userId], references: [id])
+  // SHA-256, not argon2/bcrypt: this is a high-entropy random token, not a low-entropy
+  // password — a fast hash is the correct tool here, since brute-forcing a 256-bit
+  // random value is infeasible regardless of hash speed, and slow hashing would just
+  // waste CPU on every refresh request for zero additional security.
+  tokenHash       String        @unique
+  expiresAt       DateTime
+  revokedAt       DateTime?
+  // Rotation chain: when a token is used, it's revoked and replaced by a new one.
+  // If a REVOKED token is ever presented again, that's a reuse signal — the entire
+  // chain (and ideally the user's other active sessions) should be revoked in response.
+  replacedByTokenId String?     @unique
+  createdAt       DateTime      @default(now())
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model ApiKey {
+  id          String        @id @default(uuid())
+  tenantId    String
+  tenant      Tenant        @relation(fields: [tenantId], references: [id])
+  // Store only a hash, never the raw key, following the same principle as password storage.
+  keyHash     String        @unique
+  keyPrefix   String        // first 8 chars, shown in dashboards for identification
+  scopes      ApiKeyScope[]
+  lastUsedAt  DateTime?
+  revokedAt   DateTime?
+  expiresAt   DateTime?
+  createdAt   DateTime      @default(now())
+
+  @@index([tenantId])
+  @@map("api_keys")
+}
+
+model Transaction {
+  id                  String              @id @default(uuid())
+  tenantId            String
+  tenant              Tenant              @relation(fields: [tenantId], references: [id])
+  channel             TransactionChannel
+  status              TransactionStatus   @default(PENDING)
+  amountMinorUnits     Int                 // KES cents — never a float
+  currency            String              @default("KES")
+  msisdn              String              // payer phone number
+  merchantRequestId   String?             // Daraja STK Push identifier
+  checkoutRequestId   String?             @unique // Daraja STK Push identifier — natural idempotency key
+  mpesaReceiptNumber  String?             @unique // populated once settled
+  failureReason       String?
+  metadata            Json?               // arbitrary tenant-supplied reference data
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  ledgerEntries       LedgerEntry[]
+  reconciliation      ReconciliationRecord?
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, status])
+  @@map("transactions")
+}
+
+// Double-entry style ledger: every settled transaction produces balanced entries.
+// This is what makes "tenant balance" a computed, auditable value instead of a mutable hot counter.
+model LedgerEntry {
+  id            String   @id @default(uuid())
+  tenantId      String
+  tenant        Tenant   @relation(fields: [tenantId], references: [id])
+  transactionId String
+  transaction   Transaction @relation(fields: [transactionId], references: [id])
+  account       String   // e.g. "tenant_balance", "platform_fees", "pending_settlement"
+  direction     String   // "debit" | "credit"
+  amountMinorUnits Int
+  createdAt     DateTime @default(now())
+
+  @@index([tenantId, account])
+  @@map("ledger_entries")
+}
+
+// Idempotency guard for inbound webhooks. Insert-first, process-second.
+// Unique constraint on the natural key means a duplicate Daraja retry fails the insert, not the business logic.
+model WebhookEvent {
+  id                String   @id @default(uuid())
+  tenantId          String?
+  tenant            Tenant?  @relation(fields: [tenantId], references: [id])
+  source            String   // "daraja_stk_callback" | "daraja_c2b_confirmation" | ...
+  naturalKey        String   // e.g. CheckoutRequestID or TransactionID from Safaricom
+  payload           Json
+  processedAt       DateTime?
+  processingError   String?
+  attempts          Int      @default(0)
+  receivedAt        DateTime @default(now())
+
+  @@unique([source, naturalKey])
+  @@map("webhook_events")
+}
+
+// One row per transaction per reconciliation pass — records what we expected vs what Safaricom confirmed.
+model ReconciliationRecord {
+  id              String   @id @default(uuid())
+  tenantId        String
+  tenant          Tenant   @relation(fields: [tenantId], references: [id])
+  transactionId   String   @unique
+  transaction     Transaction @relation(fields: [transactionId], references: [id])
+  expectedAmount  Int
+  confirmedAmount Int?
+  driftDetected   Boolean  @default(false)
+  reconciledAt    DateTime?
+  createdAt       DateTime @default(now())
+
+  @@index([tenantId, driftDetected])
+  @@map("reconciliation_records")
+}
+
+// --- Row-Level Security (apply via a raw SQL migration, Prisma doesn't manage RLS directly) ---
+// ALTER TABLE transactions ENABLE ROW LEVEL SECURITY;
+// CREATE POLICY tenant_isolation ON transactions
+//   USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+// -- Repeat per tenant-scoped table. The app sets `app.current_tenant_id` per request/session.
+// -- This is a SECOND layer of isolation on top of application-level tenantId filtering — defense in depth.
