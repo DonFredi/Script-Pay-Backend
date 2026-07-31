@@ -29,7 +29,7 @@ export class ApiKeysService {
    * an 8-char prefix (for UI identification) are persisted.
    */
   async create(tenantId: string, scopes: ApiKeyScope[], actorId: string, expiresAt?: Date) {
-    const rawKey = `sp_${generateKeyBody()}`;
+    const rawKey = `sp_${randomBytes(40).toString("hex")}`;
     const keyHash = await argon2.hash(rawKey + PEPPER);
 
     const record = await this.prisma.apiKey.create({
