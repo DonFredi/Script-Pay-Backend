@@ -35,18 +35,17 @@ export const envSchema = z.object({
   JWT_ACCESS_TTL_SECONDS: z.coerce.number().default(900), // 15 minutes
   JWT_REFRESH_TTL_DAYS: z.coerce.number().default(30),
 
-  RESEND_API_KEY: z.string().min(1),
-  EMAIL_FROM: z.string().email(),
   EMAIL_VERIFICATION_TTL_HOURS: z.coerce.number().default(24),
   PASSWORD_RESET_TTL_MINUTES: z.coerce.number().default(30),
+  RESEND_API_KEY: optionalString(),
+  EMAIL_FROM: optionalString(),
 
-  FRONTEND_ORIGIN: z.string().url(), // for CORS + building email links (verify-email, reset-password)
+  FRONTEND_ORIGIN: optionalUrl(),
 
-  REDIS_URL: z.string().url(), // backs the BullMQ queue used for webhook processing + reconciliation jobs
+  REDIS_URL: optionalUrl(),
 
   SENTRY_DSN: optionalUrl(),
   SLACK_WEBHOOK_URL: optionalUrl(),
-  CREDENTIALS_ENCRYPTION_KEY: z.string().min(1),
 });
 
 export type Env = z.infer<typeof envSchema>;
