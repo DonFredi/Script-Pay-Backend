@@ -8,7 +8,7 @@ import { randomBytes } from "crypto";
 
 // Unambiguous alphabet (no 0/O, 1/I/l) — these keys get read aloud/copy-pasted by humans.
 // const generateKeyBody = customAlphabet("23456789ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz", 40);
-const generateKeyBody = randomBytes(40).toString("hex");
+const rawKey = `sp_${randomBytes(40).toString("hex")}`;
 
 // A pepper is a second secret, held only in application config (never in the DB),
 // mixed in before hashing. A stolen DATABASE backup alone is then insufficient to
