@@ -1,12 +1,14 @@
 import { Injectable } from "@nestjs/common";
 import * as argon2 from "argon2";
-import { customAlphabet } from "nanoid";
+// import { customAlphabet } from "nanoid";
 import { PrismaService } from "../prisma/prisma.service";
 import { AuditLogService } from "../audit-log/audit-log.service";
 import type { ApiKeyScope } from "@prisma/client";
+import { randomBytes } from "crypto";
 
 // Unambiguous alphabet (no 0/O, 1/I/l) — these keys get read aloud/copy-pasted by humans.
-const generateKeyBody = customAlphabet("23456789ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz", 40);
+// const generateKeyBody = customAlphabet("23456789ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz", 40);
+const generateKeyBody = randomBytes(40).toString("hex");
 
 // A pepper is a second secret, held only in application config (never in the DB),
 // mixed in before hashing. A stolen DATABASE backup alone is then insufficient to
