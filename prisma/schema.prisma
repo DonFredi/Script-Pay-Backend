@@ -238,12 +238,21 @@ model WebhookEvent {
   payload           Json
   processedAt       DateTime?
   processingError   String?
+  status            WebhookEventStatus  @default(pending)
   attempts          Int      @default(0)
   receivedAt        DateTime @default(now())
 
   @@unique([source, naturalKey])
   @@map("webhook_events")
 }
+
+enum WebhookEventStatus {
+  pending
+  processing
+  processed
+  failed
+}
+
 
 // One row per transaction per reconciliation pass — records what we expected vs what Safaricom confirmed.
 model ReconciliationRecord {
