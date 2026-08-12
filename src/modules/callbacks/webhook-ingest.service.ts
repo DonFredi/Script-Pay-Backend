@@ -43,7 +43,7 @@ export class WebhookIngestService {
         data: {
           source,
           naturalKey,
-          status: "pending",
+          //   status: "pending",
           payload: rawPayload as object,
         },
       });
