@@ -4,7 +4,8 @@ import { DarajaClient } from "../../../infrastructure/daraja/daraja.client";
 import { AuditLogService } from "../../audit-log/audit-log.service";
 import { AlertsService } from "../../alerts/alerts.service";
 import type { InitiateStkPushDto } from "./initiate-stk-push.dto";
-import { TenantsService } from "src/modules/tenants/tenants.service";
+import { TenantsService } from "../../tenants/tenants.service";
+import { maskMsisdn } from "src/common/utils/mask-msisdn";
 
 @Injectable()
 export class StkPushService {
@@ -19,18 +20,7 @@ export class StkPushService {
   ) {}
 
   async initiate(tenantId: string, dto: InitiateStkPushDto) {
-    // Write PENDING to our own DB FIRST, before calling Safaricom. If Daraja's response
-    // is lost to a network error, we still have a record to reconcile against later —
-    // "did we ever try this payment" should never depend on a third party's response reaching us.
-
-    const credentials = await this.tenantsService.getMpesaCredentialsForPayment(tenantId);
-    const darajaResponse = await this.daraja.initiateStkPush(credentials, {
-      amount: dto.amountMinorUnits / 100,
-      msisdn: dto.msisdn,
-      accountReference: dto.accountReference,
-      transactionDesc: dto.transactionDesc,
-      transactionType: dto.channel === "TILL" ? "CustomerBuyGoodsOnline" : "CustomerPayBillOnline",
-    });
+    // Step 1: Create transaction FIRST
     const transaction = await this.prisma.transaction.create({
       data: {
         tenantId,
@@ -43,6 +33,7 @@ export class StkPushService {
     });
 
     try {
+      // Step 2: Get credentials and call Daraja ONCE
       const credentials = await this.tenantsService.getMpesaCredentialsForPayment(tenantId);
 
       const darajaResponse = await this.daraja.initiateStkPush(credentials, {
@@ -52,6 +43,8 @@ export class StkPushService {
         transactionDesc: dto.transactionDesc,
         transactionType: dto.channel === "TILL" ? "CustomerBuyGoodsOnline" : "CustomerPayBillOnline",
       });
+
+      // Step 3: Update transaction with Daraja response
       await this.prisma.transaction.update({
         where: { id: transaction.id },
         data: {
@@ -61,6 +54,7 @@ export class StkPushService {
         },
       });
 
+      // Step 4: Audit log
       await this.auditLog.record({
         tenantId,
         actorType: "system",
@@ -102,9 +96,4 @@ export class StkPushService {
       throw error;
     }
   }
-}
-
-/** Never log a full phone number in audit trails/alerts — mask the middle digits. */
-function maskMsisdn(msisdn: string): string {
-  return msisdn.length >= 8 ? `${msisdn.slice(0, 6)}****${msisdn.slice(-2)}` : "****";
 }

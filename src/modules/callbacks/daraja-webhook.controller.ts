@@ -1,46 +1,93 @@
-import { Body, Controller, HttpCode, Post, UseGuards } from "@nestjs/common";
+import { Body, Controller, HttpCode, Post, UseGuards, Logger, BadRequestException } from "@nestjs/common";
 import { ThrottlerGuard } from "@nestjs/throttler";
 import { WebhookThrottle } from "../../common/throttle-tiers";
 import { SkipResponseTransform } from "../../common/decorators/skip-response-transform.decorator";
 import { WebhookIngestService } from "./webhook-ingest.service";
 
 /**
- * Design principle: this endpoint does the MINIMUM possible work — record the raw
- * event (idempotently) and enqueue it, then return 200 immediately. Safaricom retries
- * callbacks aggressively on anything other than a fast 2xx; the actual business logic
- * (updating transaction status, writing ledger entries) happens in a queue consumer
- * (see reconciliation/webhook-processor) where retries and failures are handled
- * explicitly instead of by hoping Safaricom's retry timing lines up with our processing time.
+ * Daraja Webhook Controller
  *
- * No signature verification exists on Daraja callbacks (Safaricom doesn't HMAC-sign them).
- * Trust is instead established by matching the callback's CheckoutRequestID against a
- * transaction WE initiated and are expecting — an unsolicited callback for an unknown
- * CheckoutRequestID is logged and dropped, never blindly trusted.
+ * Receives callbacks from Safaricom M-Pesa for:
+ * 1. STK Push (payment prompt) responses
+ * 2. C2B (paybill/till) confirmations
  *
- * @SkipResponseTransform on the whole controller: Safaricom expects exactly
- * { ResultCode, ResultDesc } back, not our {success, message, statusCode, payload}
- * envelope — wrapping this would likely make Daraja treat it as a failed callback.
+ * Design:
+ * - Return 200 OK immediately (Safaricom requirement)
+ * - Actual processing happens async (see webhook-processor)
+ * - Idempotency handled via unique constraint on (source, naturalKey)
+ *
+ * @SkipResponseTransform: Safaricom expects exactly { ResultCode, ResultDesc }
+ * not our {success, message, statusCode, payload} envelope
  */
 @Controller("v1/webhooks/daraja")
 @UseGuards(ThrottlerGuard)
 @WebhookThrottle()
 @SkipResponseTransform()
 export class DarajaWebhookController {
+  private readonly logger = new Logger(DarajaWebhookController.name);
+
   constructor(private readonly ingest: WebhookIngestService) {}
 
+  /**
+   * STK Push Callback
+   * Safaricom calls this when user enters PIN (or cancels)
+   *
+   * Expected response: { ResultCode: 0, ResultDesc: "Accepted" }
+   */
   @Post("stk-callback")
   @HttpCode(200)
   async handleStkCallback(@Body() rawPayload: unknown) {
-    await this.ingest.ingest("daraja_stk_callback", rawPayload);
-    // Always 200 — once accepted into our system, Safaricom's job is done.
-    // Any downstream processing failure is OUR problem to retry, not theirs.
-    return { ResultCode: 0, ResultDesc: "Accepted" };
+    try {
+      this.logger.log("Received STK callback");
+
+      // Validate basic structure
+      if (!rawPayload || typeof rawPayload !== "object") {
+        throw new BadRequestException("Invalid payload: must be an object");
+      }
+
+      // Ingest webhook (stores in DB, queues for processing)
+      await this.ingest.ingest("daraja_stk_callback", rawPayload);
+
+      // Always return 200 to Safaricom (success or not, we've accepted it)
+      return { ResultCode: 0, ResultDesc: "Accepted" };
+    } catch (error) {
+      // Log error but still return 200 (so Safaricom doesn't retry indefinitely)
+      this.logger.error(`Failed to ingest STK callback: ${error}`, {
+        error: String(error),
+        payload: rawPayload,
+      });
+
+      // Return 200 anyway (Safaricom will eventually stop retrying)
+      return { ResultCode: 0, ResultDesc: "Accepted" };
+    }
   }
 
+  /**
+   * C2B Confirmation Callback
+   * Safaricom calls this to confirm payment to paybill/till
+   *
+   * Expected response: { ResultCode: 0, ResultDesc: "Accepted" }
+   */
   @Post("c2b-confirmation")
   @HttpCode(200)
   async handleC2bConfirmation(@Body() rawPayload: unknown) {
-    await this.ingest.ingest("daraja_c2b_confirmation", rawPayload);
-    return { ResultCode: 0, ResultDesc: "Accepted" };
+    try {
+      this.logger.log("Received C2B confirmation callback");
+
+      if (!rawPayload || typeof rawPayload !== "object") {
+        throw new BadRequestException("Invalid payload: must be an object");
+      }
+
+      await this.ingest.ingest("daraja_c2b_confirmation", rawPayload);
+
+      return { ResultCode: 0, ResultDesc: "Accepted" };
+    } catch (error) {
+      this.logger.error(`Failed to ingest C2B confirmation: ${error}`, {
+        error: String(error),
+        payload: rawPayload,
+      });
+
+      return { ResultCode: 0, ResultDesc: "Accepted" };
+    }
   }
 }

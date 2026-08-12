@@ -4,6 +4,7 @@ import { ThrottlerGuard } from "@nestjs/throttler";
 import { AuthService } from "./auth.service";
 import { RefreshTokenService } from "./refresh-token.service";
 import { ZodValidationPipe } from "../../common/pipes/zod-validation.pipe";
+import { CsrfGuard, generateCsrfToken } from "../../common/guards/csrf.guard"; // ← ADD IMPORT
 import {
   forgotPasswordSchema,
   loginSchema,
@@ -21,7 +22,7 @@ import {
 import { StrictPaymentThrottle } from "../../common/throttle-tiers";
 
 const REFRESH_COOKIE = "refresh_token";
-const REFRESH_COOKIE_PATH = "/auth/refresh"; // scope the cookie tightly — it's only ever sent on this one path
+const REFRESH_COOKIE_PATH = "/auth/refresh";
 
 /**
  * Paths here match the frontend's already-built auth modules exactly. Firebase
@@ -38,11 +39,12 @@ export class AuthController {
   ) {}
 
   @Post("signup")
-  @StrictPaymentThrottle() // account creation is rare and sensitive, same tight ceiling as payment initiation
+  @StrictPaymentThrottle()
   async signup(@Body(new ZodValidationPipe(signupSchema)) dto: SignupDto, @Res({ passthrough: true }) res: Response) {
     const session = await this.authService.signup(dto);
     this.setRefreshCookie(res, session.refreshToken);
     this.setAccessCookie(res, session.accessToken);
+    this.setCsrfCookie(res); // ← ADD THIS LINE
     return { user: session.user, accessToken: session.accessToken };
   }
 
@@ -52,6 +54,7 @@ export class AuthController {
     const session = await this.authService.login(dto);
     this.setRefreshCookie(res, session.refreshToken);
     this.setAccessCookie(res, session.accessToken);
+    this.setCsrfCookie(res); // ← ADD THIS LINE
     return { user: session.user, accessToken: session.accessToken };
   }
 
@@ -59,7 +62,6 @@ export class AuthController {
   async refresh(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
     const rawRefreshToken = req.cookies?.[REFRESH_COOKIE];
     if (!rawRefreshToken) {
-      // No cookie at all — not an error worth alerting on, just "not logged in."
       return { accessToken: null };
     }
 
@@ -71,21 +73,22 @@ export class AuthController {
 
   @Post("forgot-password")
   @StrictPaymentThrottle()
+  @UseGuards(CsrfGuard) // ← ADD CSRF GUARD
   async forgotPassword(@Body(new ZodValidationPipe(forgotPasswordSchema)) dto: ForgotPasswordDto) {
     await this.authService.requestPasswordReset(dto);
-    // Always the same response whether or not the email exists — see
-    // AuthService.requestPasswordReset for why.
     return { message: "If an account exists for that email, a reset link has been sent." };
   }
 
   @Post("reset-password")
   @StrictPaymentThrottle()
+  @UseGuards(CsrfGuard) // ← ADD CSRF GUARD
   async resetPassword(@Body(new ZodValidationPipe(resetPasswordSchema)) dto: ResetPasswordDto) {
     await this.authService.resetPassword(dto);
     return { message: "Password updated. Please log in again." };
   }
 
   @Post("verify-email")
+  @UseGuards(CsrfGuard) // ← ADD CSRF GUARD
   async verifyEmail(@Body(new ZodValidationPipe(verifyEmailSchema)) dto: VerifyEmailDto) {
     await this.authService.verifyEmail(dto);
     return { message: "Email verified." };
@@ -93,6 +96,7 @@ export class AuthController {
 
   @Post("resend-verification")
   @StrictPaymentThrottle()
+  @UseGuards(CsrfGuard) // ← ADD CSRF GUARD
   async resendVerification(@Body(new ZodValidationPipe(resendVerificationSchema)) dto: ResendVerificationDto) {
     await this.authService.resendVerification(dto);
     return { message: "If that account needs verification, a new link has been sent." };
@@ -108,13 +112,6 @@ export class AuthController {
     });
   }
 
-  /**
-   * Never read by this backend's own guards (AccessTokenGuard only ever reads the
-   * Authorization header, matching the axios in-memory-token pattern used for
-   * actual API calls). Its only consumer is the frontend's own Edge middleware —
-   * see that file's comments for why this exists as a second, httpOnly-cookie
-   * copy of the same token.
-   */
   private setAccessCookie(res: Response, token: string) {
     res.cookie("access_token", token, {
       httpOnly: true,
@@ -122,6 +119,18 @@ export class AuthController {
       sameSite: "lax",
       path: "/",
       maxAge: 15 * 60 * 1000,
+    });
+  }
+
+  // ← ADD THIS METHOD
+  private setCsrfCookie(res: Response) {
+    const csrfToken = generateCsrfToken();
+    res.cookie("csrf-token", csrfToken, {
+      httpOnly: false, // ← JavaScript MUST read this (not httpOnly)
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      path: "/",
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     });
   }
 }
