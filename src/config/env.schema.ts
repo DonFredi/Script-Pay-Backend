@@ -42,8 +42,6 @@ export const envSchema = z.object({
 
   FRONTEND_ORIGIN: optionalUrl(),
 
-  REDIS_URL: optionalUrl(),
-
   SENTRY_DSN: optionalUrl(),
   SLACK_WEBHOOK_URL: optionalUrl(),
 });

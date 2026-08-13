@@ -16,7 +16,6 @@
     "prisma:migrate": "prisma migrate dev"
   },
   "dependencies": {
-    "@nestjs/bullmq": "^11.0.0",
     "@nestjs/common": "^11.0.0",
     "@nestjs/config": "^4.0.0",
     "@nestjs/core": "^11.0.0",
@@ -26,7 +25,6 @@
     "@prisma/client": "^6.0.0",
     "@sentry/node": "^8.0.0",
     "argon2": "^0.41.0",
-    "bullmq": "^5.0.0",
     "cookie-parser": "^1.4.6",
     "jose": "^5.9.0",
     "nanoid": "^5.0.0",
