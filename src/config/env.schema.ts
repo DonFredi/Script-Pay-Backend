@@ -100,7 +100,7 @@ export const envSchema = z.object({
   // localhost is (correctly) in the CORS allow-list for local dev/testing.
   PUBLIC_APP_URL: z
     .string()
-    .url("required — the canonical frontend URL used in email links, e.g. https://app.scriptpay.com"),
+    .url("required — the canonical frontend URL used in email links, e.g. https://script-pay.vecel.app"),
 
   SENTRY_DSN: optionalUrl(),
   SLACK_WEBHOOK_URL: optionalUrl(),
