@@ -7,7 +7,10 @@ export class EmailService {
 
   private readonly resend?: Resend;
   private readonly from = process.env.EMAIL_FROM;
-  private readonly frontendOrigin = process.env.FRONTEND_ORIGIN;
+  // PUBLIC_APP_URL, not FRONTEND_ORIGIN — FRONTEND_ORIGIN is a comma-separated CORS
+  // allow-list (can include localhost for dev) and is the wrong value to build a
+  // user-facing email link from. See env.schema.ts for the distinction.
+  private readonly appUrl = process.env.PUBLIC_APP_URL;
 
   constructor() {
     if (process.env.RESEND_API_KEY) {
@@ -18,12 +21,12 @@ export class EmailService {
   }
 
   async sendVerificationEmail(to: string, token: string): Promise<void> {
-    if (!this.resend || !this.from || !this.frontendOrigin) {
+    if (!this.resend || !this.from || !this.appUrl) {
       this.logger.warn(`Verification email skipped because email is not configured. User: ${to}`);
       return;
     }
 
-    const link = `${this.frontendOrigin}/auth/verify-email?token=${encodeURIComponent(token)}`;
+    const link = `${this.appUrl}/auth/verify-email?token=${encodeURIComponent(token)}`;
 
     try {
       await this.resend.emails.send({
@@ -39,12 +42,12 @@ export class EmailService {
   }
 
   async sendPasswordResetEmail(to: string, token: string): Promise<void> {
-    if (!this.resend || !this.from || !this.frontendOrigin) {
+    if (!this.resend || !this.from || !this.appUrl) {
       this.logger.warn(`Password reset email skipped because email is not configured. User: ${to}`);
       return;
     }
 
-    const link = `${this.frontendOrigin}/auth/reset-password?token=${encodeURIComponent(token)}`;
+    const link = `${this.appUrl}/auth/reset-password?token=${encodeURIComponent(token)}`;
 
     try {
       await this.resend.emails.send({

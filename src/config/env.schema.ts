@@ -10,6 +10,50 @@ const optionalUrl = () => z.preprocess((v) => (v === "" ? undefined : v), z.stri
 const optionalString = (min = 1) => z.preprocess((v) => (v === "" ? undefined : v), z.string().min(min).optional());
 
 /**
+ * Comma-separated list of allowed CORS origins (e.g. local dev + deployed frontend
+ * at once), returned as a string[] ready to pass straight into app.enableCors({ origin }).
+ *
+ * Deliberately REQUIRED, not optional: an unset origin previously fell through to
+ * enableCors({ origin: undefined, credentials: true }), which the underlying `cors`
+ * package resolves as Access-Control-Allow-Origin: * — and browsers reject wildcard
+ * origin combined with credentials: true outright. That produced a bare, headerless
+ * "CORS error" on every request with no indication in server logs of what was wrong.
+ * Failing at boot instead of at request-time avoids re-debugging this from scratch.
+ */
+const originList = () =>
+  z
+    .string()
+    .min(1, "required — comma-separated list, e.g. http://localhost:3000,https://app.scriptpay.com")
+    .transform((v) =>
+      v
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+    )
+    .refine((urls) => urls.length > 0 && urls.every((u) => z.string().url().safeParse(u).success), {
+      message:
+        "FRONTEND_ORIGIN must be a comma-separated list of valid URLs (e.g. http://localhost:3000,https://app.scriptpay.com)",
+    });
+
+/**
+ * Must decode to exactly 32 bytes — that's what AES-256-GCM (used by
+ * CredentialsEncryptionService) requires as a key. Validating this at boot means a
+ * misconfigured key fails loudly on startup instead of on the first tenant credential
+ * decrypt/encrypt call in production. Generate a valid value with: openssl rand -base64 32
+ */
+const base64Key32Bytes = (envVarName: string) =>
+  z.string().refine(
+    (v) => {
+      try {
+        return Buffer.from(v, "base64").length === 32;
+      } catch {
+        return false;
+      }
+    },
+    { message: `${envVarName} must be a base64-encoded 32-byte key — generate with: openssl rand -base64 32` },
+  );
+
+/**
  * Every environment variable the app depends on is declared here.
  * The app refuses to boot if any REQUIRED value is missing or malformed —
  * this converts "undefined env var" from a 2am production bug into a startup failure in CI.
@@ -35,12 +79,28 @@ export const envSchema = z.object({
   JWT_ACCESS_TTL_SECONDS: z.coerce.number().default(900), // 15 minutes
   JWT_REFRESH_TTL_DAYS: z.coerce.number().default(30),
 
+  // Encrypts tenants' Daraja consumer secret + passkey at rest (AES-256-GCM). Previously
+  // this was read directly from process.env in CredentialsEncryptionService, bypassing
+  // this fail-fast validation entirely — an unset or malformed key would silently produce
+  // an empty/wrong encryption key instead of refusing to boot. Never treat this as optional.
+  CREDENTIALS_ENCRYPTION_KEY: base64Key32Bytes("CREDENTIALS_ENCRYPTION_KEY"),
+
   EMAIL_VERIFICATION_TTL_HOURS: z.coerce.number().default(24),
   PASSWORD_RESET_TTL_MINUTES: z.coerce.number().default(30),
   RESEND_API_KEY: optionalString(),
   EMAIL_FROM: optionalString(),
 
-  FRONTEND_ORIGIN: optionalUrl(),
+  // FRONTEND_ORIGIN: every origin the API should accept cross-origin requests from
+  // (CORS allow-list — can be several, e.g. local dev + deployed frontend).
+  FRONTEND_ORIGIN: originList(),
+
+  // PUBLIC_APP_URL: the ONE canonical frontend URL used when building links inside
+  // outbound emails (verification, password reset). Deliberately separate from
+  // FRONTEND_ORIGIN — an email link should never resolve to localhost, even if
+  // localhost is (correctly) in the CORS allow-list for local dev/testing.
+  PUBLIC_APP_URL: z
+    .string()
+    .url("required — the canonical frontend URL used in email links, e.g. https://app.scriptpay.com"),
 
   SENTRY_DSN: optionalUrl(),
   SLACK_WEBHOOK_URL: optionalUrl(),

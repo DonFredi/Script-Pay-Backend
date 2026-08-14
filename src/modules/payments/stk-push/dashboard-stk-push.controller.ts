@@ -1,5 +1,6 @@
 import { Body, Controller, ForbiddenException, Post, UseGuards } from "@nestjs/common";
 import { AccessTokenGuard } from "../../auth/access-token.guard";
+import { CsrfGuard } from "../../../common/guards/csrf.guard";
 import { RolesGuard } from "../../../common/guards/roles.guard";
 import { TenantAwareThrottlerGuard } from "../../../common/guards/tenant-aware-throttler.guard";
 import { Roles } from "../../../common/decorators/roles.decorator";
@@ -21,7 +22,7 @@ import { StkPushService } from "./stk-push.service";
  * TenantAwareThrottlerGuard reads it.
  */
 @Controller("v1/dashboard/payments/stk-push")
-@UseGuards(AccessTokenGuard, RolesGuard, TenantAwareThrottlerGuard)
+@UseGuards(AccessTokenGuard, CsrfGuard, RolesGuard, TenantAwareThrottlerGuard)
 @Roles("TENANT_ADMIN", "TENANT_STAFF")
 export class DashboardStkPushController {
   constructor(private readonly stkPushService: StkPushService) {}

@@ -1,5 +1,6 @@
 import { Body, Controller, Get, Param, Post, UseGuards } from "@nestjs/common";
 import { AccessTokenGuard } from "../auth/access-token.guard";
+import { CsrfGuard } from "../../common/guards/csrf.guard";
 import { RolesGuard } from "../../common/guards/roles.guard";
 import { Roles } from "../../common/decorators/roles.decorator";
 import { CurrentUser, type AuthenticatedUser } from "../../common/decorators/current-user.decorator";
@@ -8,8 +9,13 @@ import { createTenantSchema, type CreateTenantDto } from "./tenant.dto";
 import { TenantsService } from "./tenants.service";
 import { mpesaCredentialsSchema, type MpesaCredentialsDto } from "./tenants.schema";
 
+/**
+ * CsrfGuard applies to every mutating route here, including setMpesaCredentials —
+ * a forged request to that endpoint could overwrite a tenant's Daraja credentials,
+ * which is at least as sensitive as the payment-initiation and API-key routes.
+ */
 @Controller("v1/tenants")
-@UseGuards(AccessTokenGuard, RolesGuard)
+@UseGuards(AccessTokenGuard, CsrfGuard, RolesGuard)
 export class TenantsController {
   constructor(private readonly tenants: TenantsService) {}
 

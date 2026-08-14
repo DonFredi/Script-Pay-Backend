@@ -1,5 +1,6 @@
 import { Body, Controller, Delete, ForbiddenException, Get, Param, Post, UseGuards } from "@nestjs/common";
 import { AccessTokenGuard } from "../auth/access-token.guard";
+import { CsrfGuard } from "../../common/guards/csrf.guard";
 import { RolesGuard } from "../../common/guards/roles.guard";
 import { TenantAwareThrottlerGuard } from "../../common/guards/tenant-aware-throttler.guard";
 import { Roles } from "../../common/decorators/roles.decorator";
@@ -10,13 +11,17 @@ import { createApiKeySchema, type CreateApiKeyDto } from "./api-key.dto";
 import { ApiKeysService } from "./api-keys.service";
 
 /**
- * Note the guard: this is Firebase-authenticated (a logged-in dashboard user managing
- * their OWN tenant's keys), distinct from ApiKeyGuard which authenticates a tenant's
- * automated systems calling the payments API. Don't confuse "managing keys" with
- * "authenticating via a key" — they're separate concerns with separate guards.
+ * Note the guard: this is cookie/session-authenticated (a logged-in dashboard user
+ * managing their OWN tenant's keys), distinct from ApiKeyGuard which authenticates a
+ * tenant's automated systems calling the payments API. Don't confuse "managing keys"
+ * with "authenticating via a key" — they're separate concerns with separate guards.
+ *
+ * CsrfGuard is required on create/revoke — both are cookie-authenticated, state-changing
+ * actions with real consequences (a forged create/revoke could hijack or cut off a
+ * tenant's payment integration).
  */
 @Controller("v1/api-keys")
-@UseGuards(AccessTokenGuard, RolesGuard, TenantAwareThrottlerGuard)
+@UseGuards(AccessTokenGuard, CsrfGuard, RolesGuard, TenantAwareThrottlerGuard)
 @Roles("TENANT_ADMIN", "SUPER_ADMIN")
 export class ApiKeysController {
   constructor(private readonly apiKeys: ApiKeysService) {}
