@@ -2,7 +2,7 @@ import { ForbiddenException, Injectable, NotFoundException } from "@nestjs/commo
 import { PrismaService } from "../prisma/prisma.service";
 import { AuditLogService } from "../audit-log/audit-log.service";
 import type { AuthenticatedUser } from "../../common/decorators/current-user.decorator";
-import type { CreateTenantDto } from "./tenant.dto";
+import type { CreateTenantDto, UpdateTenantStatusDto } from "./tenant.dto";
 import type { MpesaCredentialsDto } from "./tenants.schema";
 import type { TenantMpesaCredentials } from "../../infrastructure/daraja/daraja.client";
 import { CredentialsEncryptionService } from "./credentials-encryption.service";
@@ -120,6 +120,40 @@ export class TenantsService {
       targetType: "Tenant",
       targetId: tenant.id,
       metadata: { name: tenant.name, businessShortcode: tenant.businessShortcode },
+    });
+
+    return tenant;
+  }
+
+  /**
+   * SUPER_ADMIN may set any tenant to any status, including reverting one to
+   * "pending_kyc" for re-review. A TENANT_ADMIN may only toggle their OWN tenant
+   * between "active" and "suspended" — self-service deactivation, not a path to
+   * self-approve out of KYC review or touch another tenant's status.
+   */
+  async updateStatus(tenantId: string, dto: UpdateTenantStatusDto, actor: AuthenticatedUser) {
+    if (actor.role !== "SUPER_ADMIN") {
+      if (actor.tenantId !== tenantId) {
+        throw new ForbiddenException("Cannot change another tenant's status");
+      }
+      if (dto.status === "pending_kyc") {
+        throw new ForbiddenException("Only ScriptPay staff can move a tenant into KYC review");
+      }
+    }
+
+    const tenant = await this.prisma.tenant.update({
+      where: { id: tenantId },
+      data: { status: dto.status },
+    });
+
+    await this.auditLog.record({
+      tenantId,
+      actorType: "user",
+      actorId: actor.id,
+      action: "tenant.status_changed",
+      targetType: "Tenant",
+      targetId: tenantId,
+      metadata: { newStatus: dto.status },
     });
 
     return tenant;

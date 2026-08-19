@@ -1,5 +1,6 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { ForbiddenException, Injectable, Logger } from "@nestjs/common";
 import { PrismaService } from "../prisma/prisma.service";
+import type { AuthenticatedUser } from "../../common/decorators/current-user.decorator";
 
 export interface AuditEntry {
   tenantId?: string | null;
@@ -28,11 +29,6 @@ export class AuditLogService {
       await this.prisma.auditLog.create({
         data: {
           ...entry,
-          // Deliberate, narrow `any`: Record<string, unknown> isn't structurally
-          // assignable to Prisma's JSON input type (name varies by Prisma
-          // version/generator config), even though this data is always valid
-          // JSON in practice — it's app-constructed audit metadata, never raw
-          // unchecked user input.
           metadata: entry.metadata as any,
         },
       });
@@ -44,10 +40,27 @@ export class AuditLogService {
     }
   }
 
-  /** SUPER_ADMIN-only read path — enforced by the controller, not here. */
-  async list(params: { tenantId?: string; take?: number }) {
+  /**
+   * SUPER_ADMIN sees any tenant's log (or everything, if tenantId is omitted).
+   * TENANT_ADMIN may only ever see their OWN tenant's log — enforced here, not
+   * just at the controller's @Roles(), same "data-scoping is a service concern"
+   * pattern as TenantsService.findOne/updateStatus. A TENANT_ADMIN passing a
+   * different tenantId (or none at all) still only ever gets their own tenant's
+   * entries; they can't broaden the query to see anyone else's or "everything".
+   */
+  async list(params: { tenantId?: string; action?: string; take?: number }, caller: AuthenticatedUser) {
+    if (caller.role !== "SUPER_ADMIN") {
+      if (params.tenantId && params.tenantId !== caller.tenantId) {
+        throw new ForbiddenException("Cannot view another tenant's audit log");
+      }
+      params.tenantId = caller.tenantId ?? undefined;
+    }
+
     return this.prisma.auditLog.findMany({
-      where: params.tenantId ? { tenantId: params.tenantId } : {},
+      where: {
+        ...(params.tenantId ? { tenantId: params.tenantId } : {}),
+        ...(params.action ? { action: params.action } : {}),
+      },
       orderBy: { createdAt: "desc" },
       take: params.take ?? 100,
     });
