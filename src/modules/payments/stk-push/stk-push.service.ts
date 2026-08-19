@@ -5,7 +5,7 @@ import { AuditLogService } from "../../audit-log/audit-log.service";
 import { AlertsService } from "../../alerts/alerts.service";
 import type { InitiateStkPushDto } from "./initiate-stk-push.dto";
 import { TenantsService } from "../../tenants/tenants.service";
-import { maskMsisdn } from "src/common/utils/mask-msisdn";
+import { maskMsisdn } from "../../../common/utils/mask-msisdn";
 
 @Injectable()
 export class StkPushService {
