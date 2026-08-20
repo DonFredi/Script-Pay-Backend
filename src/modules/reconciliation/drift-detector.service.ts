@@ -61,7 +61,14 @@ export class DriftDetectorService {
     // Route through the SAME state-machine methods a webhook would call — this active
     // reconciliation path and the passive webhook path must never diverge in how they
     // apply a result, or you get two slightly-different definitions of "settled."
-    if (darajaStatus.resultCode === 0 && darajaStatus.mpesaReceiptNumber) {
+    //
+    // resultCode === 0 is Safaricom's own authoritative success signal for this query —
+    // settlement must NOT be gated on mpesaReceiptNumber also being present: the STK Push
+    // Query API never returns one (only the async callback's CallbackMetadata does), so
+    // requiring it here made this branch permanently unreachable. transitionToSettled
+    // tolerates a missing receipt number and backfills it later if the real callback
+    // eventually arrives.
+    if (darajaStatus.resultCode === 0) {
       await this.stateMachine.transitionToSettled(transactionId, {
         mpesaReceiptNumber: darajaStatus.mpesaReceiptNumber,
       });

@@ -1,5 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { ThrottlerGuard } from "@nestjs/throttler";
+import type { AuthenticatedRequest } from "../types/authenticated-request";
 
 /**
  * Default @nestjs/throttler tracks by IP alone. That's wrong for a multi-tenant API:
@@ -10,9 +11,9 @@ import { ThrottlerGuard } from "@nestjs/throttler";
  */
 @Injectable()
 export class TenantAwareThrottlerGuard extends ThrottlerGuard {
-  protected async getTracker(req: Record<string, any>): Promise<string> {
+  protected getTracker(req: AuthenticatedRequest): Promise<string> {
     const tenantId = req.tenantId ?? req.user?.tenantId;
-    if (tenantId) return `tenant:${tenantId}`;
-    return req.ips?.length ? req.ips[0] : req.ip;
+    if (tenantId) return Promise.resolve(`tenant:${tenantId}`);
+    return Promise.resolve(req.ips.length ? req.ips[0] : req.ip!);
   }
 }

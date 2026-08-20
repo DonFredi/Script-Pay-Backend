@@ -1,11 +1,30 @@
 import { Test, TestingModule } from "@nestjs/testing";
+import { UnauthorizedException } from "@nestjs/common";
+import { hash, verify } from "argon2";
 import { AuthService } from "./auth.service";
 import { PrismaService } from "../prisma/prisma.service";
-import { hash, verify } from "argon2";
+import { TokenService } from "./token.service";
+import { RefreshTokenService } from "./refresh-token.service";
+import { VerificationTokenService } from "./verification-token.service";
+import { EmailService } from "./email.service";
+import { AuditLogService } from "../audit-log/audit-log.service";
 
 describe("AuthService", () => {
   let service: AuthService;
   let prisma: PrismaService;
+
+  const now = new Date();
+  const baseUser = {
+    id: "1",
+    username: "testuser",
+    email: "test@example.com",
+    passwordHash: "hashed",
+    emailVerified: false,
+    role: "TENANT_ADMIN" as const,
+    tenantId: null as string | null,
+    createdAt: now,
+    updatedAt: now,
+  };
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
@@ -15,8 +34,10 @@ describe("AuthService", () => {
           provide: PrismaService,
           useValue: {
             user: {
+              findUnique: jest.fn(),
               findUniqueOrThrow: jest.fn(),
               create: jest.fn(),
+              update: jest.fn(),
             },
             refreshToken: {
               create: jest.fn(),
@@ -24,6 +45,39 @@ describe("AuthService", () => {
               update: jest.fn(),
             },
           },
+        },
+        {
+          provide: TokenService,
+          useValue: { signAccessToken: jest.fn().mockResolvedValue("access-token") },
+        },
+        {
+          provide: RefreshTokenService,
+          useValue: {
+            issue: jest.fn().mockResolvedValue("refresh-token"),
+            verifyAndRotate: jest.fn(),
+            revoke: jest.fn(),
+            revokeAllForUser: jest.fn(),
+          },
+        },
+        {
+          provide: VerificationTokenService,
+          useValue: {
+            issueEmailVerificationToken: jest.fn().mockResolvedValue("verify-token"),
+            consumeEmailVerificationToken: jest.fn(),
+            issuePasswordResetToken: jest.fn(),
+            consumePasswordResetToken: jest.fn(),
+          },
+        },
+        {
+          provide: EmailService,
+          useValue: {
+            sendVerificationEmail: jest.fn().mockResolvedValue(undefined),
+            sendPasswordResetEmail: jest.fn().mockResolvedValue(undefined),
+          },
+        },
+        {
+          provide: AuditLogService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
         },
       ],
     }).compile();
@@ -37,18 +91,12 @@ describe("AuthService", () => {
       const dto = {
         email: "test@example.com",
         password: "test123",
+        confirmPassword: "test123",
         username: "testuser",
       };
 
-      const mockUser = {
-        id: "1",
-        email: dto.email,
-        passwordHash: "hashed",
-        role: "TENANT_ADMIN",
-        tenantId: null,
-      };
-
-      jest.spyOn(prisma.user, "create").mockResolvedValueOnce(mockUser);
+      jest.spyOn(prisma.user, "findUnique").mockResolvedValueOnce(null);
+      jest.spyOn(prisma.user, "create").mockResolvedValueOnce(baseUser);
 
       const result = await service.signup(dto);
 
@@ -62,16 +110,22 @@ describe("AuthService", () => {
       expect(result.user.email).toBe(dto.email);
     });
 
-    it("should hash password before storing", async () => {
+    it("should hash the password before storing it", async () => {
       const dto = {
         email: "test@example.com",
         password: "plain_password",
+        confirmPassword: "plain_password",
         username: "testuser",
       };
 
-      // Verify password is hashed (simplified test)
-      // In real test, verify hash() was called
-      expect(dto.password).not.toBe("plain_password");
+      jest.spyOn(prisma.user, "findUnique").mockResolvedValueOnce(null);
+      const createSpy = jest.spyOn(prisma.user, "create").mockResolvedValueOnce(baseUser);
+
+      await service.signup(dto);
+
+      const storedHash = createSpy.mock.calls[0][0].data.passwordHash;
+      expect(storedHash).not.toBe(dto.password);
+      await expect(verify(storedHash, dto.password)).resolves.toBe(true);
     });
   });
 
@@ -81,14 +135,13 @@ describe("AuthService", () => {
       const password = "test123";
 
       const mockUser = {
-        id: "1",
+        ...baseUser,
         email,
-        passwordHash: await hash(password), // Hashed password
-        role: "TENANT_ADMIN",
+        passwordHash: await hash(password),
         tenantId: "tenant-1",
       };
 
-      jest.spyOn(prisma.user, "findUniqueOrThrow").mockResolvedValueOnce(mockUser);
+      jest.spyOn(prisma.user, "findUnique").mockResolvedValueOnce(mockUser);
 
       const result = await service.login({ email, password });
 
@@ -98,11 +151,14 @@ describe("AuthService", () => {
     });
 
     it("should prevent user enumeration", async () => {
-      // Both "user not found" and "password wrong" return same error
-      jest.spyOn(prisma.user, "findUniqueOrThrow").mockRejectedValueOnce(new Error("User not found"));
+      // Both "user not found" and "wrong password" return the same generic error
+      jest.spyOn(prisma.user, "findUnique").mockResolvedValueOnce(null);
 
       await expect(service.login({ email: "nonexistent@example.com", password: "any" })).rejects.toThrow(
-        "Invalid credentials",
+        UnauthorizedException,
+      );
+      await expect(service.login({ email: "nonexistent@example.com", password: "any" })).rejects.toThrow(
+        "Invalid email or password",
       );
     });
   });

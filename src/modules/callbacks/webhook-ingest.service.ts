@@ -44,7 +44,7 @@ export class WebhookIngestService {
           source,
           naturalKey,
           //   status: "pending",
-          payload: rawPayload as object,
+          payload: rawPayload,
         },
       });
 
@@ -70,7 +70,7 @@ export class WebhookIngestService {
       }
 
       // Unexpected database error
-      this.logger.error(`Failed to store webhook event: ${error}`, {
+      this.logger.error(`Failed to store webhook event: ${String(error)}`, {
         source,
         naturalKey,
         error: String(error),

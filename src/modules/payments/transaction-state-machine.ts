@@ -22,9 +22,38 @@ export class TransactionStateMachine {
 
   constructor(private readonly prisma: PrismaService) {}
 
-  async transitionToSettled(transactionId: string, data: { mpesaReceiptNumber: string }) {
+  /**
+   * mpesaReceiptNumber is OPTIONAL: DriftDetectorService settles a transaction from
+   * Safaricom's STK Push Query API, whose response carries a ResultCode but never a
+   * receipt number (that only ever arrives via the async callback's CallbackMetadata,
+   * handled by WebhookPollerService). A resultCode of 0 is Safaricom's own authoritative
+   * success signal, so settlement must not be gated on a field that API can never supply.
+   */
+  async transitionToSettled(transactionId: string, data: { mpesaReceiptNumber?: string }) {
     await this.prisma.$transaction(async (tx) => {
       const transaction = await tx.transaction.findUniqueOrThrow({ where: { id: transactionId } });
+
+      if (transaction.status === "SETTLED") {
+        // Already settled — most commonly Safaricom redelivering the same callback, but
+        // also the expected shape of a real callback arriving AFTER drift detection already
+        // settled this transaction without a receipt number: back-fill it instead of
+        // treating "SETTLED -> SETTLED" as an illegal transition.
+        if (!transaction.mpesaReceiptNumber && data.mpesaReceiptNumber) {
+          await tx.transaction.update({
+            where: { id: transactionId },
+            data: { mpesaReceiptNumber: data.mpesaReceiptNumber },
+          });
+          return;
+        }
+        if (!data.mpesaReceiptNumber || transaction.mpesaReceiptNumber === data.mpesaReceiptNumber) {
+          return; // idempotent duplicate delivery — nothing to do
+        }
+        throw new Error(
+          `Transaction ${transactionId} already settled with a different receipt number ` +
+            `(existing: ${transaction.mpesaReceiptNumber}, incoming: ${data.mpesaReceiptNumber})`,
+        );
+      }
+
       this.assertTransitionAllowed(transaction.status, "SETTLED");
 
       await tx.transaction.update({

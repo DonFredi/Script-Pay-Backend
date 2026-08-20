@@ -52,7 +52,7 @@ export class DarajaWebhookController {
       return { ResultCode: 0, ResultDesc: "Accepted" };
     } catch (error) {
       // Log error but still return 200 (so Safaricom doesn't retry indefinitely)
-      this.logger.error(`Failed to ingest STK callback: ${error}`, {
+      this.logger.error(`Failed to ingest STK callback: ${String(error)}`, {
         error: String(error),
         payload: rawPayload,
       });
@@ -82,7 +82,7 @@ export class DarajaWebhookController {
 
       return { ResultCode: 0, ResultDesc: "Accepted" };
     } catch (error) {
-      this.logger.error(`Failed to ingest C2B confirmation: ${error}`, {
+      this.logger.error(`Failed to ingest C2B confirmation: ${String(error)}`, {
         error: String(error),
         payload: rawPayload,
       });

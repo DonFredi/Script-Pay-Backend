@@ -1,364 +1,49 @@
 # Security
 
-## Overview
+This documents what the codebase actually does, not a compliance program — there is no PCI DSS/SOC 2 scope here (ScriptPay never touches card data; M-Pesa is a bank-mediated mobile money rail, not a card network) and no 2FA/TOTP implementation exists. If those become real requirements, this doc should be rewritten against the actual implementation at that time, not aspirationally in advance of it.
 
-ScriptPay handles sensitive financial data and must maintain the highest security standards. This document outlines our security practices, compliance requirements, and threat mitigation strategies.
+## Password & credential storage
 
-## Compliance
+- **User passwords**: argon2id (`passwordHash` on `User`). This backend owns password verification directly — an earlier Firebase-based auth flow has been fully removed.
+- **API keys**: argon2, only the hash is stored (`ApiKey.keyHash`). `ApiKeyGuard` narrows candidates by `keyPrefix` (indexed, cheap) before running the expensive argon2 verify, to avoid a full-table hash comparison on every request.
+- **Refresh tokens / email-verification / password-reset tokens**: SHA-256, not argon2 — these are high-entropy random tokens, not low-entropy passwords, so a fast hash is correct and sufficient; slow hashing here would only waste CPU with no security benefit.
+- **Daraja credentials** (`Tenant.mpesaConsumerSecretEncrypted`, `mpesaPasskeyEncrypted`): AES-256-GCM, reversible by design (`CredentialsEncryptionService`) — these must be decrypted to actually call Safaricom, unlike passwords/keys which only ever need to be *verified*. `CREDENTIALS_ENCRYPTION_KEY` is a 32-byte base64 key, validated at boot by the env schema.
 
-### PCI DSS
+## Session model
 
-- **Level**: Stripe handles payment processing, ScriptPay maintains Level 1 compliance
-- **Responsibility**: Never store full credit card data; use Stripe tokenization
-- **Validation**: Annual audits required
-- **Status**: Currently compliant via Stripe partnership
+- Access token: short-lived JWT (`jose`, ~15 min), verified on every request by `AccessTokenGuard`. Set as an httpOnly cookie and also returned in the login/signup JSON body for the frontend to hold in memory.
+- Refresh token: long-lived, httpOnly cookie, path-scoped to `/auth/refresh`. Stored server-side only as a SHA-256 hash, with rotation — using a token revokes it and issues a replacement; a revoked token presented again is treated as a theft signal.
+- `POST /profile/logout` clears the `access_token` cookie.
 
-### GDPR
+## CSRF
 
-- **Data Processing**: User data covered by DPA with Stripe
-- **Right to Erasure**: Soft-delete implemented with 90-day purge
-- **Consent**: Explicit opt-in for marketing communications
-- **Breach Notification**: Required within 72 hours to authorities
+Double-submit cookie pattern (`CsrfGuard`): a non-httpOnly `csrf-token` cookie is set on login/signup; state-changing requests (`POST`/`PUT`/`PATCH`/`DELETE`) must echo it back in an `X-CSRF-Token` header, and the guard compares the two. Applied to every cookie-authenticated mutating route (auth flows, tenant management, API key create/revoke, dashboard STK push) — not applied to the Daraja webhook endpoints, which aren't browser-originated and can't carry the cookie/header pair at all.
 
-### SOC 2 Type II
+## Multi-tenant isolation
 
-- Target: Achieve certification within 12 months
-- Audits: Annual Type II audits once certified
+Two independent layers, not one:
+1. **Application-level**: every query is filtered by `tenantId`, resolved from the authenticated caller (JWT claim or API key), never from a client-supplied body field.
+2. **Database-level**: Postgres Row-Level Security (`prisma/manual-sql/001_row_level_security.sql`), applied per tenant-scoped table via `current_setting('app.current_tenant_id')`. This is defense-in-depth — a service that forgets to filter by tenant is still blocked at the database layer.
 
-## Authentication & Authorization
+## Rate limiting
 
-### Password Security
+`@nestjs/throttler`, per-controller (not global — throttling needs `request.tenantId`/`request.user`, which only exist after the auth guard has run; a global throttler would run first and see neither). `TenantAwareThrottlerGuard` keys by tenant, not IP, so tenants behind the same NAT gateway don't throttle each other. Named tiers in `common/throttle-tiers.ts`:
+- `StrictPaymentThrottle` — 10/min (STK push initiation: real-world cost per call, an actual SMS/prompt sent to a phone)
+- `ReadThrottle` — 120/min
+- `WebhookThrottle` — 300/min (the Daraja webhook has no credential to check, so a generous ceiling is its only defense against being discovered and hammered)
 
-```
-- Minimum 12 characters
-- Mix of uppercase, lowercase, numbers, special characters
-- SHA-256 hashing with bcrypt (salt rounds: 12)
-- Password history: prevent reusing last 5 passwords
-- Expiration: optional (recommended every 90 days)
-```
+## Guard ordering — a real, previously-shipped bug
 
-### Session Management
+`RolesGuard` must run **after** the auth guard that populates `request.user`/`request.tenantId` (`AccessTokenGuard` or `ApiKeyGuard`). It is deliberately *not* registered as a global `APP_GUARD`: NestJS runs global guards before controller-level `@UseGuards()`, so a global `RolesGuard` would always see an empty `request.user` and reject every `@Roles()`-protected route regardless of actual role. This previously shipped as a live bug (every role-gated route silently rejecting valid users) and is now fixed by applying `RolesGuard` explicitly, per-controller, listed after the auth guard.
 
-```javascript
-// JWT Configuration
-{
-  algorithm: 'HS256',
-  accessTokenExpiry: '15 minutes',
-  refreshTokenExpiry: '7 days',
-  issuer: 'scriptpay.io',
-  audience: 'scriptpay-api'
-}
-```
+## Idempotency as a security property
 
-### Multi-Factor Authentication
+Every inbound Daraja webhook is written to `WebhookEvent` (unique on `(source, naturalKey)`) **before** any business logic runs. A duplicate or replayed callback fails the insert, not the settlement logic — this matters for a payments system specifically because double-processing a settlement would double-credit a ledger.
 
-- 2FA enabled for admin accounts (mandatory)
-- 2FA available for merchants (optional, recommended)
-- Supported methods:
-  - Time-based One-Time Password (TOTP)
-  - Email-based verification
-  - SMS (future)
+## Error reporting
 
-### API Key Management
+Global `HttpExceptionFilter` reports every 5xx to Sentry. 4xx is treated as expected client traffic, not an incident, and is not reported — this keeps Sentry's signal-to-noise ratio meaningful (a wrong password isn't an incident; an unhandled exception is).
 
-- Keys generated with 64-byte random entropy
-- Stored as salted hashes in database (never plaintext)
-- Rotation recommended every 90 days
-- API key scopes limit endpoint access
-- Keys tied to specific IP ranges (optional)
+## Boot-time validation
 
-## Data Protection
-
-### Encryption at Rest
-
-```
-- PostgreSQL: Transparent Data Encryption (TDE) enabled
-- Backups: AES-256 encryption
-- Stripe keys: Encrypted in application configuration
-- Database credentials: Stored in AWS Secrets Manager
-```
-
-### Encryption in Transit
-
-```
-- TLS 1.2+ mandatory for all connections
-- Certificate: Let's Encrypt with auto-renewal
-- HSTS: strict-transport-security: max-age=31536000; includeSubDomains
-- Certificate pinning: Recommended for mobile clients (future)
-```
-
-### Data Classification
-
-```
-PUBLIC:    Website content, general documentation
-INTERNAL:  Architecture docs, incident reports
-SENSITIVE: API keys, database credentials, encryption keys
-RESTRICTED: PII, payment data, audit logs
-```
-
-### PII Handling
-
-- Email addresses and names stored encrypted
-- Phone numbers hashed
-- Social security numbers: NOT stored
-- Payment methods: Tokenized via Stripe
-- Data access logs: Maintain 1-year audit trail
-
-## API Security
-
-### Rate Limiting
-
-```
-- 100 requests/minute per API key (general)
-- 50 requests/minute for auth endpoints
-- 1000 requests/minute for analytics queries
-- Burst protection: 200 requests/10 seconds
-```
-
-### CORS Configuration
-
-```javascript
-// Allowed Origins
-const allowedOrigins = ["https://dashboard.scriptpay.io", "https://app.scriptpay.io"];
-
-// Allowed Methods
-["GET", "POST", "PUT", "DELETE"];
-
-// Credentials
-credentials: true;
-```
-
-### Input Validation
-
-- All inputs validated against schema
-- XSS protection via input sanitization
-- SQL injection prevention via Prisma ORM
-- File upload restrictions (type, size, malware scan)
-
-### Output Encoding
-
-- JSON responses properly encoded
-- Error messages don't leak sensitive data
-- Stack traces hidden in production
-
-### CSRF Protection
-
-- CSRF tokens included in state-changing requests
-- Token validation on server-side
-- SameSite cookies: Strict
-
-## Infrastructure Security
-
-### API Gateway
-
-- AWS API Gateway with WAF
-- DDoS protection via AWS Shield
-- Request validation and rate limiting
-- IP whitelisting (internal services)
-
-### Database Security
-
-```
-- PostgreSQL 14+
-- Authentication: Username + password
-- Authorization: Row-level security for audit logs
-- Connection: SSL/TLS encrypted
-- Network: Private VPC, no internet access
-- Backup: 30-day retention, encrypted, tested monthly
-```
-
-### Secrets Management
-
-- AWS Secrets Manager for all credentials
-- Automatic rotation enabled for database passwords
-- Application config via environment variables
-- Never log sensitive values
-
-### Network Security
-
-```
-- Production: Private VPC with no internet gateway
-- NAT Gateway: For outbound connections
-- Security Groups: Least privilege principle
-- Network ACLs: Explicit allow rules
-- VPN: Required for admin access
-```
-
-### Server Security
-
-```
-- OS: Ubuntu 22.04 LTS, hardened
-- Firewall: UFW enabled, port 443/80 only
-- Patching: Automated monthly
-- Monitoring: CloudWatch, Security Hub
-- Logging: ELK stack for aggregation
-```
-
-## Monitoring & Logging
-
-### Audit Logging
-
-- All data changes logged: user, timestamp, action, changes
-- Login attempts: succeeded and failed
-- API key usage: endpoint, IP, timestamp
-- Admin actions: full audit trail
-- Retention: 1 year
-- Immutable: No deletion, only archival
-
-### Security Monitoring
-
-```javascript
-// Events triggering alerts
-- Multiple failed login attempts (5+ in 15 min)
-- API key creation/rotation
-- Permission changes
-- Bulk data exports
-- Payment amount anomalies
-- Failed security checks
-```
-
-### Incident Response
-
-1. **Detection**: CloudWatch alarms + manual review
-2. **Isolation**: Affected systems quarantined
-3. **Assessment**: Severity determination
-4. **Notification**: Affected users within 4 hours
-5. **Remediation**: Fix implemented
-6. **Post-mortem**: Within 24 hours of resolution
-
-### Log Management
-
-```
-- Logs retained: 90 days hot, 1 year cold storage
-- Encryption: All logs encrypted
-- Access: Via CloudTrail audit only
-- Scrubbing: Sensitive data redacted
-- Retention policy: Compliant with GDPR
-```
-
-## Dependency Management
-
-### Vulnerability Scanning
-
-- `npm audit` run on every commit (CI/CD)
-- Snyk integration for continuous monitoring
-- Automated PRs for non-breaking updates
-- Manual review for breaking updates
-- Quarterly security audits
-
-### Approved Dependencies
-
-- Regular review: quarterly
-- License compliance: Apache 2.0, MIT preferred
-- Risk assessment: security + maintenance status
-- Deprecated packages: removed within 30 days
-
-## Threat Scenarios
-
-### Account Compromise
-
-- **Detection**: Login from unusual location/device
-- **Response**: Session termination, password reset required
-- **Prevention**: 2FA, email verification, rate limiting
-
-### SQL Injection
-
-- **Prevention**: Prisma ORM parameterized queries
-- **Detection**: WAF rules, log monitoring
-- **Testing**: OWASP Top 10 penetration testing
-
-### DDoS Attack
-
-- **Prevention**: AWS Shield, CloudFlare DDoS protection
-- **Detection**: Traffic anomaly detection
-- **Response**: Auto-scaling, rate limiting
-
-### Payment Fraud
-
-- **Detection**: Amount anomalies, velocity checks
-- **Prevention**: Stripe 3D Secure, CVV validation
-- **Response**: Transaction decline, account review
-
-### Data Breach
-
-- **Prevention**: Encryption, access controls, monitoring
-- **Detection**: Intrusion detection system alerts
-- **Response**: Incident response plan (see above)
-
-## Third-Party Security
-
-### Stripe Integration
-
-- Uses Stripe PCI compliance (not our responsibility)
-- API key stored in Secrets Manager
-- Webhook signature verification required
-- Limited scopes (test mode for development)
-
-### External Dependencies
-
-- GitHub: 2FA required, branch protection rules
-- AWS: Root account disabled, MFA enforced
-- NPM: Token-based auth, limited scope tokens
-
-## Security Checklist
-
-### Before Deployment
-
-- [ ] Security review completed
-- [ ] OWASP Top 10 validation passed
-- [ ] Penetration testing done
-- [ ] Secrets not committed (git-secrets)
-- [ ] SAST scan passed (SonarQube)
-- [ ] Dependencies audited (npm audit)
-- [ ] Logging implemented
-- [ ] Rate limiting configured
-- [ ] CORS properly set
-- [ ] Error handling doesn't leak data
-
-### During Development
-
-- [ ] Secrets in `.env`, not `.env.example`
-- [ ] Validate all inputs
-- [ ] Sanitize all outputs
-- [ ] Use HTTPS in dev (localhost certificate)
-- [ ] Log security-relevant events
-- [ ] Regular vulnerability scans
-- [ ] Keep dependencies updated
-
-### Incident Response
-
-- [ ] Incident severity determined
-- [ ] Affected systems isolated
-- [ ] Incident lead appointed
-- [ ] Stakeholders notified
-- [ ] Root cause analysis performed
-- [ ] Fix implemented and tested
-- [ ] Communication sent to affected parties
-- [ ] Post-incident review scheduled
-
-## Reporting Security Issues
-
-**DO NOT** create public GitHub issues for security vulnerabilities.
-
-1. Email: `security@scriptpay.io`
-2. Include:
-   - Vulnerability description
-   - Affected component/endpoint
-   - Reproduction steps
-   - Potential impact
-   - Suggested fix (optional)
-
-3. We will:
-   - Acknowledge within 24 hours
-   - Triage within 48 hours
-   - Provide status updates weekly
-   - Coordinate fix and disclosure timeline
-   - Credit finder in advisory (unless declined)
-
-## Resources
-
-- [OWASP Top 10](https://owasp.org/Top10/)
-- [PCI DSS Compliance](https://www.pcisecuritystandards.org/)
-- [GDPR Requirements](https://gdpr.eu/)
-- [AWS Security Best Practices](https://docs.aws.amazon.com/security/)
-- [Node.js Security Best Practices](https://nodejs.org/en/docs/guides/security/)
+Every environment variable the app depends on is declared and validated with Zod (`src/config/env.schema.ts`), including shape checks like "this must decode to exactly 32 bytes" for the encryption key. A missing or malformed value fails startup in CI/deploy instead of surfacing as a runtime failure in production later.

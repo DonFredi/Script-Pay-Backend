@@ -34,4 +34,10 @@ async function bootstrap() {
   await app.listen(env.PORT);
 }
 
-bootstrap();
+bootstrap().catch((error: unknown) => {
+  // Boot-time failure (bad config, DB unreachable, etc.) — nothing is listening yet,
+  // so there's no request path to report this on. Log and exit non-zero instead of
+  // leaving the process hanging in a half-started state.
+  console.error("Fatal error during bootstrap:", error);
+  process.exit(1);
+});

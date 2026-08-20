@@ -49,7 +49,8 @@ export class AlertsService {
   }
 
   // Extension point — implement when an email provider (Resend, SES, etc.) is chosen.
-  async sendEmail(_to: string, _subject: string, _body: string): Promise<void> {
+  sendEmail(_to: string, _subject: string, _body: string): Promise<void> {
     this.logger.warn("sendEmail() called but no email provider is configured yet — see AlertsService");
+    return Promise.resolve();
   }
 }
