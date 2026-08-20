@@ -1,0 +1,115 @@
+# CLAUDE.md — ScriptPay Backend
+
+Guidance for Claude Code (or any AI assistant) working in this repository.
+
+## What this project is
+
+A NestJS + Prisma + PostgreSQL backend for **ScriptPay**, a multi-tenant M-Pesa
+(Safaricom Daraja) payment platform for the Kenyan market. Tenants (merchants)
+integrate against this API to initiate STK Push payments, receive Daraja
+callbacks, and reconcile/report on transactions.
+
+This repo is standalone — not a monorepo. Its counterpart is a sibling
+repository, `Script Pay Frontend` (Next.js 16, App Router), which is the only
+consumer of this API and talks to it purely over REST/HTTP. Nothing in this
+repo imports from or calls into the frontend.
+
+## Real stack — do not assume otherwise
+
+- **Framework**: NestJS 11 (TypeScript, decorators, DI, guards/interceptors/pipes)
+- **Database**: PostgreSQL via Prisma 6 — no TypeORM, no Mongo
+- **Payment provider**: Safaricom Daraja API (STK Push; C2B/Paybill/Till modeled in schema) — no Stripe, no card processing
+- **Auth**: self-issued JWT (`jose`, HS256) + refresh-token rotation, argon2id password hashing. No Firebase — it was fully removed; some inline comments still say "Firebase" and are stale (see below)
+- **Retry/queue**: Postgres-table polling (`WebhookPollerService` via `@nestjs/schedule` cron) — no Redis, no BullMQ
+- **Other**: `argon2` (passwords + API keys), Node `crypto` AES-256-GCM (tenant Daraja credential encryption), `nestjs-pino` (structured logs), `@sentry/node`, `resend` (transactional email), `zod` (request validation + env schema)
+
+## Project structure
+
+```
+src/
+├── app.module.ts           wires everything together — no business logic here
+├── main.ts                 bootstrap: env validation, Sentry init, cookie-parser, CORS
+├── config/env.schema.ts    zod schema for every env var — app refuses to boot if invalid
+├── modules/
+│   ├── prisma/              PrismaService (global)
+│   ├── auth/                 signup/login/refresh/password-reset/email-verification, JWT issuance
+│   │                         AccessTokenGuard, TokenService, RefreshTokenService, EmailService
+│   ├── tenants/               tenant CRUD/onboarding, encrypted Daraja credential storage
+│   ├── api-keys/              issue/list/revoke scoped, argon2-hashed API keys
+│   ├── payments/               STK Push (tenant + dashboard variants), transaction reads, TransactionStateMachine
+│   ├── callbacks/               inbound Daraja webhook ingestion (WebhookIngestService) + Postgres-polling processor (WebhookPollerService)
+│   ├── reconciliation/          DriftDetectorService — active recovery for stuck transactions
+│   ├── reporting/                GET /v1/reporting/summary
+│   ├── audit-log/                 AuditLogService — every sensitive action + Daraja interaction
+│   └── alerts/                     Slack webhook alerts on failures
+├── infrastructure/daraja/  the ONLY code that calls Safaricom (DarajaClient)
+└── common/                 guards, decorators, throttle tiers, pipes, filters, interceptors
+```
+
+There is no `apps/`, no `packages/`, no `k8s/`, no `docker-compose.yml`.
+
+## Real routes
+
+| Method | Path | Guard chain | Notes |
+|---|---|---|---|
+| POST | `/auth/signup`, `/auth/login` | Throttler | issues `access_token`/`refresh_token`/`csrf-token` httpOnly cookies |
+| POST | `/auth/refresh` | Throttler | rotates refresh token, reissues access token |
+| POST | `/auth/forgot-password`, `/auth/reset-password`, `/auth/verify-email`, `/auth/resend-verification` | Throttler, CsrfGuard | |
+| GET | `/profile` | AccessTokenGuard | resolves role/tenantId for the dashboard |
+| POST | `/profile/logout` | AccessTokenGuard | |
+| POST/GET/PATCH | `/v1/tenants*` | AccessTokenGuard, CsrfGuard, RolesGuard | SUPER_ADMIN for create/status |
+| POST/GET/DELETE | `/v1/api-keys*` | AccessTokenGuard, CsrfGuard, RolesGuard | |
+| POST | `/v1/payments/stk-push` | ApiKeyGuard, TenantAwareThrottlerGuard | tenant-to-platform, scope `PAYMENTS_INITIATE` |
+| POST | `/v1/dashboard/payments/stk-push` | AccessTokenGuard | dashboard-initiated STK push |
+| GET | `/v1/transactions`, `/v1/transactions/:id` | AccessTokenGuard | |
+| GET | `/v1/reporting/summary` | AccessTokenGuard | success rate, per-status counts, drift count |
+| GET | `/v1/audit-logs` | AccessTokenGuard, RolesGuard | |
+| POST | `/v1/webhooks/daraja/stk-callback`, `/v1/webhooks/daraja/c2b-confirmation` | Throttler only | inbound from Safaricom; always returns 200, `@SkipResponseTransform` |
+
+Controllers are the source of truth for exact guard order and scopes — verify against the file before repeating a route/guard claim.
+
+## Auth model (read before touching anything auth-related)
+
+- **Dashboard users** (Next.js frontend) → email + password against this backend's own `User` table (argon2id) → backend issues its own short-lived (`JWT_ACCESS_TTL_SECONDS`, default 15 min) access JWT + long-lived refresh token (`JWT_REFRESH_TTL_DAYS`, default 30), both as httpOnly cookies, plus a non-httpOnly `csrf-token` cookie the frontend echoes back as `X-CSRF-Token` on mutating requests. `AccessTokenGuard` verifies the JWT (`Authorization: Bearer`) on every protected route.
+- **Tenant integrations** (a merchant's own backend calling ScriptPay) → `x-api-key` header → `ApiKeyGuard` verifies an argon2 hash (prefix-narrowed lookup, then per-candidate verify) and checks `@RequireScopes(...)`.
+- Never conflate the two guards on one route — pick whichever matches who's actually calling it.
+
+### The guard-ordering rule (this has broken production before)
+
+`RolesGuard` is **not** registered as a global `APP_GUARD` — NestJS runs global guards *before* controller-level ones, and `RolesGuard` needs `request.user`, which only `AccessTokenGuard` sets. A global `RolesGuard` would always see an empty user and reject every `@Roles()` route. It is instead applied explicitly, per-controller, *after* `AccessTokenGuard`/`ApiKeyGuard` in each `@UseGuards([...])` array — same reasoning applies to `TenantAwareThrottlerGuard`, which needs `request.tenantId` set by whichever auth guard runs before it. When adding a new guarded route, match the existing controller's guard order — don't reorder guards without understanding why they're ordered that way (`app.module.ts` has the full rationale in a comment).
+
+## Data model highlights (`prisma/schema.prisma` is the source of truth)
+
+- Money is **integer minor units** (`amountMinorUnits`), never float/Decimal-as-JS-number.
+- `WebhookEvent` is the idempotency guard — every inbound Daraja callback is inserted (unique on `(source, naturalKey)`) *before* processing; a Safaricom retry fails the insert, not the business logic.
+- `RefreshToken` stores only a SHA-256 hash, tracks a rotation chain (`replacedByTokenId`) — a revoked token presented again is a theft signal.
+- `AuditLog` is append-only by convention — never updated/deleted by application code.
+- Tenant-scoped tables carry `tenantId` and are meant to be protected by Postgres RLS; the policy SQL lives in `prisma/manual-sql/001_row_level_security.sql` and must be applied manually (Prisma doesn't manage RLS).
+
+## Environment
+
+Every var is validated by `src/config/env.schema.ts` (zod) — the app refuses to boot on a missing/malformed value. See `.env.example` for the full list. Notable ones:
+- `JWT_ACCESS_SECRET` must be byte-for-byte identical to the frontend's `JWT_ACCESS_SECRET` — it's a shared secret the frontend's Edge middleware uses to verify tokens this backend signs.
+- `CREDENTIALS_ENCRYPTION_KEY` must be a base64-encoded 32-byte key (AES-256-GCM) for tenant Daraja credential encryption.
+- `FRONTEND_ORIGIN` is a required comma-separated CORS allow-list (not optional — an unset value previously produced a silent, headerless CORS failure).
+
+## Running locally
+
+```bash
+cp .env.example .env   # fill in real values, rotated credentials only
+npm install
+npx prisma migrate dev
+psql $DATABASE_URL -f prisma/manual-sql/001_row_level_security.sql
+npm run start:dev
+```
+
+## Known stale spots
+
+- Inline comments in a few files (e.g. `dashboard-stk-push.controller.ts`) still say "Firebase-verified user" — functionally that's now the JWT-verified user from `AccessTokenGuard`. The comment wording is stale; the guard itself is correct. Fix the wording if you're already editing that file; don't go out of your way otherwise.
+
+## What to avoid
+
+- Don't invent Stripe/card/PCI-DSS terminology — this is mobile money (M-Pesa), not card processing.
+- Don't assume a monorepo layout when referencing paths.
+- Don't add or reorder guards on a route without reading the guard-ordering rule above first — this has silently broken every `@Roles()` check in production once already.
+- Don't treat `docs/` references in old commit messages or comments as still valid — the `docs/` folder was deleted (2026-08-20) because it had drifted into fictional/hallucinated content (a nonexistent `scriptpay-agent` CLI, invented files like `coding-standards.md`/`deployment.md`). This file and `README.md` are the current source of truth; if you regenerate multi-file docs later, verify every claim against the actual source before writing it down.
