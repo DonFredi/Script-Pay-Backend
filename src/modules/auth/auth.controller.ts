@@ -22,7 +22,7 @@ import {
 import { StrictPaymentThrottle } from "../../common/throttle-tiers";
 
 const REFRESH_COOKIE = "refresh_token";
-const REFRESH_COOKIE_PATH = "/auth/refresh";
+const REFRESH_COOKIE_PATH = "/api/backend/auth/refresh";
 
 /**
  * Paths here match the frontend's already-built auth modules exactly. Firebase
