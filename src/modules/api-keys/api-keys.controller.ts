@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, ForbiddenException, Get, Param, Post, UseGuards } from "@nestjs/common";
+import { BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Param, Post, Query, UseGuards } from "@nestjs/common";
 import { AccessTokenGuard } from "../auth/access-token.guard";
 import { CsrfGuard } from "../../common/guards/csrf.guard";
 import { RolesGuard } from "../../common/guards/roles.guard";
@@ -37,14 +37,28 @@ export class ApiKeysController {
   }
 
   @Get()
-  list(@CurrentUser() user: AuthenticatedUser) {
-    if (!user.tenantId) throw new ForbiddenException("Platform staff must specify a tenant explicitly");
-    return this.apiKeys.listForTenant(user.tenantId);
+  list(@CurrentUser() user: AuthenticatedUser, @Query("tenantId") tenantId?: string) {
+    return this.apiKeys.listForTenant(this.resolveTenantId(user, tenantId));
   }
 
   @Delete(":id")
-  revoke(@Param("id") id: string, @CurrentUser() user: AuthenticatedUser) {
+  revoke(@Param("id") id: string, @CurrentUser() user: AuthenticatedUser, @Query("tenantId") tenantId?: string) {
+    return this.apiKeys.revoke(this.resolveTenantId(user, tenantId), id, user.id);
+  }
+
+  /**
+   * TENANT_ADMIN is always scoped to their own tenant regardless of any tenantId
+   * query param they pass — prevents guessing another tenant's id to read/revoke
+   * their keys. SUPER_ADMIN has no tenant of their own, so for read/revoke (oversight,
+   * not self-service) they must name one explicitly via ?tenantId= — there's no
+   * "list every tenant's keys at once" mode, this is per-tenant audit-on-demand.
+   */
+  private resolveTenantId(user: AuthenticatedUser, queryTenantId?: string): string {
+    if (user.role === "SUPER_ADMIN") {
+      if (!queryTenantId) throw new BadRequestException("SUPER_ADMIN must specify ?tenantId=");
+      return queryTenantId;
+    }
     if (!user.tenantId) throw new ForbiddenException("Platform staff must specify a tenant explicitly");
-    return this.apiKeys.revoke(user.tenantId, id, user.id);
+    return user.tenantId;
   }
 }

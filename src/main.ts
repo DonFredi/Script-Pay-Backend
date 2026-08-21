@@ -5,10 +5,12 @@ import cookieParser from "cookie-parser";
 import { AppModule } from "./app.module";
 import { validateEnv } from "./config/env.schema";
 
+
+
 async function bootstrap() {
   // Fail fast on boot if config is invalid — never let a service start in a half-configured state.
   const env = validateEnv(process.env);
-
+console.log("MPESA_CALLBACK_BASE_URL:", process.env.MPESA_CALLBACK_BASE_URL);
   // Initialized before anything else so it can capture errors during the rest of bootstrap too.
   if (env.SENTRY_DSN) {
     Sentry.init({
