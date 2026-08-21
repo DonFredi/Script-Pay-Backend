@@ -1,4 +1,4 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { BadGatewayException, Injectable, Logger } from "@nestjs/common";
 
 export interface TenantMpesaCredentials {
   mpesaConsumerKey: string;
@@ -53,7 +53,11 @@ export class DarajaClient {
     if (!response.ok) {
       const body = await response.text();
       this.logger.error(`Daraja OAuth token request failed: ${response.status} ${body}`);
-      throw new Error("Failed to authenticate with Daraja using this tenant's credentials");
+      // A BadGatewayException (not a plain Error) so this reaches the caller as a real
+      // HTTP error the frontend can display, instead of being swallowed into the global
+      // filter's generic "Internal server error" — see docs/decisions.md if this pattern
+      // gets extended further.
+      throw new BadGatewayException("Failed to authenticate with Daraja using this tenant's credentials");
     }
 
     const data = (await response.json()) as { access_token: string; expires_in: string };
@@ -97,7 +101,13 @@ export class DarajaClient {
     const body = await response.json();
     if (!response.ok || body.ResponseCode !== "0") {
       this.logger.error(`Daraja STK push rejected: ${JSON.stringify(body)}`);
-      throw new Error(body.errorMessage ?? body.ResponseDescription ?? "Daraja rejected the STK push request");
+      // Safaricom's own rejection reason (e.g. "Invalid TransactionType", "Invalid
+      // CallBackURL") is safe to surface directly — it describes this tenant's own
+      // request, not another tenant's data — and is far more actionable than the
+      // generic 500 a plain Error would collapse into via the global exception filter.
+      throw new BadGatewayException(
+        body.errorMessage ?? body.ResponseDescription ?? "Daraja rejected the STK push request",
+      );
     }
 
     return {

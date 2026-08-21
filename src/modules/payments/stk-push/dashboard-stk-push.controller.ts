@@ -14,7 +14,7 @@ import { StkPushService } from "./stk-push.service";
  * Deliberately a SEPARATE route + guard from StkPushController (which is API-key
  * authenticated, for tenants' own external integrations). This one is for the
  * dashboard's own "send a payment" form — the caller is a logged-in human, not an
- * automated system, so tenantId comes from their Firebase-verified User record,
+ * automated system, so tenantId comes from AccessTokenGuard,
  * never from a request body field (which a client could tamper with to initiate
  * a payment against a tenant they don't belong to).
  *

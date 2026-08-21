@@ -103,6 +103,30 @@ psql $DATABASE_URL -f prisma/manual-sql/001_row_level_security.sql
 npm run start:dev
 ```
 
+## Further docs
+
+This file and `README.md` are the fast-orientation layer. For depth, see
+`docs/` (regenerated 2026-08-21, verified against source — see "What to
+avoid" below for why that verification matters here specifically):
+
+- `docs/architecture.md` — module map, request flows (STK push, webhook
+  ingestion, drift detection), auth model, retry model, observability.
+- `docs/decisions.md` — ADR log: each entry states the problem, the choice
+  made, and *why the rejected alternative didn't fit* (e.g. why Postgres
+  polling replaced BullMQ/Redis, why RolesGuard isn't global).
+- `docs/api.md` — full route reference: every endpoint, guard chain, request
+  body shape, and the authorization rules enforced beyond the guards
+  themselves.
+- `docs/database.md` — table-by-table Prisma schema reference and the
+  Row-Level Security setup.
+- `docs/security.md` — consolidated security posture: auth, CSRF, rate
+  limiting, secrets at rest, the webhook trust boundary, known gaps.
+
+Two project-specific skills also live in `.claude/skills/`:
+`add-guarded-route` (the guard-ordering checklist, operationalized) and
+`add-tenant-scoped-table` (the RLS/tenantId checklist for a new Prisma
+model) — reach for these before adding a route or table from scratch.
+
 ## Known stale spots
 
 - Inline comments in a few files (e.g. `dashboard-stk-push.controller.ts`) still say "Firebase-verified user" — functionally that's now the JWT-verified user from `AccessTokenGuard`. The comment wording is stale; the guard itself is correct. Fix the wording if you're already editing that file; don't go out of your way otherwise.
@@ -112,4 +136,4 @@ npm run start:dev
 - Don't invent Stripe/card/PCI-DSS terminology — this is mobile money (M-Pesa), not card processing.
 - Don't assume a monorepo layout when referencing paths.
 - Don't add or reorder guards on a route without reading the guard-ordering rule above first — this has silently broken every `@Roles()` check in production once already.
-- Don't treat `docs/` references in old commit messages or comments as still valid — the `docs/` folder was deleted (2026-08-20) because it had drifted into fictional/hallucinated content (a nonexistent `scriptpay-agent` CLI, invented files like `coding-standards.md`/`deployment.md`). This file and `README.md` are the current source of truth; if you regenerate multi-file docs later, verify every claim against the actual source before writing it down.
+- Don't treat `docs/` references in old commit messages or comments as still valid — the ORIGINAL `docs/` folder was deleted (2026-08-20) because it had drifted into fictional/hallucinated content (a nonexistent `scriptpay-agent` CLI, invented files like `coding-standards.md`/`deployment.md`). A new `docs/` was regenerated the same day (see "Further docs" above), verified claim-by-claim against controllers/schema/guards rather than carried over from the deleted version — treat *that* one, plus this file and `README.md`, as current. If you extend `docs/` further, keep verifying against actual source before writing anything down; this repo has already paid for that mistake once.
