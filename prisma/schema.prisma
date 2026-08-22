@@ -10,8 +10,12 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  // Prisma Migrate needs advisory locks, which Supabase's transaction-mode pooler
+  // (DATABASE_URL, port 6543) doesn't support — migrate commands use this direct,
+  // non-pooled connection instead. The app itself still runs on DATABASE_URL.
+  directUrl = env("DIRECT_URL")
 }
 
 enum Role {
@@ -182,6 +186,10 @@ model ApiKey {
   createdAt   DateTime      @default(now())
 
   @@index([tenantId])
+  // ApiKeyGuard narrows every incoming request by keyPrefix before the (expensive)
+  // argon2 verify — that lookup was an unindexed full-table scan until this index
+  // existed, despite the guard's own comment claiming it was already indexed.
+  @@index([keyPrefix])
   @@map("api_keys")
 }
 
