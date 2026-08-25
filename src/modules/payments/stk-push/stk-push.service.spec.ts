@@ -12,18 +12,20 @@ describe("StkPushService", () => {
   let daraja: DarajaClient;
 
   beforeEach(async () => {
+    const prismaMock: any = {
+      transaction: {
+        create: jest.fn(),
+        update: jest.fn(),
+      },
+    };
+    // Mirrors PrismaService.withTenantContext's real signature, running the callback
+    // against this same mock rather than a real transaction.
+    prismaMock.withTenantContext = jest.fn((_tenantId: string, fn: (tx: unknown) => unknown) => fn(prismaMock));
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         StkPushService,
-        {
-          provide: PrismaService,
-          useValue: {
-            transaction: {
-              create: jest.fn(),
-              update: jest.fn(),
-            },
-          },
-        },
+        { provide: PrismaService, useValue: prismaMock },
         {
           provide: DarajaClient,
           useValue: {
@@ -82,6 +84,11 @@ describe("StkPushService", () => {
       // Verify Daraja called only once (not duplicate!)
       expect(daraja.initiateStkPush).toHaveBeenCalledTimes(1);
       expect(result.transactionId).toBe("tx-1");
+
+      // Both DB writes run under the tenant's RLS context — and as two separate
+      // calls, not one transaction spanning the Daraja HTTP call in between.
+      expect(prisma.withTenantContext).toHaveBeenCalledWith("tenant-1", expect.any(Function));
+      expect(prisma.withTenantContext).toHaveBeenCalledTimes(2);
     });
 
     it("should handle Daraja errors gracefully", async () => {
@@ -111,6 +118,9 @@ describe("StkPushService", () => {
           }),
         }),
       );
+      // The failure-path write still runs under the tenant's RLS context, same as the
+      // success path — this is exactly the write a forgotten tenantId filter would miss.
+      expect(prisma.withTenantContext).toHaveBeenCalledWith("tenant-1", expect.any(Function));
     });
   });
 });

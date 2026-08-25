@@ -136,10 +136,16 @@ export class WebhookPollerService {
     const msisdn = payload?.MSISDN;
     const channel = payload?.TransactionType === "Buy Goods" ? "TILL" : "PAYBILL";
 
-    const tenant = await this.prisma.tenant.findFirst({ where: { businessShortcode: businessShortCode } });
+    // Scoped to status: 'active' to match the partial unique index on
+    // businessShortcode (prisma/manual-sql/002_tenant_shortcode_unique_active.sql) —
+    // pending_kyc tenants may share Safaricom's sandbox shortcode while testing, so
+    // only an active tenant can be the unambiguous real target for a live payment.
+    const matches = await this.prisma.tenant.findMany({
+      where: { businessShortcode: businessShortCode, status: "active" },
+    });
 
-    if (!tenant) {
-      this.logger.warn(`C2B confirmation for unknown shortcode ${businessShortCode} — ignoring`);
+    if (matches.length === 0) {
+      this.logger.warn(`C2B confirmation for unknown/inactive shortcode ${businessShortCode} — ignoring`);
       await this.auditLog.record({
         actorType: "system",
         action: "daraja.c2b_unmatched",
@@ -147,6 +153,30 @@ export class WebhookPollerService {
       });
       return;
     }
+
+    if (matches.length > 1) {
+      // Should be unreachable given the partial unique index — if this ever fires,
+      // something bypassed it (a manual DB edit, the index missing in this
+      // environment). Refuse to guess which tenant a real customer payment belongs
+      // to; fail loudly instead of silently misrouting money.
+      this.logger.error(
+        `C2B confirmation for shortcode ${businessShortCode} matched ${matches.length} active tenants — refusing to process`,
+      );
+      await this.auditLog.record({
+        actorType: "system",
+        action: "daraja.c2b_ambiguous_shortcode",
+        metadata: { businessShortCode, transId, matchedTenantIds: matches.map((t) => t.id) },
+      });
+      await this.alerts.send({
+        title: "Ambiguous C2B shortcode match — payment not processed",
+        detail: `${matches.length} active tenants share shortcode ${businessShortCode}. A real customer payment (${transId}) could not be safely routed.`,
+        severity: "critical",
+        context: { businessShortCode, transId, matchedTenantIds: matches.map((t) => t.id) },
+      });
+      return;
+    }
+
+    const tenant = matches[0];
 
     const amountMinorUnits = Math.round(Number(amount) * 100);
 

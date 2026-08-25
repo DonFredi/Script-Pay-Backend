@@ -1,4 +1,5 @@
-import { ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
+import { ConflictException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
+import { Prisma } from "@prisma/client";
 import { PrismaService } from "../prisma/prisma.service";
 import { AuditLogService } from "../audit-log/audit-log.service";
 import type { AuthenticatedUser } from "../../common/decorators/current-user.decorator";
@@ -37,16 +38,18 @@ export class TenantsService {
       throw new ForbiddenException("Cannot configure another tenant's credentials");
     }
 
-    await this.prisma.tenant.update({
-      where: { id: tenantId },
-      data: {
-        businessShortcode: dto.businessShortcode,
-        mpesaConsumerKey: dto.consumerKey,
-        mpesaConsumerSecretEncrypted: this.encryption.encrypt(dto.consumerSecret),
-        mpesaPasskeyEncrypted: this.encryption.encrypt(dto.passkey),
-        mpesaCredentialsConfiguredAt: new Date(),
-      },
-    });
+    await this.rejectingShortcodeConflict(
+      this.prisma.tenant.update({
+        where: { id: tenantId },
+        data: {
+          businessShortcode: dto.businessShortcode,
+          mpesaConsumerKey: dto.consumerKey,
+          mpesaConsumerSecretEncrypted: this.encryption.encrypt(dto.consumerSecret),
+          mpesaPasskeyEncrypted: this.encryption.encrypt(dto.passkey),
+          mpesaCredentialsConfiguredAt: new Date(),
+        },
+      }),
+    );
 
     await this.auditLog.record({
       tenantId,
@@ -109,8 +112,26 @@ export class TenantsService {
       throw new ForbiddenException("Only a tenant admin can provision a tenant");
     }
 
-    const tenant = await this.prisma.tenant.create({ data: { ...dto, status: "pending_kyc" } });
-    await this.prisma.user.update({ where: { id: actor.id }, data: { tenantId: tenant.id } });
+    // The two checks above read actor.tenantId from the request's JWT claims, not a
+    // fresh DB read — a double-submit (or a retried request) can pass both checks
+    // twice before either write lands. tenant.create + user.updateMany run in one
+    // transaction, and updateMany's WHERE re-checks tenantId: null at write time:
+    // only one of two racing requests can actually claim the account, and the loser
+    // throws inside the transaction, rolling its own tenant row back with it instead
+    // of leaving an orphaned Tenant nothing points to.
+    const tenant = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.tenant.create({ data: { ...dto, status: "pending_kyc" } });
+
+      const linked = await tx.user.updateMany({
+        where: { id: actor.id, tenantId: null },
+        data: { tenantId: created.id },
+      });
+      if (linked.count !== 1) {
+        throw new ConflictException("Account is already associated with a tenant");
+      }
+
+      return created;
+    });
 
     await this.auditLog.record({
       tenantId: tenant.id,
@@ -141,10 +162,12 @@ export class TenantsService {
       }
     }
 
-    const tenant = await this.prisma.tenant.update({
-      where: { id: tenantId },
-      data: { status: dto.status },
-    });
+    const tenant = await this.rejectingShortcodeConflict(
+      this.prisma.tenant.update({
+        where: { id: tenantId },
+        data: { status: dto.status },
+      }),
+    );
 
     await this.auditLog.record({
       tenantId,
@@ -157,5 +180,25 @@ export class TenantsService {
     });
 
     return tenant;
+  }
+
+  /**
+   * The only unique constraint that can fire on a tenants.update is the partial
+   * index on businessShortcode scoped to status = 'active' (see
+   * prisma/manual-sql/002_tenant_shortcode_unique_active.sql) — pending_kyc tenants
+   * may share Safaricom's sandbox shortcode freely, so this only ever surfaces once
+   * a shortcode collides with another tenant that's actually live.
+   */
+  private async rejectingShortcodeConflict<T>(op: Promise<T>): Promise<T> {
+    try {
+      return await op;
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+        throw new ConflictException(
+          "This Paybill/Till shortcode is already in use by another active tenant",
+        );
+      }
+      throw error;
+    }
   }
 }

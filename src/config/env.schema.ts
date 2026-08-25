@@ -8,6 +8,7 @@ import { z } from "zod";
  */
 const optionalUrl = () => z.preprocess((v) => (v === "" ? undefined : v), z.string().url().optional());
 const optionalString = (min = 1) => z.preprocess((v) => (v === "" ? undefined : v), z.string().min(min).optional());
+const optionalEmail = () => z.preprocess((v) => (v === "" ? undefined : v), z.string().email().optional());
 
 /**
  * Comma-separated list of allowed CORS origins (e.g. local dev + deployed frontend
@@ -104,6 +105,11 @@ export const envSchema = z.object({
 
   SENTRY_DSN: optionalUrl(),
   SLACK_WEBHOOK_URL: optionalUrl(),
+  // Redundant channel for severity: "critical" alerts only — Slack being down or
+  // misconfigured shouldn't mean a critical failure only ever reaches a log line.
+  // Optional: with this unset, critical alerts still go to Slack (if configured)
+  // and to logs, same as before.
+  ALERTS_EMAIL_TO: optionalEmail(),
 });
 
 export type Env = z.infer<typeof envSchema>;

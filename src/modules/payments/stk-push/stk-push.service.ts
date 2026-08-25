@@ -20,17 +20,25 @@ export class StkPushService {
   ) {}
 
   async initiate(tenantId: string, dto: InitiateStkPushDto) {
+    // Each DB write below runs under its own short withTenantContext call, rather
+    // than one transaction spanning the whole method — the Daraja HTTP call in
+    // between can take seconds, and holding a Postgres transaction open across an
+    // external network call for that long is its own bug (connection pool pressure,
+    // held locks) independent of tenant isolation.
+
     // Step 1: Create transaction FIRST
-    const transaction = await this.prisma.transaction.create({
-      data: {
-        tenantId,
-        channel: "STK_PUSH",
-        status: "PENDING",
-        amountMinorUnits: dto.amountMinorUnits,
-        msisdn: dto.msisdn,
-        metadata: dto.metadata as any,
-      },
-    });
+    const transaction = await this.prisma.withTenantContext(tenantId, (tx) =>
+      tx.transaction.create({
+        data: {
+          tenantId,
+          channel: "STK_PUSH",
+          status: "PENDING",
+          amountMinorUnits: dto.amountMinorUnits,
+          msisdn: dto.msisdn,
+          metadata: dto.metadata as any,
+        },
+      }),
+    );
 
     try {
       // Step 2: Get credentials and call Daraja ONCE
@@ -45,14 +53,16 @@ export class StkPushService {
       });
 
       // Step 3: Update transaction with Daraja response
-      await this.prisma.transaction.update({
-        where: { id: transaction.id },
-        data: {
-          status: "PROCESSING",
-          merchantRequestId: darajaResponse.MerchantRequestID,
-          checkoutRequestId: darajaResponse.CheckoutRequestID,
-        },
-      });
+      await this.prisma.withTenantContext(tenantId, (tx) =>
+        tx.transaction.update({
+          where: { id: transaction.id },
+          data: {
+            status: "PROCESSING",
+            merchantRequestId: darajaResponse.MerchantRequestID,
+            checkoutRequestId: darajaResponse.CheckoutRequestID,
+          },
+        }),
+      );
 
       // Step 4: Audit log
       await this.auditLog.record({
@@ -72,10 +82,12 @@ export class StkPushService {
     } catch (error) {
       this.logger.error(`STK push initiation failed for transaction ${transaction.id}`, error as Error);
 
-      await this.prisma.transaction.update({
-        where: { id: transaction.id },
-        data: { status: "FAILED", failureReason: "daraja_initiation_error" },
-      });
+      await this.prisma.withTenantContext(tenantId, (tx) =>
+        tx.transaction.update({
+          where: { id: transaction.id },
+          data: { status: "FAILED", failureReason: "daraja_initiation_error" },
+        }),
+      );
 
       await this.auditLog.record({
         tenantId,

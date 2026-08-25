@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # Reads only prisma/schema.prisma — no DATABASE_URL needed, this never
+      # connects to a database.
+      - run: npx prisma generate
+
+      - run: npx tsc --noEmit
+
+      # No --fix here on purpose: CI verifies, it doesn't rewrite your branch.
+      # Fails only on real errors — this codebase has pre-existing `any`-typed
+      # warnings on the Daraja webhook payload boundary that aren't part of
+      # this gate; see the guard/interceptor files for why.
+      - run: npx eslint "{src,scripts}/**/*.ts"
+
+      # All unit tests mock PrismaService — no live database needed. If a
+      # future test genuinely requires one, it belongs in a separate e2e job
+      # with its own disposable database, not here.
+      - run: npm test -- --ci
+
+      # Compiles with the real NestJS CLI — catches build-only failures
+      # tsc --noEmit alone can miss. No env vars needed: env is read at
+      # runtime (main.ts), not at build time.
+      - run: npm run build

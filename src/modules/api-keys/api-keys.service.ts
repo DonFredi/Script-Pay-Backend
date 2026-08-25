@@ -28,9 +28,11 @@ export class ApiKeysService {
     const rawKey = `sp_${randomBytes(40).toString("hex")}`;
     const keyHash = await argon2.hash(rawKey + PEPPER);
 
-    const record = await this.prisma.apiKey.create({
-      data: { tenantId, keyHash, keyPrefix: rawKey.slice(0, 8), scopes, expiresAt },
-    });
+    const record = await this.prisma.withTenantContext(tenantId, (tx) =>
+      tx.apiKey.create({
+        data: { tenantId, keyHash, keyPrefix: rawKey.slice(0, 8), scopes, expiresAt },
+      }),
+    );
 
     await this.auditLog.record({
       tenantId,
@@ -47,28 +49,33 @@ export class ApiKeysService {
 
   async listForTenant(tenantId: string) {
     // Deliberately excludes keyHash from the select — never return it, even to the owning tenant.
-    return this.prisma.apiKey.findMany({
-      where: { tenantId },
-      select: {
-        id: true,
-        keyPrefix: true,
-        scopes: true,
-        lastUsedAt: true,
-        revokedAt: true,
-        expiresAt: true,
-        createdAt: true,
-      },
-      orderBy: { createdAt: "desc" },
-    });
+    return this.prisma.withTenantContext(tenantId, (tx) =>
+      tx.apiKey.findMany({
+        where: { tenantId },
+        select: {
+          id: true,
+          keyPrefix: true,
+          scopes: true,
+          lastUsedAt: true,
+          revokedAt: true,
+          expiresAt: true,
+          createdAt: true,
+        },
+        orderBy: { createdAt: "desc" },
+      }),
+    );
   }
 
   async revoke(tenantId: string, keyId: string, actorId: string) {
     // Scoped by tenantId in the WHERE clause, not just the id — prevents one tenant
-    // from revoking another tenant's key by guessing/enumerating IDs.
-    const result = await this.prisma.apiKey.updateMany({
-      where: { id: keyId, tenantId },
-      data: { revokedAt: new Date() },
-    });
+    // from revoking another tenant's key by guessing/enumerating IDs. Also runs under
+    // RLS's tenant context now, so this is enforced twice over (see PrismaService.withTenantContext).
+    const result = await this.prisma.withTenantContext(tenantId, (tx) =>
+      tx.apiKey.updateMany({
+        where: { id: keyId, tenantId },
+        data: { revokedAt: new Date() },
+      }),
+    );
 
     if (result.count > 0) {
       await this.auditLog.record({

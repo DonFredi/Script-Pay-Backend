@@ -9,13 +9,18 @@ describe("ApiKeysService", () => {
   let auditLog: AuditLogService;
 
   beforeEach(async () => {
+    const prismaMock: any = {
+      apiKey: { create: jest.fn(), findMany: jest.fn(), updateMany: jest.fn() },
+    };
+    // Mirrors the real PrismaService.withTenantContext signature but runs the callback
+    // against this same mock instead of a real transaction — lets tests assert both
+    // that the tenant context was set (the fix) and that the query still ran correctly.
+    prismaMock.withTenantContext = jest.fn((_tenantId: string, fn: (tx: unknown) => unknown) => fn(prismaMock));
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         ApiKeysService,
-        {
-          provide: PrismaService,
-          useValue: { apiKey: { create: jest.fn(), findMany: jest.fn(), updateMany: jest.fn() } },
-        },
+        { provide: PrismaService, useValue: prismaMock },
         { provide: AuditLogService, useValue: { record: jest.fn() } },
       ],
     }).compile();
@@ -61,6 +66,16 @@ describe("ApiKeysService", () => {
 
       expect(first.rawKey).not.toBe(second.rawKey);
     });
+
+    it("creates the key under that tenant's RLS context", async () => {
+      jest
+        .spyOn(prisma.apiKey, "create")
+        .mockImplementation((({ data }: any) => Promise.resolve({ id: "key-1", ...data })) as any);
+
+      await service.create("tenant-1", [], "actor-1");
+
+      expect(prisma.withTenantContext).toHaveBeenCalledWith("tenant-1", expect.any(Function));
+    });
   });
 
   describe("listForTenant", () => {
@@ -72,6 +87,7 @@ describe("ApiKeysService", () => {
       const args = (prisma.apiKey.findMany as jest.Mock).mock.calls[0][0];
       expect(args.select.keyHash).toBeUndefined();
       expect(args.where).toEqual({ tenantId: "tenant-1" });
+      expect(prisma.withTenantContext).toHaveBeenCalledWith("tenant-1", expect.any(Function));
     });
   });
 
@@ -86,6 +102,7 @@ describe("ApiKeysService", () => {
         data: { revokedAt: expect.any(Date) },
       });
       expect(auditLog.record).toHaveBeenCalledWith(expect.objectContaining({ action: "api_key.revoked" }));
+      expect(prisma.withTenantContext).toHaveBeenCalledWith("tenant-1", expect.any(Function));
     });
 
     it("does not audit-log when nothing matched (wrong tenant or unknown key)", async () => {

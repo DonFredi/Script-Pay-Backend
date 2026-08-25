@@ -25,13 +25,19 @@ export class TransactionsController {
     @Query("status") status?: TransactionStatus,
     @Query("tenantId") queryTenantId?: string,
   ) {
+    // resolveTenantId always resolves to exactly one concrete tenant, even for
+    // SUPER_ADMIN (it requires ?tenantId= explicitly, see below) — so this can
+    // always run under that one tenant's RLS context, no unscoped "all tenants"
+    // path exists here to conflict with it.
     const tenantId = this.resolveTenantId(user, queryTenantId);
 
-    return this.prisma.transaction.findMany({
-      where: { tenantId, ...(status ? { status } : {}) },
-      orderBy: { createdAt: "desc" },
-      take: 100,
-    });
+    return this.prisma.withTenantContext(tenantId, (tx) =>
+      tx.transaction.findMany({
+        where: { tenantId, ...(status ? { status } : {}) },
+        orderBy: { createdAt: "desc" },
+        take: 100,
+      }),
+    );
   }
 
   /**
@@ -42,10 +48,28 @@ export class TransactionsController {
    */
   @Get(":id")
   async findOne(@Param("id") id: string, @CurrentUser() user: AuthenticatedUser) {
-    const transaction = await this.prisma.transaction.findUnique({ where: { id } });
+    if (user.role === "SUPER_ADMIN") {
+      // Genuinely doesn't have a target tenant to scope by until after this read —
+      // that's the whole point of this branch. Not RLS-covered today: doing that
+      // properly needs the dedicated BYPASSRLS connection path the RLS SQL file's
+      // own header comments call for, which isn't provisioned yet. This read stays
+      // app-layer only, same as before.
+      const transaction = await this.prisma.transaction.findUnique({ where: { id } });
+      if (!transaction) throw new NotFoundException("Transaction not found");
+      return transaction;
+    }
+
+    if (!user.tenantId) throw new ForbiddenException("Account has no associated tenant");
+
+    const transaction = await this.prisma.withTenantContext(user.tenantId, (tx) =>
+      tx.transaction.findUnique({ where: { id } }),
+    );
     if (!transaction) throw new NotFoundException("Transaction not found");
 
-    if (user.role !== "SUPER_ADMIN" && transaction.tenantId !== user.tenantId) {
+    // Redundant with the RLS context above once that's actually enforced (see
+    // PrismaService.withTenantContext) — kept anyway, same "neither layer alone is
+    // enough" reasoning the rest of this codebase already follows.
+    if (transaction.tenantId !== user.tenantId) {
       throw new ForbiddenException("Cannot access another tenant's transaction");
     }
 
