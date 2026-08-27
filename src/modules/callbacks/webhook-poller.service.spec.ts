@@ -1,6 +1,6 @@
 import { Test, TestingModule } from "@nestjs/testing";
 import { WebhookPollerService } from "./webhook-poller.service";
-import { PrismaService } from "../prisma/prisma.service";
+import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 import { TransactionStateMachine } from "../payments/transaction-state-machine";
 import { AuditLogService } from "../audit-log/audit-log.service";
 import { AlertsService } from "../alerts/alerts.service";
@@ -23,7 +23,7 @@ function c2bEvent(overrides: Partial<Record<string, unknown>> = {}) {
 
 describe("WebhookPollerService — C2B shortcode resolution", () => {
   let service: WebhookPollerService;
-  let prisma: PrismaService;
+  let prisma: PrismaPrivilegedService;
   let stateMachine: TransactionStateMachine;
   let auditLog: AuditLogService;
   let alerts: AlertsService;
@@ -33,7 +33,7 @@ describe("WebhookPollerService — C2B shortcode resolution", () => {
       providers: [
         WebhookPollerService,
         {
-          provide: PrismaService,
+          provide: PrismaPrivilegedService,
           useValue: {
             webhookEvent: { findMany: jest.fn(), update: jest.fn() },
             tenant: { findMany: jest.fn() },
@@ -47,7 +47,7 @@ describe("WebhookPollerService — C2B shortcode resolution", () => {
     }).compile();
 
     service = module.get(WebhookPollerService);
-    prisma = module.get(PrismaService);
+    prisma = module.get(PrismaPrivilegedService);
     stateMachine = module.get(TransactionStateMachine);
     auditLog = module.get(AuditLogService);
     alerts = module.get(AlertsService);

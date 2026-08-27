@@ -55,7 +55,7 @@ Guard chain: `AccessTokenGuard, CsrfGuard, RolesGuard` (order matters —
 | GET | `/v1/tenants` | `SUPER_ADMIN` | — | List all tenants. |
 | GET | `/v1/tenants/:id` | any authenticated | — | No `@Roles()` restriction at the decorator level — `TenantsService.findOne` enforces "only your own tenant" for non-`SUPER_ADMIN` callers. |
 | POST | `/v1/tenants/:id/mpesa-credentials` | any authenticated (service-enforced) | `{ businessShortcode, consumerKey, consumerSecret, passkey }` | Encrypts `consumerSecret`/`passkey` before storage (see `docs/architecture.md`, secrets section). |
-| PATCH | `/v1/tenants/:id/status` | `SUPER_ADMIN`, `TENANT_ADMIN` | `{ status: "active" \| "suspended" \| "pending_kyc" }` | `SUPER_ADMIN` may set any status on any tenant. `TENANT_ADMIN` may only toggle their own tenant between `active`/`suspended` — `TenantsService.updateStatus` blocks a `TENANT_ADMIN` from setting `pending_kyc`, even though the DTO itself accepts the value (authorization lives in the service, not the schema). `TENANT_STAFF` is excluded entirely by `@Roles()`. |
+| PATCH | `/v1/tenants/:id/status` | `SUPER_ADMIN`, `TENANT_ADMIN` | `{ status: "active" \| "suspended" \| "pending_kyc" }` | `SUPER_ADMIN` may set any status on any tenant. `TENANT_ADMIN` may only toggle their own tenant between `active`/`suspended` — `TenantsService.updateStatus` blocks a `TENANT_ADMIN` from setting `pending_kyc`, even though the DTO itself accepts the value (authorization lives in the service, not the schema). `TENANT_STAFF` is excluded entirely by `@Roles()`. **A transition into `active` from any other status auto-provisions the tenant's first API key** (see the API-keys section below and `docs/decisions.md` entry 14) — idempotent, skipped if the tenant already holds a live key. |
 
 ## API keys — `/v1/api-keys`
 
@@ -70,10 +70,22 @@ manages keys, it does not authenticate via one; don't confuse it with
 | GET | `/v1/api-keys` | — | Lists the caller's tenant's keys (hash never returned). |
 | DELETE | `/v1/api-keys/:id` | — | Revokes a key belonging to the caller's tenant. |
 
-`SUPER_ADMIN` callers have `tenantId: null` and are rejected with
-`ForbiddenException("Platform staff must specify a tenant explicitly")` on
-all three routes — this controller manages *a specific tenant's* keys, not
-platform-wide key administration.
+`TENANT_ADMIN` is always scoped to their own tenant on all three routes,
+regardless of any `?tenantId=` they pass. `SUPER_ADMIN` callers have
+`tenantId: null` and must pass `?tenantId=` explicitly on all three
+(`BadRequestException` if omitted) — there's no "act on every tenant at once"
+mode, this is per-tenant, on-demand only. This applies to `create` too as of
+2026-08-27: platform staff can now issue a key on a tenant's behalf (e.g.
+onboarding/support), matching the oversight `list`/`revoke` already had —
+previously `create` unconditionally rejected any caller with `tenantId: null`.
+The primary path for a tenant obtaining a key is now neither of the above by
+default: as of 2026-08-27, `TenantsService.updateStatus` auto-provisions a
+default-scoped key (`PAYMENTS_INITIATE`, `PAYMENTS_READ`, `WEBHOOKS_MANAGE`)
+the moment a tenant transitions into `"active"`, emailed once to every
+`TENANT_ADMIN` on the account — see `docs/decisions.md` entry 14. This route
+remains available for a tenant that wants a second scoped key, or platform
+staff provisioning one manually; it's an optional capability, not a required
+onboarding step.
 
 ## Payments — STK Push initiation
 
@@ -112,6 +124,48 @@ no associated tenant yet (hasn't completed onboarding).
 Creates a `Transaction` row (`status: PENDING`), calls `DarajaClient` to
 initiate the real STK push, records `daraja.stk_push_initiated` (or
 `_failed`) in the audit log.
+
+## Tenant webhook config — `POST /v1/tenants/webhook-config`
+
+Guard chain: `ApiKeyGuard, TenantAwareThrottlerGuard`, `@RequireScopes("WEBHOOKS_MANAGE")`,
+`StrictPaymentThrottle`. API-key-authenticated (merchant-to-platform), like
+`/v1/payments/stk-push` — not a dashboard route, since registering where
+settlement notifications go is an integration concern, not something a human
+fills into a form.
+
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| POST | `/v1/tenants/webhook-config` | `{ webhookUrl: string }` (must be `https://`) | Generates a fresh `whsec_<64 hex>` secret server-side (never client-supplied), encrypts it at rest (same AES-256-GCM pattern as Daraja credentials), stores it + the URL on `Tenant`. Returns `{ webhookUrl, webhookSecret }` — the raw secret is shown **exactly once**, same principle as API key issuance. Re-calling this route rotates both the URL and the secret. Audit-logged as `tenant.webhook_configured` with `actorType: "api_key"`. |
+
+### Outbound delivery — settlement/failure notifications
+
+Once configured, every `Transaction` that transitions to `SETTLED` or `FAILED`
+via `TransactionStateMachine` (STK-push-initiated only — not C2B/Paybill-Till,
+see the method's own doc comment) enqueues a `TenantWebhookDelivery` row in
+the same DB transaction as the transition itself. `TenantWebhookPollerService`
+(Postgres-table polling, same architecture as `WebhookPollerService` — see
+`docs/decisions.md`) delivers it:
+
+```json
+POST <tenant's webhookUrl>
+X-ScriptPay-Signature: sha256=<hex HMAC-SHA256 of the raw body, keyed by webhookSecret>
+Content-Type: application/json
+
+{
+  "transactionId": "uuid",
+  "status": "SETTLED" | "FAILED",
+  "mpesaReceiptNumber": "string | null",
+  "amountMinorUnits": 1234500,
+  "metadata": { "...": "echoed back from the original stk-push call" },
+  "occurredAt": "ISO-8601"
+}
+```
+
+Retries on a non-2xx response or network error/timeout with backoff (30s, 2m,
+10m, 30m, 1h), up to 5 attempts, then marks the delivery `FAILED` (terminal)
+and fires a critical alert via `AlertsService`. A tenant with no `webhookUrl`
+configured never gets a delivery row queued in the first place — this is
+opt-in, not a default for every tenant.
 
 ## Transactions — `/v1/transactions`
 

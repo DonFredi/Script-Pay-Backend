@@ -12,9 +12,15 @@ describe("ReportingService", () => {
         ReportingService,
         {
           provide: PrismaService,
-          useValue: {
-            transaction: { groupBy: jest.fn() },
-            reconciliationRecord: { count: jest.fn() },
+          useFactory: (): PrismaService => {
+            const mock: any = {
+              transaction: { groupBy: jest.fn() },
+              reconciliationRecord: { count: jest.fn() },
+            };
+            // Mirrors PrismaService.withTenantContext's real signature, running the
+            // callback against this same mock rather than a real transaction.
+            mock.withTenantContext = jest.fn((_tenantId: string, fn: (tx: unknown) => unknown) => fn(mock));
+            return mock as PrismaService;
           },
         },
       ],
@@ -66,5 +72,14 @@ describe("ReportingService", () => {
     const args = (prisma.transaction.groupBy as jest.Mock).mock.calls[0][0];
     expect(args.where.tenantId).toBe("tenant-42");
     expect(args.where.createdAt.gte).toBeInstanceOf(Date);
+  });
+
+  it("runs both reads under the requested tenant's RLS context", async () => {
+    jest.spyOn(prisma.transaction, "groupBy").mockResolvedValueOnce([]);
+    jest.spyOn(prisma.reconciliationRecord, "count").mockResolvedValueOnce(0);
+
+    await service.paymentSummary("tenant-42", 7);
+
+    expect((prisma as any).withTenantContext).toHaveBeenCalledWith("tenant-42", expect.any(Function));
   });
 });

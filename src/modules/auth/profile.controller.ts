@@ -2,12 +2,16 @@ import { Controller, Get, Post, Req, Res, UseGuards } from "@nestjs/common";
 import type { Request, Response } from "express";
 import { AccessTokenGuard } from "./access-token.guard";
 import { RefreshTokenService } from "./refresh-token.service";
-import { CsrfGuard } from "../../common/guards/csrf.guard"; // ← ADD IMPORT
+import { CsrfGuard } from "../../common/guards/csrf.guard";
 import { CurrentUser, type AuthenticatedUser } from "../../common/decorators/current-user.decorator";
 import { PrismaService } from "../prisma/prisma.service";
 
 const REFRESH_COOKIE = "refresh_token";
-const REFRESH_COOKIE_PATH = "/auth/refresh";
+// Must match AuthController's REFRESH_COOKIE_PATH exactly — a cookie can only be
+// cleared (or, before this was fixed, even read here at all) via a Set-Cookie whose
+// path matches the cookie's actual stored path. See that file's own comment for
+// the bug this caused when the two paths didn't match.
+const REFRESH_COOKIE_PATH = "/";
 
 /**
  * Deliberately a separate controller from AuthController, matching the frontend's
@@ -25,7 +29,12 @@ export class ProfileController {
   @Get()
   @UseGuards(AccessTokenGuard)
   async me(@CurrentUser() user: AuthenticatedUser) {
-    const record = await this.prisma.user.findUniqueOrThrow({ where: { id: user.id } });
+    // A tenant-less caller (SUPER_ADMIN, or a user mid-onboarding) has a NULL
+    // tenantId on their own row too — the RLS policy's `tenantId IS NULL` branch
+    // matches that unconditionally, so no context needs to be set for them.
+    const record = user.tenantId
+      ? await this.prisma.withTenantContext(user.tenantId, (tx) => tx.user.findUniqueOrThrow({ where: { id: user.id } }))
+      : await this.prisma.user.findUniqueOrThrow({ where: { id: user.id } });
     return {
       id: record.id,
       username: record.username,
@@ -37,7 +46,7 @@ export class ProfileController {
   }
 
   @Post("logout")
-  @UseGuards(CsrfGuard) // ← ADD CSRF GUARD
+  @UseGuards(CsrfGuard)
   async logout(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
     const rawRefreshToken = req.cookies?.[REFRESH_COOKIE];
     if (rawRefreshToken) {
@@ -45,7 +54,7 @@ export class ProfileController {
     }
     res.clearCookie(REFRESH_COOKIE, { path: REFRESH_COOKIE_PATH });
     res.clearCookie("access_token", { path: "/" });
-    res.clearCookie("csrf-token", { path: "/" }); // ← ADD THIS LINE
+    res.clearCookie("csrf-token", { path: "/" });
     return { loggedOut: true };
   }
 }

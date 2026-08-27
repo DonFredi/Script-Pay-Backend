@@ -1,6 +1,7 @@
 import { ForbiddenException, NotFoundException } from "@nestjs/common";
 import { TransactionsController } from "./transactions.controller";
 import { PrismaService } from "../prisma/prisma.service";
+import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 import type { AuthenticatedUser } from "../../common/decorators/current-user.decorator";
 
 function user(overrides: Partial<AuthenticatedUser> = {}): AuthenticatedUser {
@@ -10,6 +11,7 @@ function user(overrides: Partial<AuthenticatedUser> = {}): AuthenticatedUser {
 describe("TransactionsController", () => {
   let controller: TransactionsController;
   let prisma: PrismaService;
+  let prismaPrivileged: PrismaPrivilegedService;
 
   beforeEach(() => {
     const prismaMock: any = {
@@ -20,13 +22,18 @@ describe("TransactionsController", () => {
     // that the tenant context was set (the fix) and that the query still ran correctly.
     prismaMock.withTenantContext = jest.fn((_tenantId: string, fn: (tx: unknown) => unknown) => fn(prismaMock));
 
+    const prismaPrivilegedMock: any = {
+      transaction: { findUnique: jest.fn() },
+    };
+
     // Instantiated directly rather than via Test.createTestingModule: this controller
     // carries @UseGuards() class metadata, and Nest's testing DI tries to resolve
     // those guards' own dependencies (TokenService, etc.) even when the controller is
     // only under test as a plain class — irrelevant noise for a unit test that calls
     // its methods directly and never goes through the HTTP/guard pipeline.
     prisma = prismaMock;
-    controller = new TransactionsController(prisma);
+    prismaPrivileged = prismaPrivilegedMock;
+    controller = new TransactionsController(prisma, prismaPrivileged);
   });
 
   describe("list", () => {
@@ -82,13 +89,28 @@ describe("TransactionsController", () => {
       );
     });
 
-    it("does not set a tenant RLS context for SUPER_ADMIN, who has no single target tenant here", async () => {
+    it("discovers the tenant via the privileged (bypass) connection, then re-fetches under that tenant's RLS context on the normal connection", async () => {
+      jest.spyOn(prismaPrivileged.transaction, "findUnique").mockResolvedValueOnce({
+        id: "tx-1",
+        tenantId: "tenant-9",
+      } as any);
       jest.spyOn(prisma.transaction, "findUnique").mockResolvedValueOnce({ id: "tx-1", tenantId: "tenant-9" } as any);
 
       const result = await controller.findOne("tx-1", user({ role: "SUPER_ADMIN", tenantId: null }));
 
-      expect(prisma.withTenantContext).not.toHaveBeenCalled();
+      expect(prismaPrivileged.transaction.findUnique).toHaveBeenCalledWith({ where: { id: "tx-1" } });
+      expect(prisma.withTenantContext).toHaveBeenCalledWith("tenant-9", expect.any(Function));
+      expect(prisma.transaction.findUnique).toHaveBeenCalledWith({ where: { id: "tx-1" } });
       expect(result).toEqual({ id: "tx-1", tenantId: "tenant-9" });
+    });
+
+    it("SUPER_ADMIN gets NotFoundException if the privileged discovery read finds nothing", async () => {
+      jest.spyOn(prismaPrivileged.transaction, "findUnique").mockResolvedValueOnce(null);
+
+      await expect(controller.findOne("tx-missing", user({ role: "SUPER_ADMIN", tenantId: null }))).rejects.toThrow(
+        NotFoundException,
+      );
+      expect(prisma.withTenantContext).not.toHaveBeenCalled();
     });
 
     it("rejects an account with no associated tenant", async () => {

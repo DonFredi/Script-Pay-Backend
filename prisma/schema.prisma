@@ -45,6 +45,12 @@ enum ApiKeyScope {
   WEBHOOKS_MANAGE
 }
 
+enum TenantWebhookDeliveryStatus {
+  PENDING
+  DELIVERED
+  FAILED
+}
+
 // Immutable-by-convention record of every sensitive action: admin actions
 // (tenant creation, key issuance/revocation) AND every M-Pesa interaction
 // (outbound Daraja calls, not just inbound callbacks — WebhookEvent covers those).
@@ -84,6 +90,14 @@ model Tenant {
   mpesaPasskeyEncrypted        String?
   mpesaCredentialsConfiguredAt DateTime?
 
+  // Outbound settlement-notification config — set by the tenant itself via
+  // POST /v1/tenants/webhook-config (WEBHOOKS_MANAGE scope), not by platform staff.
+  // webhookSecretEncrypted follows the exact same AES-256-GCM-at-rest pattern as the
+  // Daraja credentials above; the raw secret is only ever shown once, at creation time
+  // (see TenantsService.configureWebhook), same principle as ApiKey.keyHash.
+  webhookUrl                String?
+  webhookSecretEncrypted    String?
+  webhookConfiguredAt       DateTime?
 
   users             User[]
   apiKeys           ApiKey[]
@@ -91,6 +105,7 @@ model Tenant {
   ledgerEntries     LedgerEntry[]
   webhookEvents     WebhookEvent[]
   reconciliations   ReconciliationRecord[]
+  webhookDeliveries TenantWebhookDelivery[]
 
   @@map("tenants")
 }
@@ -212,10 +227,37 @@ model Transaction {
 
   ledgerEntries       LedgerEntry[]
   reconciliation      ReconciliationRecord?
+  webhookDeliveries   TenantWebhookDelivery[]
 
   @@index([tenantId, createdAt])
   @@index([tenantId, status])
   @@map("transactions")
+}
+
+// Outbound delivery queue for tenant settlement-notification webhooks — the mirror
+// image of WebhookEvent (which queues INBOUND Daraja callbacks). Enqueued by
+// TransactionStateMachine in the same DB transaction as the settle/fail it's
+// reporting, so a delivery is never missed for a transition that actually committed;
+// delivered by TenantWebhookPollerService (Postgres-table polling, same architectural
+// choice as WebhookPollerService over Redis/BullMQ — see docs/decisions.md).
+model TenantWebhookDelivery {
+  id            String                      @id @default(uuid())
+  tenantId      String
+  tenant        Tenant                      @relation(fields: [tenantId], references: [id])
+  transactionId String
+  transaction   Transaction                 @relation(fields: [transactionId], references: [id])
+  payload       Json
+  status        TenantWebhookDeliveryStatus @default(PENDING)
+  attempts      Int                         @default(0)
+  nextAttemptAt DateTime                    @default(now())
+  lastError     String?
+  deliveredAt   DateTime?
+  createdAt     DateTime                    @default(now())
+
+  // Poller's own query shape: "due PENDING rows, oldest first".
+  @@index([status, nextAttemptAt])
+  @@index([tenantId, createdAt])
+  @@map("tenant_webhook_deliveries")
 }
 
 // Double-entry style ledger: every settled transaction produces balanced entries.

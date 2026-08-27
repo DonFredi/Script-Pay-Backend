@@ -1,6 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { Cron, CronExpression } from "@nestjs/schedule";
-import { PrismaService } from "../prisma/prisma.service";
+import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 import { TransactionStateMachine } from "../payments/transaction-state-machine";
 import { AuditLogService } from "../audit-log/audit-log.service";
 import { AlertsService } from "../alerts/alerts.service";
@@ -21,7 +21,10 @@ export class WebhookPollerService {
   private isPolling = false; // prevents overlapping runs if one poll takes longer than the interval
 
   constructor(
-    private readonly prisma: PrismaService,
+    // Polls across every tenant's unprocessed events in one pass, and reads a
+    // transaction before its tenant is known (looked up by checkoutRequestId) —
+    // see PrismaPrivilegedService's own doc comment.
+    private readonly prisma: PrismaPrivilegedService,
     private readonly stateMachine: TransactionStateMachine,
     private readonly auditLog: AuditLogService,
     private readonly alerts: AlertsService,

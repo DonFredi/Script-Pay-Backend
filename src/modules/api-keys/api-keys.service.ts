@@ -25,12 +25,11 @@ export class ApiKeysService {
    * an 8-char prefix (for UI identification) are persisted.
    */
   async create(tenantId: string, scopes: ApiKeyScope[], actorId: string, expiresAt?: Date) {
-    const rawKey = `sp_${randomBytes(40).toString("hex")}`;
-    const keyHash = await argon2.hash(rawKey + PEPPER);
+    const { rawKey, keyHash, keyPrefix } = await this.mintKeyMaterial();
 
     const record = await this.prisma.withTenantContext(tenantId, (tx) =>
       tx.apiKey.create({
-        data: { tenantId, keyHash, keyPrefix: rawKey.slice(0, 8), scopes, expiresAt },
+        data: { tenantId, keyHash, keyPrefix, scopes, expiresAt },
       }),
     );
 
@@ -45,6 +44,59 @@ export class ApiKeysService {
     });
 
     return { id: record.id, rawKey, keyPrefix: record.keyPrefix, scopes: record.scopes };
+  }
+
+  /**
+   * System-triggered issuance — no human actor initiated this, so it's
+   * audit-logged as actorType "system" (actorId null) rather than attributing
+   * it to whichever admin happened to flip the tenant's status field. Only
+   * ever called via provisionDefaultKeyIfNeeded below.
+   */
+  private async createSystemIssued(tenantId: string, scopes: ApiKeyScope[]) {
+    const { rawKey, keyHash, keyPrefix } = await this.mintKeyMaterial();
+
+    const record = await this.prisma.withTenantContext(tenantId, (tx) =>
+      tx.apiKey.create({
+        data: { tenantId, keyHash, keyPrefix, scopes },
+      }),
+    );
+
+    await this.auditLog.record({
+      tenantId,
+      actorType: "system",
+      action: "api_key.created",
+      targetType: "ApiKey",
+      targetId: record.id,
+      metadata: { scopes, keyPrefix: record.keyPrefix, reason: "tenant_activated" },
+    });
+
+    return { id: record.id, rawKey, keyPrefix: record.keyPrefix, scopes: record.scopes };
+  }
+
+  /**
+   * Auto-provisioning entry point — called once by TenantsService.updateStatus
+   * when a tenant transitions into "active", so a merchant who only wants to
+   * accept payments never has to visit an API-key management page at all (see
+   * docs/decisions.md entry 14). Idempotent: a tenant that already holds a
+   * live (non-revoked) key — most commonly re-activating after a suspension —
+   * never gets a redundant second one just for that. Default scopes cover the
+   * two wired tenant-integration capabilities (STK push initiation, webhook
+   * registration) plus the reserved-but-not-yet-wired PAYMENTS_READ, so a
+   * tenant never needs a second key issued the day that scope gets a route.
+   */
+  async provisionDefaultKeyIfNeeded(tenantId: string) {
+    const existing = await this.prisma.withTenantContext(tenantId, (tx) =>
+      tx.apiKey.findFirst({ where: { tenantId, revokedAt: null } }),
+    );
+    if (existing) return null;
+
+    return this.createSystemIssued(tenantId, ["PAYMENTS_INITIATE", "PAYMENTS_READ", "WEBHOOKS_MANAGE"]);
+  }
+
+  private async mintKeyMaterial() {
+    const rawKey = `sp_${randomBytes(40).toString("hex")}`;
+    const keyHash = await argon2.hash(rawKey + PEPPER);
+    return { rawKey, keyHash, keyPrefix: rawKey.slice(0, 8) };
   }
 
   async listForTenant(tenantId: string) {

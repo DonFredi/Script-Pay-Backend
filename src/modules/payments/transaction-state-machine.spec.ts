@@ -1,6 +1,6 @@
 import { Test, TestingModule } from "@nestjs/testing";
 import { TransactionStateMachine } from "./transaction-state-machine";
-import { PrismaService } from "../prisma/prisma.service";
+import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 
 describe("TransactionStateMachine", () => {
   let service: TransactionStateMachine;
@@ -8,6 +8,7 @@ describe("TransactionStateMachine", () => {
     transaction: { findUniqueOrThrow: jest.Mock; update: jest.Mock; create: jest.Mock };
     ledgerEntry: { createMany: jest.Mock };
     reconciliationRecord: { create: jest.Mock; updateMany: jest.Mock };
+    tenantWebhookDelivery: { create: jest.Mock };
   };
 
   beforeEach(async () => {
@@ -15,13 +16,14 @@ describe("TransactionStateMachine", () => {
       transaction: { findUniqueOrThrow: jest.fn(), update: jest.fn(), create: jest.fn() },
       ledgerEntry: { createMany: jest.fn() },
       reconciliationRecord: { create: jest.fn(), updateMany: jest.fn() },
+      tenantWebhookDelivery: { create: jest.fn() },
     };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         TransactionStateMachine,
         {
-          provide: PrismaService,
+          provide: PrismaPrivilegedService,
           useValue: {
             $transaction: jest.fn((fn: (tx: unknown) => unknown) => fn(tx)),
           },
@@ -59,6 +61,51 @@ describe("TransactionStateMachine", () => {
           data: expect.objectContaining({ transactionId: "tx-1", expectedAmount: 10000, confirmedAmount: 10000 }),
         }),
       );
+      // No tenant.webhookUrl on this fixture — nothing to notify, so no delivery is queued.
+      expect(tx.tenantWebhookDelivery.create).not.toHaveBeenCalled();
+    });
+
+    it("enqueues a webhook delivery when the tenant has a webhookUrl configured", async () => {
+      tx.transaction.findUniqueOrThrow.mockResolvedValueOnce({
+        id: "tx-1",
+        tenantId: "tenant-1",
+        status: "PROCESSING",
+        amountMinorUnits: 10000,
+        metadata: { orderRef: "abc" },
+        tenant: { webhookUrl: "https://example.com/webhooks/scriptpay" },
+      });
+
+      await service.transitionToSettled("tx-1", { mpesaReceiptNumber: "REC123" });
+
+      expect(tx.tenantWebhookDelivery.create).toHaveBeenCalledWith({
+        data: {
+          tenantId: "tenant-1",
+          transactionId: "tx-1",
+          payload: {
+            transactionId: "tx-1",
+            status: "SETTLED",
+            mpesaReceiptNumber: "REC123",
+            amountMinorUnits: 10000,
+            metadata: { orderRef: "abc" },
+            occurredAt: expect.any(String),
+          },
+        },
+      });
+    });
+
+    it("does not enqueue a second delivery for an idempotent duplicate settlement", async () => {
+      tx.transaction.findUniqueOrThrow.mockResolvedValueOnce({
+        id: "tx-1",
+        tenantId: "tenant-1",
+        status: "SETTLED",
+        mpesaReceiptNumber: "REC123",
+        amountMinorUnits: 10000,
+        tenant: { webhookUrl: "https://example.com/webhooks/scriptpay" },
+      });
+
+      await service.transitionToSettled("tx-1", { mpesaReceiptNumber: "REC123" });
+
+      expect(tx.tenantWebhookDelivery.create).not.toHaveBeenCalled();
     });
 
     it("settles PROCESSING -> SETTLED even with no receipt number yet (drift-detection path)", async () => {
@@ -169,6 +216,35 @@ describe("TransactionStateMachine", () => {
       expect(tx.transaction.update).toHaveBeenCalledWith({
         where: { id: "tx-1" },
         data: { status: "FAILED", failureReason: "insufficient_funds" },
+      });
+      expect(tx.tenantWebhookDelivery.create).not.toHaveBeenCalled();
+    });
+
+    it("enqueues a FAILED webhook delivery when the tenant has a webhookUrl configured", async () => {
+      tx.transaction.findUniqueOrThrow.mockResolvedValueOnce({
+        id: "tx-1",
+        tenantId: "tenant-1",
+        status: "PROCESSING",
+        amountMinorUnits: 10000,
+        metadata: null,
+        tenant: { webhookUrl: "https://example.com/webhooks/scriptpay" },
+      });
+
+      await service.transitionToFailed("tx-1", { failureReason: "insufficient_funds" });
+
+      expect(tx.tenantWebhookDelivery.create).toHaveBeenCalledWith({
+        data: {
+          tenantId: "tenant-1",
+          transactionId: "tx-1",
+          payload: {
+            transactionId: "tx-1",
+            status: "FAILED",
+            mpesaReceiptNumber: null,
+            amountMinorUnits: 10000,
+            metadata: null,
+            occurredAt: expect.any(String),
+          },
+        },
       });
     });
 

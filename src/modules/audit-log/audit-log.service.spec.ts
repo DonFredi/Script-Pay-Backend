@@ -1,7 +1,7 @@
 import { Test, TestingModule } from "@nestjs/testing";
 import { ForbiddenException } from "@nestjs/common";
 import { AuditLogService } from "./audit-log.service";
-import { PrismaService } from "../prisma/prisma.service";
+import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 import type { AuthenticatedUser } from "../../common/decorators/current-user.decorator";
 
 function user(overrides: Partial<AuthenticatedUser> = {}): AuthenticatedUser {
@@ -10,18 +10,18 @@ function user(overrides: Partial<AuthenticatedUser> = {}): AuthenticatedUser {
 
 describe("AuditLogService", () => {
   let service: AuditLogService;
-  let prisma: PrismaService;
+  let prisma: PrismaPrivilegedService;
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         AuditLogService,
-        { provide: PrismaService, useValue: { auditLog: { create: jest.fn(), findMany: jest.fn() } } },
+        { provide: PrismaPrivilegedService, useValue: { auditLog: { create: jest.fn(), findMany: jest.fn() } } },
       ],
     }).compile();
 
     service = module.get(AuditLogService);
-    prisma = module.get(PrismaService);
+    prisma = module.get(PrismaPrivilegedService);
   });
 
   describe("record", () => {

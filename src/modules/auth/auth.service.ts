@@ -1,7 +1,7 @@
 import { ConflictException, Injectable, UnauthorizedException } from "@nestjs/common";
 import * as argon2 from "argon2";
 import type { Role } from "@prisma/client";
-import { PrismaService } from "../prisma/prisma.service";
+import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 import { TokenService } from "./token.service";
 import { RefreshTokenService } from "./refresh-token.service";
 import { VerificationTokenService } from "./verification-token.service";
@@ -32,7 +32,10 @@ export interface SessionResult {
 @Injectable()
 export class AuthService {
   constructor(
-    private readonly prisma: PrismaService,
+    // AuthService looks up users BY EMAIL, before any tenant identity exists to
+    // scope by — see PrismaPrivilegedService's own doc comment for why this can't
+    // go through PrismaService.withTenantContext.
+    private readonly prisma: PrismaPrivilegedService,
     private readonly tokens: TokenService,
     private readonly refreshTokens: RefreshTokenService,
     private readonly verificationTokens: VerificationTokenService,

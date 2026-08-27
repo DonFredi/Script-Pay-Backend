@@ -1,7 +1,7 @@
 import * as argon2 from "argon2";
 import { ExecutionContext, UnauthorizedException } from "@nestjs/common";
 import { ApiKeyGuard } from "./api-key.guard";
-import { PrismaService } from "../../modules/prisma/prisma.service";
+import { PrismaPrivilegedService } from "../../modules/prisma/prisma-privileged.service";
 
 function contextWithRequest(request: Record<string, unknown>) {
   return {
@@ -13,7 +13,7 @@ function contextWithRequest(request: Record<string, unknown>) {
 
 describe("ApiKeyGuard", () => {
   let guard: ApiKeyGuard;
-  let prisma: PrismaService;
+  let prisma: PrismaPrivilegedService;
   let reflector: { getAllAndOverride: jest.Mock };
   let rawKey: string;
   let keyHash: string;
@@ -83,6 +83,7 @@ describe("ApiKeyGuard", () => {
     expect(result).toBe(true);
     expect(req.tenantId).toBe("tenant-1");
     expect(req.apiKeyScopes).toEqual(["PAYMENTS_INITIATE"]);
+    expect(req.apiKeyId).toBe("k-1");
   });
 
   it("never matches a revoked key — revoked keys aren't even fetched as candidates", async () => {

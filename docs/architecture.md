@@ -42,7 +42,9 @@ TenantsModule              — tenant CRUD, encrypted Daraja credential storage
 ApiKeysModule               — issue/list/revoke scoped API keys
 PaymentsModule              — STK Push initiation, transaction reads, TransactionStateMachine
   └─ exports TransactionStateMachine → consumed by CallbacksModule and ReconciliationModule
-CallbacksModule              — inbound Daraja webhook ingestion + Postgres-polling processor
+CallbacksModule              — inbound Daraja webhook ingestion + Postgres-polling processor;
+                                also outbound tenant-webhook delivery (TenantWebhookPollerService)
+                                — imports TenantsModule for CredentialsEncryptionService
 ReconciliationModule         — DriftDetectorService, active recovery for stuck transactions
 ReportingModule              — GET /v1/reporting/summary
 ```
@@ -114,6 +116,44 @@ TransactionStateMachine.transitionToSettled / transitionToFailed
 The unprocessed `WebhookEvent` row *is* the queue — there is no separate
 broker. See `docs/decisions.md` for why this replaced an earlier
 Redis/BullMQ-based processor.
+
+## Request flow: outbound tenant webhook delivery
+
+The mirror image of the inbound flow above — a tenant integration (e.g.
+scripttagg-leadgen) registers `POST /v1/tenants/webhook-config`
+(`ApiKeyGuard`, `@RequireScopes("WEBHOOKS_MANAGE")`) to receive settlement
+notifications instead of polling `GET /v1/transactions`, which requires a
+dashboard session an automated backend doesn't have.
+
+```
+TransactionStateMachine.transitionToSettled / transitionToFailed
+      │ (STK-push-initiated transitions only — not recordInboundSettlement/C2B)
+      │ same DB transaction as the status change itself
+      ▼
+tenant.webhookUrl set? ── no ──▶ nothing queued (opt-in, most tenants have none configured)
+      │ yes
+      ▼
+TenantWebhookDelivery row created, status PENDING
+      ▼
+TenantWebhookPollerService (@Cron EVERY_10_SECONDS)
+      │ SELECT ... WHERE status = 'PENDING' AND nextAttemptAt <= now(), take 20
+      ▼
+POST tenant.webhookUrl, X-ScriptPay-Signature: sha256=<HMAC over the body,
+     keyed by the tenant's decrypted webhookSecret>
+      │
+      ├─ 2xx ──▶ status DELIVERED
+      └─ else ─▶ attempts++, nextAttemptAt = now + backoff[attempts]
+                 (30s, 2m, 10m, 30m, 1h)
+                 5th failure ──▶ status FAILED (terminal) + AlertsService (critical)
+```
+
+Enqueuing inside the same transaction as the settle/fail means a delivery is
+never missed for a transition that actually committed, and the idempotent
+early-return branches in `transitionToSettled` (duplicate Safaricom
+redelivery, receipt-number backfill) never enqueue a second notification for
+the same real-world settlement. See `docs/decisions.md` entry 12 for why this
+is Postgres-table polling rather than an inline `fetch` or a queue
+technology, matching entry 2's reasoning applied to the opposite direction.
 
 ## Request flow: reconciliation (drift detection)
 

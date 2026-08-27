@@ -1,7 +1,7 @@
 import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
 import * as argon2 from "argon2";
-import { PrismaService } from "../../modules/prisma/prisma.service";
+import { PrismaPrivilegedService } from "../../modules/prisma/prisma-privileged.service";
 import { API_KEY_SCOPES_KEY } from "../decorators/api-key-scopes.decorator";
 import type { ApiKeyScope } from "@prisma/client";
 
@@ -14,7 +14,10 @@ import type { ApiKeyScope } from "@prisma/client";
 @Injectable()
 export class ApiKeyGuard implements CanActivate {
   constructor(
-    private readonly prisma: PrismaService,
+    // Resolves WHICH tenant this key belongs to — the tenant is the OUTPUT of this
+    // lookup, not an input, so it can't go through withTenantContext. See
+    // PrismaPrivilegedService's own doc comment.
+    private readonly prisma: PrismaPrivilegedService,
     private readonly reflector: Reflector,
   ) {}
 
@@ -72,6 +75,7 @@ export class ApiKeyGuard implements CanActivate {
 
     request.tenantId = matched.tenantId;
     request.apiKeyScopes = matched.scopes;
+    request.apiKeyId = matched.id; // for audit-log traceability on routes that mutate state via API key auth
 
     return true;
   }

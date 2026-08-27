@@ -1,5 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common";
-import { PrismaService } from "../prisma/prisma.service";
+import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
+import { Prisma } from "@prisma/client";
 import type { TransactionStatus } from "@prisma/client";
 
 /**
@@ -20,7 +21,10 @@ const ALLOWED_TRANSITIONS: Record<TransactionStatus, TransactionStatus[]> = {
 export class TransactionStateMachine {
   private readonly logger = new Logger(TransactionStateMachine.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  // Only ever invoked by WebhookPollerService/DriftDetectorService — both
+  // cross-tenant background jobs with no single tenant to scope by. See
+  // PrismaPrivilegedService's own doc comment.
+  constructor(private readonly prisma: PrismaPrivilegedService) {}
 
   /**
    * mpesaReceiptNumber is OPTIONAL: DriftDetectorService settles a transaction from
@@ -31,7 +35,10 @@ export class TransactionStateMachine {
    */
   async transitionToSettled(transactionId: string, data: { mpesaReceiptNumber?: string }) {
     await this.prisma.$transaction(async (tx) => {
-      const transaction = await tx.transaction.findUniqueOrThrow({ where: { id: transactionId } });
+      const transaction = await tx.transaction.findUniqueOrThrow({
+        where: { id: transactionId },
+        include: { tenant: { select: { webhookUrl: true } } },
+      });
 
       if (transaction.status === "SETTLED") {
         // Already settled — most commonly Safaricom redelivering the same callback, but
@@ -91,18 +98,67 @@ export class TransactionStateMachine {
           reconciledAt: new Date(),
         },
       });
+
+      // Only on the transition that actually just happened, not the idempotent
+      // early-returns above — a redelivered Safaricom callback must never cause a
+      // second settlement notification to go out to the tenant.
+      await this.enqueueWebhookDelivery(tx, transaction, "SETTLED", data.mpesaReceiptNumber ?? null);
     });
   }
 
   async transitionToFailed(transactionId: string, data: { failureReason: string }) {
     await this.prisma.$transaction(async (tx) => {
-      const transaction = await tx.transaction.findUniqueOrThrow({ where: { id: transactionId } });
+      const transaction = await tx.transaction.findUniqueOrThrow({
+        where: { id: transactionId },
+        include: { tenant: { select: { webhookUrl: true } } },
+      });
       this.assertTransitionAllowed(transaction.status, "FAILED");
 
       await tx.transaction.update({
         where: { id: transactionId },
         data: { status: "FAILED", failureReason: data.failureReason },
       });
+
+      await this.enqueueWebhookDelivery(tx, transaction, "FAILED", null);
+    });
+  }
+
+  /**
+   * Deliberately NOT called from recordInboundSettlement (C2B/Paybill-Till) — that
+   * path is out of scope for the ScriptPay-STK-Push-integration module spec this was
+   * built for (see Script-Pay-Backend usage notes / scripttagg-leadgen CRM doc
+   * Section 16.1), which only asked for notification on the STK-push-initiated
+   * settle/fail transitions above. Revisit if a tenant integration ever needs C2B
+   * settlement notifications too — not assumed here.
+   */
+  private async enqueueWebhookDelivery(
+    tx: Prisma.TransactionClient,
+    transaction: {
+      id: string;
+      tenantId: string;
+      amountMinorUnits: number;
+      metadata: unknown;
+      mpesaReceiptNumber?: string | null;
+      tenant?: { webhookUrl: string | null } | null;
+    },
+    status: "SETTLED" | "FAILED",
+    mpesaReceiptNumber: string | null,
+  ) {
+    if (!transaction.tenant?.webhookUrl) return;
+
+    await tx.tenantWebhookDelivery.create({
+      data: {
+        tenantId: transaction.tenantId,
+        transactionId: transaction.id,
+        payload: {
+          transactionId: transaction.id,
+          status,
+          mpesaReceiptNumber: mpesaReceiptNumber ?? transaction.mpesaReceiptNumber ?? null,
+          amountMinorUnits: transaction.amountMinorUnits,
+          metadata: transaction.metadata ?? null,
+          occurredAt: new Date().toISOString(),
+        },
+      },
     });
   }
 

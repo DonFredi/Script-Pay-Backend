@@ -1,13 +1,13 @@
 import { Test, TestingModule } from "@nestjs/testing";
 import { DriftDetectorService } from "./drift-detector.service";
-import { PrismaService } from "../prisma/prisma.service";
+import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 import { DarajaClient } from "../../infrastructure/daraja/daraja.client";
 import { TransactionStateMachine } from "../payments/transaction-state-machine";
 import { TenantsService } from "../tenants/tenants.service";
 
 describe("DriftDetectorService", () => {
   let service: DriftDetectorService;
-  let prisma: PrismaService;
+  let prisma: PrismaPrivilegedService;
   let daraja: DarajaClient;
   let stateMachine: TransactionStateMachine;
   let tenantsService: TenantsService;
@@ -17,7 +17,7 @@ describe("DriftDetectorService", () => {
       providers: [
         DriftDetectorService,
         {
-          provide: PrismaService,
+          provide: PrismaPrivilegedService,
           useValue: {
             transaction: { findMany: jest.fn() },
             reconciliationRecord: { updateMany: jest.fn() },
@@ -33,7 +33,7 @@ describe("DriftDetectorService", () => {
     }).compile();
 
     service = module.get(DriftDetectorService);
-    prisma = module.get(PrismaService);
+    prisma = module.get(PrismaPrivilegedService);
     daraja = module.get(DarajaClient);
     stateMachine = module.get(TransactionStateMachine);
     tenantsService = module.get(TenantsService);

@@ -2,11 +2,15 @@ import { Module } from "@nestjs/common";
 import { DarajaWebhookController } from "./daraja-webhook.controller";
 import { WebhookIngestService } from "./webhook-ingest.service";
 import { WebhookPollerService } from "./webhook-poller.service";
+import { TenantWebhookPollerService } from "./tenant-webhook-poller.service";
 import { PaymentsModule } from "../payments/payments.module";
+import { TenantsModule } from "../tenants/tenants.module";
 
 @Module({
-  imports: [PaymentsModule],
+  // TenantsModule for CredentialsEncryptionService — TenantWebhookPollerService
+  // decrypts Tenant.webhookSecretEncrypted at delivery time.
+  imports: [PaymentsModule, TenantsModule],
   controllers: [DarajaWebhookController],
-  providers: [WebhookIngestService, WebhookPollerService],
+  providers: [WebhookIngestService, WebhookPollerService, TenantWebhookPollerService],
 })
 export class CallbacksModule {}

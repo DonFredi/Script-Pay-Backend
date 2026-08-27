@@ -98,6 +98,7 @@ unauthenticated requests. Three tiers (`src/common/throttle-tiers.ts`):
 | Email verification / password reset token | SHA-256 (implied by "hashed", same pattern as refresh tokens) | No |
 | Tenant Daraja Consumer Secret / Passkey | AES-256-GCM | Yes — the backend must recover the real value to call Safaricom |
 | Tenant Daraja Consumer Key | Plaintext | N/A — Safaricom treats it like a client ID, not a secret |
+| Tenant webhook secret (`Tenant.webhookSecretEncrypted`) | AES-256-GCM | Yes — `TenantWebhookPollerService` must recover it to sign each outbound delivery's HMAC |
 
 `CREDENTIALS_ENCRYPTION_KEY` (32-byte, base64) is the AES key for the one
 reversible case. `API_KEY_HASH_PEPPER` is an application-wide secret mixed
@@ -131,6 +132,28 @@ credentials to. Trust is established structurally instead:
   protocol requirement (Safaricom retries aggressively on anything else),
   not a security relaxation; failures are captured in `WebhookEvent.processingError`
   and alerted on via `AlertsService` after `MAX_ATTEMPTS` (5).
+
+## Outbound webhook trust boundary
+
+The reverse of the inbound case above: ScriptPay is the caller, a tenant's
+own server is the recipient. Trust runs the other direction accordingly:
+
+- `POST /v1/tenants/webhook-config` is `ApiKeyGuard`-gated with
+  `@RequireScopes("WEBHOOKS_MANAGE")` — only a tenant holding a key with that
+  scope can set or rotate *their own* `webhookUrl`; `request.tenantId` comes
+  from the verified key, never from the request body.
+- The webhook secret is generated server-side (never accepted from the
+  caller) and shown exactly once, same principle as API key issuance — a
+  weak or guessable tenant-chosen secret is never possible.
+- Every delivery is signed (`X-ScriptPay-Signature: sha256=<HMAC-SHA256 of
+  the raw body>`) so the tenant's receiver can verify a request genuinely
+  came from ScriptPay before acting on it — this is the outbound equivalent
+  of `WebhookEvent`'s idempotency guard protecting the inbound side.
+- `webhookUrl` must be `https://` (enforced by the zod schema) — no
+  plaintext delivery of settlement data.
+- A delivery only ever fires for a tenant that has explicitly configured a
+  `webhookUrl` — opt-in, not a default that would otherwise POST tenant
+  transaction data to an unconfigured/attacker-guessable destination.
 
 ## Audit trail
 

@@ -3,7 +3,7 @@ import { AccessTokenGuard } from "./access-token.guard";
 import { TokenService } from "./token.service";
 
 function contextWithHeaders(headers: Record<string, string>, request: Record<string, unknown> = {}) {
-  const req: any = { headers, ...request };
+  const req: Record<string, unknown> = { headers, ...request };
   return {
     switchToHttp: () => ({ getRequest: () => req }),
   } as unknown as ExecutionContext;
@@ -43,7 +43,7 @@ describe("AccessTokenGuard", () => {
       role: "TENANT_ADMIN",
       tenantId: "tenant-1",
     });
-    const req: any = { headers: { authorization: "Bearer good.token.here" } };
+    const req: Record<string, unknown> = { headers: { authorization: "Bearer good.token.here" } };
     const ctx = { switchToHttp: () => ({ getRequest: () => req }) } as unknown as ExecutionContext;
 
     const result = await guard.canActivate(ctx);

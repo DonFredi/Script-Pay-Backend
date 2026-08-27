@@ -21,6 +21,7 @@ export class AlertsService {
   private readonly slackWebhookUrl = process.env.SLACK_WEBHOOK_URL;
   private readonly alertsEmailTo = process.env.ALERTS_EMAIL_TO;
   private readonly emailFrom = process.env.EMAIL_FROM;
+  private readonly platformName = process.env.PLATFORM_NAME || "ScriptPay";
   private readonly resend?: Resend;
 
   constructor() {
@@ -35,7 +36,7 @@ export class AlertsService {
     if (alert.severity === "critical" && this.alertsEmailTo) {
       await this.sendEmail(
         this.alertsEmailTo,
-        `[ScriptPay] ${alert.title}`,
+        `[${this.platformName}] ${alert.title}`,
         `<p>${alert.detail}</p>${
           alert.context ? `<pre>${this.escapeHtml(JSON.stringify(alert.context, null, 2))}</pre>` : ""
         }`,

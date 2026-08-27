@@ -37,9 +37,12 @@ Holds encrypted Daraja credentials directly:
 | `mpesaConsumerSecretEncrypted` | AES-256-GCM, format `iv:authTag:ciphertext` (hex). |
 | `mpesaPasskeyEncrypted` | Same format. |
 | `mpesaCredentialsConfiguredAt` | Null until `POST /v1/tenants/:id/mpesa-credentials` succeeds — used to detect a tenant that hasn't configured payments yet. |
+| `webhookUrl` | Where to POST settlement/failure notifications. Set via `POST /v1/tenants/webhook-config` (API-key-authenticated, `WEBHOOKS_MANAGE` scope) — a tenant integration concern, not a dashboard field. Null means no outbound notifications for this tenant (opt-in). |
+| `webhookSecretEncrypted` | AES-256-GCM, same format/mechanism as the Daraja fields — decrypted only by `TenantWebhookPollerService` at delivery time to sign the HMAC. Server-generated (`whsec_<64 hex>`), never client-supplied; shown to the caller exactly once, at configuration time. |
+| `webhookConfiguredAt` | Set (and overwritten) each time `configureWebhook` runs — re-registering rotates both the URL and the secret. |
 
 Relations: `users`, `apiKeys`, `transactions`, `ledgerEntries`,
-`webhookEvents`, `reconciliations`.
+`webhookEvents`, `reconciliations`, `webhookDeliveries`.
 
 ### `users` (`User`)
 
@@ -124,6 +127,28 @@ fails the insert itself rather than needing a separate dedup check. `status`
 `docs/decisions.md` entry 2) track the polling processor's progress.
 `tenantId` is nullable — not always resolvable at ingestion time, e.g. before
 the payload has been matched to a known `businessShortcode`.
+
+### `tenant_webhook_deliveries` (`TenantWebhookDelivery`)
+
+Outbound mirror of `webhook_events` — that one queues INBOUND Daraja
+callbacks; this queues OUTBOUND settlement/failure notifications to a
+tenant's own `webhookUrl`. Enqueued by `TransactionStateMachine` in the same
+DB transaction as the `SETTLED`/`FAILED` transition it reports (STK-push
+paths only — not C2B/Paybill-Till, see the method's own doc comment), so a
+delivery is never silently missed for a transition that actually committed,
+and never double-enqueued for an idempotent duplicate settlement. `payload`
+is the exact `Json` body that gets POSTed (transactionId, status,
+mpesaReceiptNumber, amountMinorUnits, metadata, occurredAt). `status`
+(`TenantWebhookDeliveryStatus`: `PENDING | DELIVERED | FAILED`), `attempts`,
+and `nextAttemptAt` track `TenantWebhookPollerService`'s retry/backoff
+progress (30s/2m/10m/30m/1h, 5 attempts max, then terminal `FAILED` + a
+critical alert). Only ever created for a tenant that has `webhookUrl` set at
+the moment of settlement/failure — no row is queued for the majority of
+tenants who haven't configured one.
+
+Indexes: `(status, nextAttemptAt)` for the poller's own query shape (due
+`PENDING` rows, oldest first), `(tenantId, createdAt)` per the standard
+tenant-scoped-table convention.
 
 ### `reconciliation_records` (`ReconciliationRecord`)
 

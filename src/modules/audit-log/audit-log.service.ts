@@ -1,5 +1,5 @@
 import { ForbiddenException, Injectable, Logger } from "@nestjs/common";
-import { PrismaService } from "../prisma/prisma.service";
+import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 import type { AuthenticatedUser } from "../../common/decorators/current-user.decorator";
 
 export interface AuditEntry {
@@ -16,7 +16,11 @@ export interface AuditEntry {
 export class AuditLogService {
   private readonly logger = new Logger(AuditLogService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  // Writes carry an explicit tenantId from many calling contexts, not all of them
+  // already tenant-scoped (system-actor entries, pre-auth signup events) — see
+  // PrismaPrivilegedService's own doc comment for why this can't go through
+  // withTenantContext.
+  constructor(private readonly prisma: PrismaPrivilegedService) {}
 
   /**
    * Fire-and-forget by design: a failed audit write must never fail the business

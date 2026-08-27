@@ -2,7 +2,7 @@ import { Test, TestingModule } from "@nestjs/testing";
 import { UnauthorizedException } from "@nestjs/common";
 import { hash, verify } from "argon2";
 import { AuthService } from "./auth.service";
-import { PrismaService } from "../prisma/prisma.service";
+import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 import { TokenService } from "./token.service";
 import { RefreshTokenService } from "./refresh-token.service";
 import { VerificationTokenService } from "./verification-token.service";
@@ -11,7 +11,7 @@ import { AuditLogService } from "../audit-log/audit-log.service";
 
 describe("AuthService", () => {
   let service: AuthService;
-  let prisma: PrismaService;
+  let prisma: PrismaPrivilegedService;
 
   const now = new Date();
   const baseUser = {
@@ -31,7 +31,7 @@ describe("AuthService", () => {
       providers: [
         AuthService,
         {
-          provide: PrismaService,
+          provide: PrismaPrivilegedService,
           useValue: {
             user: {
               findUnique: jest.fn(),
@@ -83,7 +83,7 @@ describe("AuthService", () => {
     }).compile();
 
     service = module.get<AuthService>(AuthService);
-    prisma = module.get<PrismaService>(PrismaService);
+    prisma = module.get<PrismaPrivilegedService>(PrismaPrivilegedService);
   });
 
   describe("signup", () => {

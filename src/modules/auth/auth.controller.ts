@@ -22,7 +22,17 @@ import {
 import { StrictPaymentThrottle } from "../../common/throttle-tiers";
 
 const REFRESH_COOKIE = "refresh_token";
-const REFRESH_COOKIE_PATH = "/api/backend/auth/refresh";
+// path: "/" — deliberately NOT scoped to just the refresh endpoint. It used to be
+// ("/api/backend/auth/refresh", matching the frontend's proxy prefix), and that was
+// a real bug: ProfileController.logout's clearCookie used a DIFFERENT path
+// ("/auth/refresh"), which doesn't match a cookie's path for clearing purposes — so
+// logout never actually cleared it. Worse, because the cookie's real path was
+// scoped that narrowly, the browser never even SENT it to /profile/logout in the
+// first place, so logout's revoke() call silently never ran either — the refresh
+// token stayed valid, so reloading after "logging out" silently logged back in.
+// httpOnly already blocks JS access, so path scoping bought no real security here —
+// just a bug. Every cookie this app sets now uses path: "/" for that reason.
+const REFRESH_COOKIE_PATH = "/";
 
 /**
  * Paths here match the frontend's already-built auth modules exactly. Firebase
@@ -68,6 +78,13 @@ export class AuthController {
     const { accessToken, refreshToken } = await this.authService.refresh(rawRefreshToken);
     this.setRefreshCookie(res, refreshToken);
     this.setAccessCookie(res, accessToken);
+    // csrf-token's own maxAge (7 days) is shorter than a session's real lifetime —
+    // sessions stay alive indefinitely via silent refresh, but nothing used to
+    // reissue this cookie after the initial login. A session older than 7 days lost
+    // CSRF protection entirely (every state-changing request, logout included,
+    // failed with "CSRF token missing") until the user logged in again. Reissuing
+    // it here keeps it exactly as fresh as the session itself.
+    this.setCsrfCookie(res);
     return { accessToken };
   }
 

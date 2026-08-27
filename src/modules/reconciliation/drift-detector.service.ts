@@ -1,6 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { Cron, CronExpression } from "@nestjs/schedule";
-import { PrismaService } from "../prisma/prisma.service";
+import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 import { DarajaClient } from "../../infrastructure/daraja/daraja.client";
 import { TransactionStateMachine } from "../payments/transaction-state-machine";
 import { TenantsService } from "../tenants/tenants.service";
@@ -20,7 +20,9 @@ export class DriftDetectorService {
   private static readonly STUCK_THRESHOLD_MINUTES = 15;
 
   constructor(
-    private readonly prisma: PrismaService,
+    // Scans across every tenant's stuck transactions in one pass — see
+    // PrismaPrivilegedService's own doc comment.
+    private readonly prisma: PrismaPrivilegedService,
     private readonly daraja: DarajaClient,
     private readonly stateMachine: TransactionStateMachine,
     private readonly tenantsService: TenantsService,

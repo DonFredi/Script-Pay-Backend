@@ -65,6 +65,15 @@ export const envSchema = z.object({
 
   DATABASE_URL: z.string().url(),
 
+  // Second connection, for PrismaPrivilegedService — code paths that can't resolve
+  // to a single tenant before querying (see that file's own doc comment). Optional:
+  // unset falls back to DATABASE_URL, which is the correct behavior before the RLS
+  // rollout's live cutover (both connections are the same owner-role connection,
+  // which already bypasses RLS regardless — see 001_row_level_security.sql). Once
+  // that cutover happens, this must point at the app_privileged (BYPASSRLS) role,
+  // never at app_runtime.
+  PRIVILEGED_DATABASE_URL: optionalUrl(),
+
   MPESA_CONSUMER_KEY: z.string().min(1),
   MPESA_CONSUMER_SECRET: z.string().min(1),
   MPESA_PASSKEY: z.string().min(1),
@@ -110,6 +119,14 @@ export const envSchema = z.object({
   // Optional: with this unset, critical alerts still go to Slack (if configured)
   // and to logs, same as before.
   ALERTS_EMAIL_TO: optionalEmail(),
+
+  // Product name used in outbound email subject lines (verification, password
+  // reset). Optional — unset behaves exactly like today (defaults to "ScriptPay"
+  // in EmailService itself, not here, since process.env isn't rewritten with
+  // zod defaults after validateEnv() runs — see main.ts). Exists so a
+  // differently-branded deployment of this codebase doesn't have to edit source
+  // to change it, matching the frontend's branding externalization.
+  PLATFORM_NAME: optionalString(),
 });
 
 export type Env = z.infer<typeof envSchema>;

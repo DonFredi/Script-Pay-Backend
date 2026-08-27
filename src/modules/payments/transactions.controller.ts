@@ -5,6 +5,7 @@ import { TenantAwareThrottlerGuard } from "../../common/guards/tenant-aware-thro
 import { CurrentUser, type AuthenticatedUser } from "../../common/decorators/current-user.decorator";
 import { ReadThrottle } from "../../common/throttle-tiers";
 import { PrismaService } from "../prisma/prisma.service";
+import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 import type { TransactionStatus } from "@prisma/client";
 
 /**
@@ -17,7 +18,16 @@ import type { TransactionStatus } from "@prisma/client";
 @UseGuards(AccessTokenGuard, RolesGuard, TenantAwareThrottlerGuard)
 @ReadThrottle()
 export class TransactionsController {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // Used ONLY for the SUPER_ADMIN discovery read below — finding out which
+    // tenant a transaction belongs to before any tenant context can be set. Under
+    // FORCE ROW LEVEL SECURITY, the RLS-enforced `prisma` connection would return
+    // null for that read regardless of whether the row exists, since no context is
+    // set yet — this bypass is what makes the discovery phase actually work rather
+    // than every SUPER_ADMIN lookup 404'ing on a transaction that's really there.
+    private readonly prismaPrivileged: PrismaPrivilegedService,
+  ) {}
 
   @Get()
   async list(
@@ -49,12 +59,19 @@ export class TransactionsController {
   @Get(":id")
   async findOne(@Param("id") id: string, @CurrentUser() user: AuthenticatedUser) {
     if (user.role === "SUPER_ADMIN") {
-      // Genuinely doesn't have a target tenant to scope by until after this read —
-      // that's the whole point of this branch. Not RLS-covered today: doing that
-      // properly needs the dedicated BYPASSRLS connection path the RLS SQL file's
-      // own header comments call for, which isn't provisioned yet. This read stays
-      // app-layer only, same as before.
-      const transaction = await this.prisma.transaction.findUnique({ where: { id } });
+      // Two-phase because SUPER_ADMIN genuinely has no target tenant to scope by
+      // until after discovering which tenant this transaction belongs to. The
+      // first read uses the privileged (BYPASSRLS) connection specifically for
+      // that discovery — it's the one legitimate use of it here. Once the tenant
+      // is known, re-fetch the same row under that tenant's RLS context on the
+      // normal connection, so this path gets the same "neither layer alone is
+      // enough" coverage as the TENANT_ADMIN path below.
+      const initial = await this.prismaPrivileged.transaction.findUnique({ where: { id } });
+      if (!initial) throw new NotFoundException("Transaction not found");
+
+      const transaction = await this.prisma.withTenantContext(initial.tenantId, (tx) =>
+        tx.transaction.findUnique({ where: { id } }),
+      );
       if (!transaction) throw new NotFoundException("Transaction not found");
       return transaction;
     }

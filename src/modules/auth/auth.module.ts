@@ -11,6 +11,8 @@ import { AccessTokenGuard } from "./access-token.guard";
 @Module({
   controllers: [AuthController, ProfileController],
   providers: [AuthService, TokenService, RefreshTokenService, VerificationTokenService, EmailService, AccessTokenGuard],
-  exports: [TokenService, AccessTokenGuard], // AccessTokenGuard is used by every other module's controllers
+  // AccessTokenGuard is used by every other module's controllers; EmailService is
+  // also needed by TenantsService (auto-provisioned API key notification on activation).
+  exports: [TokenService, AccessTokenGuard, EmailService],
 })
 export class AuthModule {}

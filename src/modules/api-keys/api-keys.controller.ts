@@ -31,9 +31,9 @@ export class ApiKeysController {
   create(
     @Body(new ZodValidationPipe(createApiKeySchema)) dto: CreateApiKeyDto,
     @CurrentUser() user: AuthenticatedUser,
+    @Query("tenantId") tenantId?: string,
   ) {
-    if (!user.tenantId) throw new ForbiddenException("Platform staff must specify a tenant explicitly");
-    return this.apiKeys.create(user.tenantId, dto.scopes, user.id, dto.expiresAt);
+    return this.apiKeys.create(this.resolveTenantId(user, tenantId), dto.scopes, user.id, dto.expiresAt);
   }
 
   @Get()
@@ -48,10 +48,11 @@ export class ApiKeysController {
 
   /**
    * TENANT_ADMIN is always scoped to their own tenant regardless of any tenantId
-   * query param they pass — prevents guessing another tenant's id to read/revoke
-   * their keys. SUPER_ADMIN has no tenant of their own, so for read/revoke (oversight,
-   * not self-service) they must name one explicitly via ?tenantId= — there's no
-   * "list every tenant's keys at once" mode, this is per-tenant audit-on-demand.
+   * query param they pass — prevents guessing another tenant's id to create/read/revoke
+   * their keys. SUPER_ADMIN has no tenant of their own, so for create/list/revoke
+   * (oversight and onboarding provisioning, not self-service) they must name one
+   * explicitly via ?tenantId= — there's no "act on every tenant at once" mode, this
+   * is per-tenant, on-demand only.
    */
   private resolveTenantId(user: AuthenticatedUser, queryTenantId?: string): string {
     if (user.role === "SUPER_ADMIN") {

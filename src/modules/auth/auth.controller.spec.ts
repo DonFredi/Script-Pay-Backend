@@ -1,15 +1,20 @@
+import type { Response } from "express";
 import { AuthController } from "./auth.controller";
 import { AuthService } from "./auth.service";
 import { RefreshTokenService } from "./refresh-token.service";
 
-function fakeResponse() {
+type FakeResponse = Response & {
+  cookies: Record<string, { value: string; options: Record<string, unknown> }>;
+};
+
+function fakeResponse(): FakeResponse {
   const cookies: Record<string, { value: string; options: Record<string, unknown> }> = {};
   return {
     cookie: jest.fn((name: string, value: string, options: Record<string, unknown>) => {
       cookies[name] = { value, options };
     }),
     cookies,
-  } as any;
+  } as unknown as FakeResponse;
 }
 
 const session = {
@@ -42,11 +47,11 @@ describe("AuthController", () => {
       jest.spyOn(authService, "login").mockResolvedValueOnce(session as any);
       const res = fakeResponse();
 
-      await controller.login({ email: "a@b.com", password: "x" } as any, res);
+      await controller.login({ email: "a@b.com", password: "x" }, res);
 
       expect(res.cookies.refresh_token).toMatchObject({
         value: "refresh-token-value",
-        options: expect.objectContaining({ httpOnly: true, sameSite: "lax", path: "/api/backend/auth/refresh" }),
+        options: expect.objectContaining({ httpOnly: true, sameSite: "lax", path: "/" }),
       });
       expect(res.cookies.access_token).toMatchObject({
         value: "access-token-value",
@@ -62,7 +67,7 @@ describe("AuthController", () => {
       jest.spyOn(authService, "login").mockResolvedValueOnce(session as any);
       const res = fakeResponse();
 
-      const result = await controller.login({ email: "a@b.com", password: "x" } as any, res);
+      const result = await controller.login({ email: "a@b.com", password: "x" }, res);
 
       expect(result).toEqual({ user: session.user, accessToken: session.accessToken });
       expect(JSON.stringify(result)).not.toContain("refresh-token-value");
@@ -74,7 +79,10 @@ describe("AuthController", () => {
       jest.spyOn(authService, "signup").mockResolvedValueOnce(session as any);
       const res = fakeResponse();
 
-      await controller.signup({ email: "a@b.com", password: "x" } as any, res);
+      await controller.signup(
+        { username: "tester", email: "a@b.com", password: "x", confirmPassword: "x" },
+        res,
+      );
 
       expect(Object.keys(res.cookies).sort()).toEqual(["access_token", "csrf-token", "refresh_token"]);
     });
@@ -104,9 +112,11 @@ describe("AuthController", () => {
       expect(result).toEqual({ accessToken: "new-access" });
       expect(res.cookies.refresh_token.value).toBe("new-refresh");
       expect(res.cookies.access_token.value).toBe("new-access");
-      // refresh() never re-issues a CSRF cookie — the existing one (7-day life) is
-      // still valid across a 15-minute access token refresh.
-      expect(res.cookies["csrf-token"]).toBeUndefined();
+      // The csrf-token cookie's own maxAge (7 days) is shorter than a session's
+      // real lifetime, which persists indefinitely via silent refresh — reissuing
+      // it here keeps it exactly as fresh as the session, closing a real bug where
+      // any session older than 7 days lost CSRF protection entirely.
+      expect(res.cookies["csrf-token"].value).toMatch(/^[0-9a-f]{64}$/);
     });
   });
 
@@ -114,7 +124,7 @@ describe("AuthController", () => {
     it("forgot-password never reveals whether the account exists", async () => {
       jest.spyOn(authService, "requestPasswordReset").mockResolvedValueOnce(undefined);
 
-      const result = await controller.forgotPassword({ email: "unknown@b.com" } as any);
+      const result = await controller.forgotPassword({ email: "unknown@b.com" });
 
       expect(result.message).toMatch(/if an account exists/i);
     });

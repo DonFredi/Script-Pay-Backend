@@ -10,7 +10,7 @@ describe("ApiKeysService", () => {
 
   beforeEach(async () => {
     const prismaMock: any = {
-      apiKey: { create: jest.fn(), findMany: jest.fn(), updateMany: jest.fn() },
+      apiKey: { create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), updateMany: jest.fn() },
     };
     // Mirrors the real PrismaService.withTenantContext signature but runs the callback
     // against this same mock instead of a real transaction — lets tests assert both
@@ -75,6 +75,36 @@ describe("ApiKeysService", () => {
       await service.create("tenant-1", [], "actor-1");
 
       expect(prisma.withTenantContext).toHaveBeenCalledWith("tenant-1", expect.any(Function));
+    });
+  });
+
+  describe("provisionDefaultKeyIfNeeded", () => {
+    it("creates a system-issued key with the default scopes when the tenant has no live key", async () => {
+      jest.spyOn(prisma.apiKey, "findFirst").mockResolvedValueOnce(null);
+      jest
+        .spyOn(prisma.apiKey, "create")
+        .mockImplementation((({ data }: any) => Promise.resolve({ id: "key-1", ...data })) as any);
+
+      const result = await service.provisionDefaultKeyIfNeeded("tenant-1");
+
+      expect(prisma.apiKey.findFirst).toHaveBeenCalledWith({ where: { tenantId: "tenant-1", revokedAt: null } });
+      expect(result).not.toBeNull();
+      expect(result!.rawKey).toMatch(/^sp_[0-9a-f]{80}$/);
+      const createArgs = (prisma.apiKey.create as jest.Mock).mock.calls[0][0];
+      expect(createArgs.data.scopes).toEqual(["PAYMENTS_INITIATE", "PAYMENTS_READ", "WEBHOOKS_MANAGE"]);
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: "api_key.created", actorType: "system" }),
+      );
+      expect((auditLog.record as jest.Mock).mock.calls[0][0].actorId).toBeUndefined();
+    });
+
+    it("returns null and creates nothing when the tenant already holds a live key", async () => {
+      jest.spyOn(prisma.apiKey, "findFirst").mockResolvedValueOnce({ id: "existing-key" } as any);
+
+      const result = await service.provisionDefaultKeyIfNeeded("tenant-1");
+
+      expect(result).toBeNull();
+      expect(prisma.apiKey.create).not.toHaveBeenCalled();
     });
   });
 

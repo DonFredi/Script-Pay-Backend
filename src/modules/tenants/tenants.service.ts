@@ -1,7 +1,10 @@
-import { ConflictException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
+import { ConflictException, ForbiddenException, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { Prisma } from "@prisma/client";
+import { randomBytes } from "node:crypto";
 import { PrismaService } from "../prisma/prisma.service";
 import { AuditLogService } from "../audit-log/audit-log.service";
+import { ApiKeysService } from "../api-keys/api-keys.service";
+import { EmailService } from "../auth/email.service";
 import type { AuthenticatedUser } from "../../common/decorators/current-user.decorator";
 import type { CreateTenantDto, UpdateTenantStatusDto } from "./tenant.dto";
 import type { MpesaCredentialsDto } from "./tenants.schema";
@@ -10,10 +13,14 @@ import { CredentialsEncryptionService } from "./credentials-encryption.service";
 
 @Injectable()
 export class TenantsService {
+  private readonly logger = new Logger(TenantsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly auditLog: AuditLogService,
     private readonly encryption: CredentialsEncryptionService,
+    private readonly apiKeysService: ApiKeysService,
+    private readonly emailService: EmailService,
   ) {}
 
   /** SUPER_ADMIN only — enforced at the controller via @Roles(), not re-checked here on purpose:
@@ -60,6 +67,39 @@ export class TenantsService {
 
     // Never echo the secret/passkey back, even to the tenant that just set it.
     return { configured: true };
+  }
+
+  /**
+   * Called from an API-key-authenticated route (TenantWebhookConfigController), not
+   * a dashboard session — so there's no AuthenticatedUser to authorize against; the
+   * tenant is already established by ApiKeyGuard + the WEBHOOKS_MANAGE scope check
+   * before this ever runs, same trust model as StkPushService.initiate.
+   *
+   * The secret is generated here, server-side, never accepted from the caller —
+   * same reasoning as ApiKeysService.create not letting a client choose its own key.
+   * Returned exactly once; only the encrypted form is ever persisted.
+   */
+  async configureWebhook(tenantId: string, webhookUrl: string, actorApiKeyId: string | null) {
+    const webhookSecret = `whsec_${randomBytes(32).toString("hex")}`;
+
+    await this.prisma.tenant.update({
+      where: { id: tenantId },
+      data: {
+        webhookUrl,
+        webhookSecretEncrypted: this.encryption.encrypt(webhookSecret),
+        webhookConfiguredAt: new Date(),
+      },
+    });
+
+    await this.auditLog.record({
+      tenantId,
+      actorType: "api_key",
+      actorId: actorApiKeyId,
+      action: "tenant.webhook_configured",
+      metadata: { webhookUrl },
+    });
+
+    return { webhookUrl, webhookSecret };
   }
 
   async getMpesaCredentialsForPayment(tenantId: string): Promise<TenantMpesaCredentials> {
@@ -158,9 +198,11 @@ export class TenantsService {
         throw new ForbiddenException("Cannot change another tenant's status");
       }
       if (dto.status === "pending_kyc") {
-        throw new ForbiddenException("Only ScriptPay staff can move a tenant into KYC review");
+        throw new ForbiddenException("Only platform staff can move a tenant into KYC review");
       }
     }
+
+    const before = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId }, select: { status: true } });
 
     const tenant = await this.rejectingShortcodeConflict(
       this.prisma.tenant.update({
@@ -179,7 +221,38 @@ export class TenantsService {
       metadata: { newStatus: dto.status },
     });
 
+    if (before.status !== "active" && dto.status === "active") {
+      await this.provisionApiKeyOnActivation(tenantId);
+    }
+
     return tenant;
+  }
+
+  /**
+   * Auto-provisions the tenant's first API key the moment they go active, so a
+   * merchant who only wants to accept payments never has to visit an API-key
+   * page at all — see docs/decisions.md entry 14. Emailed once to every
+   * TENANT_ADMIN on the account; the raw key is never shown again after this.
+   * Best-effort: a failure here must never roll back — or even fail — the
+   * status change itself, same "a side effect's failure is not the main
+   * action's failure" reasoning as AlertsService.
+   */
+  private async provisionApiKeyOnActivation(tenantId: string) {
+    try {
+      const provisioned = await this.apiKeysService.provisionDefaultKeyIfNeeded(tenantId);
+      if (!provisioned) return; // tenant already held a live key — nothing to do
+
+      const admins = await this.prisma.user.findMany({
+        where: { tenantId, role: "TENANT_ADMIN" },
+        select: { email: true },
+      });
+
+      await Promise.all(
+        admins.map((admin) => this.emailService.sendApiKeyProvisionedEmail(admin.email, provisioned.rawKey)),
+      );
+    } catch (error) {
+      this.logger.error(`Failed to auto-provision an API key for tenant ${tenantId}`, error as Error);
+    }
   }
 
   /**

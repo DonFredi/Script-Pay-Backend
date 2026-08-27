@@ -5,6 +5,8 @@ import { TenantsService } from "./tenants.service";
 import { PrismaService } from "../prisma/prisma.service";
 import { AuditLogService } from "../audit-log/audit-log.service";
 import { CredentialsEncryptionService } from "./credentials-encryption.service";
+import { ApiKeysService } from "../api-keys/api-keys.service";
+import { EmailService } from "../auth/email.service";
 import type { AuthenticatedUser } from "../../common/decorators/current-user.decorator";
 
 function uniqueConstraintError(): Prisma.PrismaClientKnownRequestError {
@@ -23,11 +25,22 @@ describe("TenantsService", () => {
   let prisma: PrismaService;
   let auditLog: AuditLogService;
   let encryption: CredentialsEncryptionService;
+  let apiKeysService: ApiKeysService;
+  let emailService: EmailService;
 
   beforeEach(async () => {
     const prismaMock: any = {
-      tenant: { create: jest.fn(), update: jest.fn(), findUnique: jest.fn(), findUniqueOrThrow: jest.fn(), findMany: jest.fn() },
-      user: { update: jest.fn(), updateMany: jest.fn() },
+      tenant: {
+        create: jest.fn(),
+        update: jest.fn(),
+        findUnique: jest.fn(),
+        // Default covers updateStatus's pre-update "before" read for every test that
+        // doesn't care about it — only the "auto-provisioning on activation" tests
+        // below override this per-call to exercise a real status transition.
+        findUniqueOrThrow: jest.fn().mockResolvedValue({ status: "pending_kyc" }),
+        findMany: jest.fn(),
+      },
+      user: { update: jest.fn(), updateMany: jest.fn(), findMany: jest.fn() },
     };
     // onboardSelf runs tenant.create + user.updateMany inside $transaction — mirror
     // that by running the callback against this same mock instead of a real transaction,
@@ -40,6 +53,8 @@ describe("TenantsService", () => {
         { provide: PrismaService, useValue: prismaMock },
         { provide: AuditLogService, useValue: { record: jest.fn() } },
         { provide: CredentialsEncryptionService, useValue: { encrypt: jest.fn(), decrypt: jest.fn() } },
+        { provide: ApiKeysService, useValue: { provisionDefaultKeyIfNeeded: jest.fn() } },
+        { provide: EmailService, useValue: { sendApiKeyProvisionedEmail: jest.fn() } },
       ],
     }).compile();
 
@@ -47,6 +62,8 @@ describe("TenantsService", () => {
     prisma = module.get(PrismaService);
     auditLog = module.get(AuditLogService);
     encryption = module.get(CredentialsEncryptionService);
+    apiKeysService = module.get(ApiKeysService);
+    emailService = module.get(EmailService);
   });
 
   describe("setMpesaCredentials", () => {
@@ -91,6 +108,42 @@ describe("TenantsService", () => {
       jest.spyOn(prisma.tenant, "update").mockRejectedValueOnce(uniqueConstraintError());
 
       await expect(service.setMpesaCredentials("tenant-1", dto, user())).rejects.toThrow(ConflictException);
+    });
+  });
+
+  describe("configureWebhook", () => {
+    it("generates a secret, encrypts it before persisting, and returns the raw secret exactly once", async () => {
+      jest.spyOn(encryption, "encrypt").mockImplementation((v) => `encrypted(${v})`);
+      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({} as any);
+
+      const result = await service.configureWebhook("tenant-1", "https://example.com/webhooks/scriptpay", "key-1");
+
+      expect(prisma.tenant.update).toHaveBeenCalledWith({
+        where: { id: "tenant-1" },
+        data: {
+          webhookUrl: "https://example.com/webhooks/scriptpay",
+          webhookSecretEncrypted: expect.stringMatching(/^encrypted\(whsec_[0-9a-f]{64}\)$/),
+          webhookConfiguredAt: expect.any(Date),
+        },
+      });
+      expect(result.webhookUrl).toBe("https://example.com/webhooks/scriptpay");
+      expect(result.webhookSecret).toMatch(/^whsec_[0-9a-f]{64}$/);
+    });
+
+    it("audit-logs the configuring API key as the actor, not a user", async () => {
+      jest.spyOn(encryption, "encrypt").mockReturnValue("enc-value");
+      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({} as any);
+
+      await service.configureWebhook("tenant-1", "https://example.com/webhooks/scriptpay", "key-1");
+
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tenantId: "tenant-1",
+          actorType: "api_key",
+          actorId: "key-1",
+          action: "tenant.webhook_configured",
+        }),
+      );
     });
   });
 
@@ -225,7 +278,7 @@ describe("TenantsService", () => {
     it("forbids a TENANT_ADMIN from self-approving out of KYC review", async () => {
       await expect(
         service.updateStatus("tenant-1", { status: "pending_kyc" }, user({ tenantId: "tenant-1" })),
-      ).rejects.toThrow("Only ScriptPay staff can move a tenant into KYC review");
+      ).rejects.toThrow("Only platform staff can move a tenant into KYC review");
     });
 
     it("lets a TENANT_ADMIN suspend their own tenant", async () => {
@@ -243,6 +296,75 @@ describe("TenantsService", () => {
       await expect(
         service.updateStatus("tenant-1", { status: "active" }, user({ role: "SUPER_ADMIN", tenantId: null })),
       ).rejects.toThrow(ConflictException);
+    });
+  });
+
+  describe("updateStatus — API key auto-provisioning on activation", () => {
+    it("provisions a default key and emails every TENANT_ADMIN when a tenant transitions into active", async () => {
+      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({ status: "pending_kyc" } as any);
+      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({ id: "tenant-1", status: "active" } as any);
+      jest
+        .spyOn(apiKeysService, "provisionDefaultKeyIfNeeded")
+        .mockResolvedValueOnce({ id: "key-1", rawKey: "sp_rawvalue", keyPrefix: "sp_rawva", scopes: [] });
+      jest
+        .spyOn(prisma.user, "findMany")
+        .mockResolvedValueOnce([{ email: "owner@tenant1.test" }, { email: "second-admin@tenant1.test" }] as any);
+
+      await service.updateStatus("tenant-1", { status: "active" }, user({ role: "SUPER_ADMIN", tenantId: null }));
+
+      expect(apiKeysService.provisionDefaultKeyIfNeeded).toHaveBeenCalledWith("tenant-1");
+      expect(prisma.user.findMany).toHaveBeenCalledWith({
+        where: { tenantId: "tenant-1", role: "TENANT_ADMIN" },
+        select: { email: true },
+      });
+      expect(emailService.sendApiKeyProvisionedEmail).toHaveBeenCalledWith("owner@tenant1.test", "sp_rawvalue");
+      expect(emailService.sendApiKeyProvisionedEmail).toHaveBeenCalledWith(
+        "second-admin@tenant1.test",
+        "sp_rawvalue",
+      );
+    });
+
+    it("does not email anyone when the tenant already held a live key (idempotent re-activation)", async () => {
+      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({ status: "suspended" } as any);
+      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({ id: "tenant-1", status: "active" } as any);
+      jest.spyOn(apiKeysService, "provisionDefaultKeyIfNeeded").mockResolvedValueOnce(null);
+
+      await service.updateStatus("tenant-1", { status: "active" }, user({ role: "SUPER_ADMIN", tenantId: null }));
+
+      expect(prisma.user.findMany).not.toHaveBeenCalled();
+      expect(emailService.sendApiKeyProvisionedEmail).not.toHaveBeenCalled();
+    });
+
+    it("does not provision anything when the tenant was already active (no real transition)", async () => {
+      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({ status: "active" } as any);
+      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({ id: "tenant-1", status: "active" } as any);
+
+      await service.updateStatus("tenant-1", { status: "active" }, user({ role: "SUPER_ADMIN", tenantId: null }));
+
+      expect(apiKeysService.provisionDefaultKeyIfNeeded).not.toHaveBeenCalled();
+    });
+
+    it("does not provision anything when moving to a non-active status", async () => {
+      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({ status: "active" } as any);
+      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({ id: "tenant-1", status: "suspended" } as any);
+
+      await service.updateStatus("tenant-1", { status: "suspended" }, user({ role: "SUPER_ADMIN", tenantId: null }));
+
+      expect(apiKeysService.provisionDefaultKeyIfNeeded).not.toHaveBeenCalled();
+    });
+
+    it("swallows a provisioning failure without failing the status change itself", async () => {
+      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({ status: "pending_kyc" } as any);
+      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({ id: "tenant-1", status: "active" } as any);
+      jest.spyOn(apiKeysService, "provisionDefaultKeyIfNeeded").mockRejectedValueOnce(new Error("db down"));
+
+      const result = await service.updateStatus(
+        "tenant-1",
+        { status: "active" },
+        user({ role: "SUPER_ADMIN", tenantId: null }),
+      );
+
+      expect(result.status).toBe("active");
     });
   });
 });

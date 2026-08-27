@@ -13,20 +13,27 @@ export class ReportingService {
   async paymentSummary(tenantId: string, sinceDays = 7) {
     const since = new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000);
 
-    const grouped = await this.prisma.transaction.groupBy({
-      by: ["status"],
-      where: { tenantId, createdAt: { gte: since } },
-      _count: { _all: true },
-      _sum: { amountMinorUnits: true },
+    // Caller (ReportingController.summary) always resolves to exactly one
+    // concrete tenantId before calling this — safe to run both reads under that
+    // one tenant's RLS context in a single wrapped transaction.
+    const { grouped, driftCount } = await this.prisma.withTenantContext(tenantId, async (tx) => {
+      const grouped = await tx.transaction.groupBy({
+        by: ["status"],
+        where: { tenantId, createdAt: { gte: since } },
+        _count: { _all: true },
+        _sum: { amountMinorUnits: true },
+      });
+
+      const driftCount = await tx.reconciliationRecord.count({
+        where: { tenantId, driftDetected: true, createdAt: { gte: since } },
+      });
+
+      return { grouped, driftCount };
     });
 
     const counts = Object.fromEntries(grouped.map((g) => [g.status, g._count._all]));
     const totalCount = grouped.reduce((sum, g) => sum + g._count._all, 0);
     const settledCount = counts["SETTLED"] ?? 0;
-
-    const driftCount = await this.prisma.reconciliationRecord.count({
-      where: { tenantId, driftDetected: true, createdAt: { gte: since } },
-    });
 
     return {
       periodDays: sinceDays,

@@ -212,3 +212,112 @@ the same database transaction as the status change. A tenant's balance is a
 *computed* value (sum of ledger entries), not a hot mutable counter — the
 audit trail and the balance are the same data, not two things that can
 diverge.
+
+## 12. Outbound tenant-webhook delivery: Postgres polling, enqueued in-transaction, not a raw fetch inline
+
+**Problem**: A tenant integration (scripttagg-leadgen was the first real
+consumer) has no way to learn a `POST /v1/payments/stk-push` result — status
+reads require a dashboard session (`AccessTokenGuard`), not an API key, and
+no outbound notification mechanism existed at all. `WEBHOOKS_MANAGE` and
+`PAYMENTS_READ` were reserved in `ApiKeyScope` from the start but never wired
+to anything.
+
+**Rejected**: (a) Wiring up `PAYMENTS_READ` for `GET /v1/transactions` and
+telling tenants to poll it — works, but pushes an ongoing polling burden onto
+every tenant integration for something ScriptPay already knows the instant it
+happens. (b) Calling `fetch()` to the tenant's `webhookUrl` synchronously,
+inline inside `TransactionStateMachine.transitionToSettled`/`transitionToFailed`
+— couples a DB transaction's commit to a third-party HTTP round-trip's
+latency/availability, and a slow or hung tenant server would then stall the
+same code path that's also updating the ledger.
+
+**Chosen**: The same shape as inbound Daraja processing, mirrored outward.
+`TransactionStateMachine` enqueues a `TenantWebhookDelivery` row (`PENDING`)
+in the *same* DB transaction as the settle/fail it's reporting — so a
+delivery is never missed for a transition that actually committed, and never
+double-enqueued for an idempotent duplicate (only the branch that actually
+just transitioned enqueues, not the early-return dedup branches). A separate
+`TenantWebhookPollerService` (same Postgres-table-polling architecture as
+entry 2's `WebhookPollerService`, applied to the opposite direction) then
+delivers it out-of-band with its own retry/backoff (30s/2m/10m/30m/1h, 5
+attempts), signed the same way Daraja itself would be trusted
+(`X-ScriptPay-Signature`, HMAC-SHA256, keyed by a per-tenant secret that's
+AES-256-GCM-encrypted at rest — entry 8's mechanism, reused). Webhook
+registration (`POST /v1/tenants/webhook-config`) is `ApiKeyGuard`-gated, not
+a dashboard route, on the same reasoning as `/v1/payments/stk-push`: this is
+a tenant's own backend registering itself, not a human filling in a form.
+Deliberately scoped to STK-push-initiated settle/fail only, not
+`recordInboundSettlement` (C2B/Paybill-Till) — no tenant integration asked
+for that path yet, and guessing at the shape it'd need wasn't worth doing
+speculatively.
+
+## 13. Platform-staff-issued API keys made symmetric with existing oversight, not left create-only-by-tenant
+
+**Problem**: `SUPER_ADMIN` (platform staff) could already `list`/`revoke` any
+tenant's API keys via an explicit `?tenantId=` (audit-on-demand, no ambient
+cross-tenant access) — but `create()` unconditionally rejected any caller
+with `tenantId: null`, which is always true for `SUPER_ADMIN`. There was no
+way for platform staff to provision a key on a tenant's behalf at all, even
+though they already had every other administrative lever over that tenant's
+keys.
+
+**Rejected**: Leaving it as-is on the theory that "self-service only" is a
+deliberate security boundary. It wasn't reasoned that way originally — it was
+simply never extended past the tenant-self-service case `ApiKeysController`
+was first built for — and it left `create` as the one operation out of three
+that didn't follow the `resolveTenantId()` pattern already governing
+`list`/`revoke`.
+
+**Chosen**: `create()` now calls the same `resolveTenantId(user, tenantId)`
+helper as `list`/`revoke` — a `TENANT_ADMIN` is still always scoped to their
+own tenant regardless of any `?tenantId=` they pass, and `SUPER_ADMIN` must
+now pass `?tenantId=` explicitly to issue a key on a tenant's behalf (a
+`BadRequestException` if they don't, same as the other two routes). This is
+oversight/onboarding-provisioning, not a parallel self-service channel: the
+primary path for a tenant obtaining a key is still their own `TENANT_ADMIN`
+calling `POST /v1/api-keys` for themselves. Both paths creating independent,
+freely-coexisting key rows was already the intended multi-key model (a
+tenant is expected to hold several keys, one per integration/scope — see
+`ApiKeyGuard`'s own doc comment) — nothing here introduces a write conflict,
+since no call ever mutates an existing key row, only inserts a new one; the
+audit log (`api_key.created`, `actorId` = the issuing user) is what
+distinguishes who issued which key, same as before this change.
+
+## 14. API keys auto-provisioned on tenant activation, not left as a required self-service step
+
+**Problem**: `POST /v1/api-keys` was built assuming every tenant is a
+developer-run integration that wants to think about scopes and key
+management. In practice most tenants using ScriptPay only care about
+accepting payments — they never asked for the concept of "API keys," they
+just want their integration to work. Requiring a self-service visit to an
+API-keys page before a tenant could call `POST /v1/payments/stk-push` was
+friction with no corresponding benefit for that majority case.
+
+**Rejected**: (a) Removing the self-service endpoints entirely — too
+restrictive for the minority of tenants who *do* run their own integration
+and want a second scoped key later (e.g. a read-only reporting key), or who
+need to rotate one. (b) Requiring platform staff to manually create and
+relay a key over some ad hoc channel for every new tenant — works, but is a
+manual step that doesn't scale and is exactly the kind of thing a system
+should do for itself the instant the real trigger (activation) occurs.
+
+**Chosen**: `TenantsService.updateStatus` auto-provisions a default-scoped
+key (`PAYMENTS_INITIATE`, `PAYMENTS_READ`, `WEBHOOKS_MANAGE`) via
+`ApiKeysService.provisionDefaultKeyIfNeeded` the moment a tenant transitions
+into `"active"` — the same real-world moment that already means "this
+tenant is now allowed to move real money." Idempotent (skips if the tenant
+already holds a live key, e.g. re-activating after a suspension), so it
+never fires twice for the same tenant. The raw key is emailed once to every
+`TENANT_ADMIN` on the account (`EmailService.sendApiKeyProvisionedEmail`,
+reusing the existing Resend integration) and never shown again after that —
+same "shown exactly once" discipline as self-service issuance. Audit-logged
+as `actorType: "system"`, distinguishing it from a human-triggered
+`api_key.created` entry. This makes `/v1/api-keys` an optional advanced
+capability rather than a required step in onboarding — the frontend's
+API-keys page (`Script Pay Frontend`, a separate repo) can be hidden or
+removed for the common case without anything in this backend needing to
+change; it remains available for the tenants who actually want it. A
+provisioning failure (email or key creation) is caught and logged, never
+allowed to fail the status-change request itself — same "a side effect's
+failure isn't the main action's failure" reasoning already used by
+`AlertsService`.
