@@ -1,8 +1,18 @@
 import { Injectable, UnauthorizedException } from "@nestjs/common";
 import { createHash, randomBytes } from "node:crypto";
 import { PrismaService } from "../prisma/prisma.service";
+import type { RefreshToken } from "@prisma/client";
 
 const REFRESH_TTL_DAYS = Number(process.env.JWT_REFRESH_TTL_DAYS ?? 30);
+
+// Concurrent /auth/refresh calls with the same token (multiple tabs, a frontend
+// interceptor firing twice) can present an already-rotated token milliseconds after
+// a sibling request rotated it. Without this window, that legitimate race trips the
+// same branch as real token theft and revokes every session for the user. Within the
+// window, we walk the rotation chain to the still-live token and rotate from there
+// instead — only a token that never resolves to a live descendant (a genuinely reused
+// or explicitly revoked token) is treated as compromise.
+const REUSE_GRACE_WINDOW_MS = 10_000;
 
 function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
@@ -41,15 +51,43 @@ export class RefreshTokenService {
     }
 
     if (existing.revokedAt) {
-      // Reuse of a already-rotated token — treat as compromise, not a normal error.
-      await this.revokeAllForUser(existing.userId);
-      throw new UnauthorizedException("Refresh token reuse detected — all sessions revoked");
+      const withinGraceWindow = Date.now() - existing.revokedAt.getTime() < REUSE_GRACE_WINDOW_MS;
+      const current = withinGraceWindow ? await this.findLiveDescendant(existing) : null;
+
+      if (!current) {
+        // Reuse of an already-rotated token, outside the grace window (or with no live
+        // descendant at all) — treat as compromise, not a normal error.
+        await this.revokeAllForUser(existing.userId);
+        throw new UnauthorizedException("Refresh token reuse detected — all sessions revoked");
+      }
+
+      return this.rotate(current);
     }
 
     if (existing.expiresAt < new Date()) {
       throw new UnauthorizedException("Refresh token expired");
     }
 
+    return this.rotate(existing);
+  }
+
+  /** Follows replacedByTokenId to the chain's still-active tail, or null if it dead-ends revoked. */
+  private async findLiveDescendant(token: RefreshToken): Promise<RefreshToken | null> {
+    let current = token;
+    const visited = new Set([current.id]);
+
+    while (current.replacedByTokenId) {
+      if (visited.has(current.replacedByTokenId)) return null;
+      const next = await this.prisma.refreshToken.findUnique({ where: { id: current.replacedByTokenId } });
+      if (!next) return null;
+      visited.add(next.id);
+      current = next;
+    }
+
+    return current.revokedAt ? null : current;
+  }
+
+  private async rotate(existing: { id: string; userId: string }): Promise<{ userId: string; newRawToken: string }> {
     const newRawToken = randomBytes(48).toString("base64url");
     const newRecord = await this.prisma.refreshToken.create({
       data: {

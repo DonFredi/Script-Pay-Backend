@@ -91,6 +91,58 @@ describe("RefreshTokenService", () => {
       // Must not also try to rotate a token it just determined was compromised.
       expect(prisma.refreshToken.create).not.toHaveBeenCalled();
     });
+
+    it("forgives a race: a just-rotated token presented again within the grace window rotates from the live descendant instead of revoking everything", async () => {
+      jest.spyOn(prisma.refreshToken, "findUnique").mockImplementation((({ where }: any) => {
+        if (where.tokenHash) {
+          return Promise.resolve({
+            id: "rt-old",
+            userId: "user-1",
+            revokedAt: new Date(Date.now() - 1000), // rotated 1s ago — inside the window
+            replacedByTokenId: "rt-live",
+            expiresAt: new Date(Date.now() + 1000 * 60 * 60),
+          } as any);
+        }
+        if (where.id === "rt-live") {
+          return Promise.resolve({
+            id: "rt-live",
+            userId: "user-1",
+            revokedAt: null,
+            replacedByTokenId: null,
+            expiresAt: new Date(Date.now() + 1000 * 60 * 60),
+          } as any);
+        }
+        return Promise.resolve(null);
+      }) as any);
+      jest.spyOn(prisma.refreshToken, "create").mockResolvedValueOnce({ id: "rt-newer" } as any);
+
+      const result = await service.verifyAndRotate("raced-token");
+
+      expect(result.userId).toBe("user-1");
+      expect(prisma.refreshToken.update).toHaveBeenCalledWith({
+        where: { id: "rt-live" },
+        data: { revokedAt: expect.any(Date), replacedByTokenId: "rt-newer" },
+      });
+      expect(prisma.refreshToken.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("still treats reuse as theft once the grace window has elapsed, even with a live descendant", async () => {
+      jest.spyOn(prisma.refreshToken, "findUnique").mockResolvedValueOnce({
+        id: "rt-old",
+        userId: "user-1",
+        revokedAt: new Date(Date.now() - 60_000), // rotated a minute ago — outside the window
+        replacedByTokenId: "rt-live",
+        expiresAt: new Date(Date.now() + 1000 * 60 * 60),
+      } as any);
+
+      await expect(service.verifyAndRotate("stale-reused-token")).rejects.toThrow(
+        "Refresh token reuse detected — all sessions revoked",
+      );
+      expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
+        where: { userId: "user-1", revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
+    });
   });
 
   describe("revoke", () => {
