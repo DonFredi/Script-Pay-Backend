@@ -1,4 +1,4 @@
-import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from "@nestjs/common";
+import { CanActivate, ExecutionContext, Injectable, Logger, UnauthorizedException } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
 import * as argon2 from "argon2";
 import { PrismaPrivilegedService } from "../../modules/prisma/prisma-privileged.service";
@@ -13,6 +13,8 @@ import type { ApiKeyScope } from "@prisma/client";
  */
 @Injectable()
 export class ApiKeyGuard implements CanActivate {
+  private readonly logger = new Logger(ApiKeyGuard.name);
+
   constructor(
     // Resolves WHICH tenant this key belongs to — the tenant is the OUTPUT of this
     // lookup, not an input, so it can't go through withTenantContext. See
@@ -67,11 +69,20 @@ export class ApiKeyGuard implements CanActivate {
       }
     }
 
-    // Fire-and-forget usage tracking — don't block the request on this write.
-    void this.prisma.apiKey.update({
-      where: { id: matched.id },
-      data: { lastUsedAt: new Date() },
-    });
+    // Fire-and-forget usage tracking — don't block the request on this write. The
+    // .catch() is not optional: without it a transient failure here (a dropped pool
+    // connection, a key revoked between the read above and this write) becomes an
+    // unhandled rejection, which Node terminates the process on by default. That
+    // would turn a cosmetic lastUsedAt miss into a backend-wide outage, triggered on
+    // the hot path of every single API-key request.
+    this.prisma.apiKey
+      .update({
+        where: { id: matched.id },
+        data: { lastUsedAt: new Date() },
+      })
+      .catch((error: unknown) => {
+        this.logger.warn(`Failed to record apiKey.lastUsedAt for key ${matched.id}: ${String(error)}`);
+      });
 
     request.tenantId = matched.tenantId;
     request.apiKeyScopes = matched.scopes;

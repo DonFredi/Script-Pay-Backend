@@ -95,4 +95,28 @@ describe("ApiKeyGuard", () => {
       expect.objectContaining({ where: expect.objectContaining({ revokedAt: null }) }),
     );
   });
+
+  it("still authorizes the request when the lastUsedAt write fails, and handles the rejection", async () => {
+    // This write is deliberately fire-and-forget. Before it had a .catch(), a
+    // transient failure here became an unhandled rejection — which Node terminates
+    // the process on — turning a cosmetic bookkeeping miss into a backend outage on
+    // the hot path of every API-key request. Asserting the guard's own warn() fired
+    // proves the .catch() ran, without installing a process-level
+    // "unhandledRejection" listener: that suppresses Node's default handling for
+    // every other suite sharing the worker, and made unrelated suites flaky.
+    const warn = jest.spyOn(guard["logger"], "warn").mockImplementation(() => undefined);
+
+    jest.spyOn(prisma.apiKey, "findMany").mockResolvedValueOnce([
+      { id: "k-1", keyHash, scopes: ["PAYMENTS_INITIATE"], tenantId: "tenant-1", expiresAt: null },
+    ] as any);
+    jest.spyOn(prisma.apiKey, "update").mockRejectedValueOnce(new Error("connection reset"));
+    reflector.getAllAndOverride.mockReturnValueOnce(["PAYMENTS_INITIATE"]);
+    const req: any = { headers: { "x-api-key": rawKey } };
+
+    await expect(guard.canActivate(contextWithRequest(req))).resolves.toBe(true);
+
+    // Let the fire-and-forget promise settle.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("connection reset"));
+  });
 });

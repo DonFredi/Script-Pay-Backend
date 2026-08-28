@@ -1,6 +1,6 @@
 import { Test, TestingModule } from "@nestjs/testing";
 import { BadRequestException } from "@nestjs/common";
-import { WebhookIngestService } from "./webhook-ingest.service";
+import { WebhookIngestService, parseDarajaTimestamp } from "./webhook-ingest.service";
 import { PrismaService } from "../prisma/prisma.service";
 
 function stkPayload(overrides: { resultCode?: number; checkoutRequestId?: string } = {}) {
@@ -21,6 +21,19 @@ function stkPayload(overrides: { resultCode?: number; checkoutRequestId?: string
         },
       },
     },
+  };
+}
+
+function c2bPayload() {
+  return {
+    TransactionType: "Pay Bill",
+    TransID: "LHG31H5V60K0",
+    TransTime: "20231129133424",
+    TransAmount: "100.00",
+    BusinessShortCode: "600000",
+    BillRefNumber: "INV-1",
+    MSISDN: "254717123456",
+    FirstName: "Jane",
   };
 }
 
@@ -120,6 +133,50 @@ describe("WebhookIngestService", () => {
 
     it("throws BadRequestException for a non-object payload", () => {
       expect(() => service.normalizePayload("daraja_c2b_confirmation", null)).toThrow(BadRequestException);
+    });
+
+    it("normalizes a real, FLAT C2B confirmation", () => {
+      // Safaricom does not wrap C2B in Body.stkCallback. This normalizer used to
+      // expect the STK shape, so every genuine C2B payload threw instead of parsing.
+      const result = service.normalizePayload("daraja_c2b_confirmation", c2bPayload());
+
+      expect(result).toMatchObject({
+        mpesaReceiptNumber: "LHG31H5V60K0",
+        success: true,
+        resultCode: 0,
+        amount: 100,
+        msisdn: "254717123456",
+        callbackType: "c2b",
+      });
+      // No checkout request exists for a customer-initiated paybill/till payment.
+      expect(result.checkoutRequestId).toBeUndefined();
+    });
+
+    it("keys a C2B confirmation on TransID, and rejects one without it", () => {
+      const { TransID: _omitted, ...withoutTransId } = c2bPayload();
+
+      expect(() => service.normalizePayload("daraja_c2b_confirmation", withoutTransId)).toThrow(BadRequestException);
+    });
+  });
+
+  describe("parseDarajaTimestamp", () => {
+    it("parses Daraja's YYYYMMDDHHmmss stamp as Nairobi time (UTC+3)", () => {
+      // 13:34:24 EAT is 10:34:24 UTC. `new Date("20231129133424")` — what this code
+      // used to do — is an Invalid Date, so transactionDate was silently NaN.
+      expect(parseDarajaTimestamp(20231129133424)?.toISOString()).toBe("2023-11-29T10:34:24.000Z");
+      expect(parseDarajaTimestamp("20231129133424")?.toISOString()).toBe("2023-11-29T10:34:24.000Z");
+    });
+
+    it("returns undefined rather than an Invalid Date for absent or malformed input", () => {
+      expect(parseDarajaTimestamp(undefined)).toBeUndefined();
+      expect(parseDarajaTimestamp("not-a-timestamp")).toBeUndefined();
+      expect(parseDarajaTimestamp("2023112913342")).toBeUndefined(); // 13 digits, not 14
+    });
+
+    it("flows through to a real callback's transactionDate", () => {
+      const result = service.normalizePayload("daraja_stk_callback", stkPayload());
+
+      expect(result.transactionDate?.toISOString()).toBe("2023-11-29T10:34:24.000Z");
     });
   });
 });

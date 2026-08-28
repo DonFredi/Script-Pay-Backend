@@ -104,6 +104,19 @@ export class TenantsService {
 
   async getMpesaCredentialsForPayment(tenantId: string): Promise<TenantMpesaCredentials> {
     const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
+
+    // Suspension is the platform's kill switch, and it was previously a no-op for
+    // outbound payments: a suspended tenant's API keys are not revoked, so nothing
+    // between ApiKeyGuard and Daraja stopped them from continuing to charge
+    // customers. The inbound side already refuses to route money to a non-active
+    // tenant (WebhookPollerService.processC2bConfirmation scopes its shortcode
+    // lookup to status: "active"), so this closes the matching hole on the way out.
+    // pending_kyc is deliberately still allowed — that's the state a tenant tests
+    // from against Safaricom's sandbox before approval.
+    if (tenant.status === "suspended") {
+      throw new ForbiddenException("This tenant is suspended and cannot initiate payments");
+    }
+
     if (!tenant.mpesaConsumerKey || !tenant.mpesaConsumerSecretEncrypted || !tenant.mpesaPasskeyEncrypted) {
       throw new ForbiddenException(
         "M-Pesa credentials aren't configured for this tenant yet — set them up before initiating payments",

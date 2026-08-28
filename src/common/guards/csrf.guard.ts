@@ -32,7 +32,7 @@ export class CsrfGuard implements CanActivate {
     }
 
     // Read token from cookie (set by browser automatically)
-    const tokenFromCookie = request.cookies["csrf-token"];
+    const tokenFromCookie = request.cookies?.["csrf-token"];
 
     // Read token from header (frontend must include it)
     const tokenFromHeader = request.headers["x-csrf-token"] as string;

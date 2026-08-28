@@ -36,12 +36,43 @@ or stored outside this column.
 ## CSRF
 
 Double-submit cookie pattern (`CsrfGuard` + `generateCsrfToken`): a
-non-httpOnly `csrf-token` cookie is set at login/signup; every
-POST/PUT/PATCH/DELETE to a `CsrfGuard`-protected route must echo that exact
-value in `X-CSRF-Token`. Applied on every cookie-authenticated, state-changing
-route with real consequences — password reset, tenant creation/status
-changes, Daraja credential updates, API key issuance/revocation, dashboard
-payment initiation, logout. **Not** applied to:
+non-httpOnly `csrf-token` cookie is set at login/signup, and reissued on every
+`/auth/refresh`; every POST/PUT/PATCH/DELETE to a `CsrfGuard`-protected route
+must echo that exact value in `X-CSRF-Token`. Applied on every
+cookie-authenticated, state-changing route with real consequences — password
+reset, tenant creation/status changes, Daraja credential updates, API key
+issuance/revocation, dashboard payment initiation, logout, **and
+`/auth/refresh`**.
+
+`/auth/refresh` was the one exception until 2026-08-28, when it was brought in
+line with its siblings. It is worth stating why it belongs here rather than in
+the "no session exists yet" list below: unlike signup and login, refresh *does*
+act on an existing session — it presents the httpOnly `refresh_token` cookie a
+browser attaches automatically, so a cross-origin page could previously trigger
+it. Nothing is readable cross-origin, so there was no exfiltration path, but a
+forged refresh still rotates the victim's refresh token, and a rotated token
+replayed outside `RefreshTokenService`'s 10-second grace window is treated as
+theft — which revokes every session that user has.
+
+Because the guard now runs on refresh, the `csrf-token` cookie is issued with
+the **same** lifetime as `refresh_token` (`JWT_REFRESH_TTL_DAYS`), not a
+shorter fixed window. A csrf cookie that expired first would be an
+unrecoverable lockout: only login and refresh mint a new one, and refresh
+would be rejecting the request.
+
+Refresh uses `RefreshCsrfGuard` (`modules/auth/refresh-csrf.guard.ts`), a
+`CsrfGuard` subclass with exactly one exemption: a request carrying **no**
+`refresh_token` cookie is allowed through. That is the case the handler
+already treats as a no-op — it returns `{ accessToken: null }` before issuing
+a cookie or touching the database — so there is no state change for a forged
+request to cause. It matters because the frontend's `AuthProvider` calls this
+endpoint blind on first load to discover whether a session exists, and a
+logged-out visitor sends neither the cookie nor the header; plain `CsrfGuard`
+would 403 every first-time visitor. The moment a session cookie *is* present —
+the only situation in which a forged refresh could rotate someone's token —
+full validation applies.
+
+**Not** applied to:
 
 - `GET`/`HEAD`/`OPTIONS` (safe methods).
 - `/v1/webhooks/*` — Safaricom is the caller, not a browser; it cannot read
@@ -50,8 +81,9 @@ payment initiation, logout. **Not** applied to:
   CSRF is a browser-cookie attack; an `x-api-key`-authenticated request
   carries no ambient browser credential for CSRF to forge in the first
   place.
-- `/auth/signup`, `/auth/login`, `/auth/refresh` — no session exists yet to
-  forge.
+- `/auth/signup`, `/auth/login` — no session exists yet to forge. (These, and
+  only these, are the genuine "nothing to protect" cases; `/auth/refresh` used
+  to be listed here in error, as described above.)
 
 ## Authorization
 
@@ -73,6 +105,16 @@ payment initiation, logout. **Not** applied to:
 - **Scoped API keys**: `@RequireScopes(...)` limits what an API key can do
   independent of which tenant it belongs to — a leaked read-only reporting
   key cannot initiate payments.
+- **Tenant status is an authorization check, not just a label.** Suspending a
+  tenant does *not* revoke their API keys, so `ApiKeyGuard` alone will keep
+  authenticating them. `TenantsService.getMpesaCredentialsForPayment` refuses
+  to release Daraja credentials for a `suspended` tenant (added 2026-08-28),
+  which is what actually stops a suspended merchant from continuing to charge
+  customers. This mirrors the inbound side, where
+  `WebhookPollerService.processC2bConfirmation` already scoped its shortcode
+  lookup to `status: "active"`. `pending_kyc` is deliberately still permitted
+  — that is the state a tenant tests from against Safaricom's sandbox before
+  approval.
 
 ## Rate limiting
 

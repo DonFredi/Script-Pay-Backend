@@ -116,9 +116,9 @@ export class WebhookIngestService {
       resultCode: stk.ResultCode,
       resultDesc: stk.ResultDesc,
       success: stk.ResultCode === 0,
-      amount: metaMap.get("Amount") ? Number(metaMap.get("Amount")) : undefined,
-      transactionDate: metaMap.get("TransactionDate") ? new Date(String(metaMap.get("TransactionDate"))) : undefined,
-      msisdn: metaMap.get("PhoneNumber") ? String(metaMap.get("PhoneNumber")) : undefined,
+      amount: metaMap.get("Amount") !== undefined ? Number(metaMap.get("Amount")) : undefined,
+      transactionDate: parseDarajaTimestamp(metaMap.get("TransactionDate")),
+      msisdn: metaMap.get("PhoneNumber") !== undefined ? String(metaMap.get("PhoneNumber")) : undefined,
       callbackType: "stk_push",
       receivedAt: new Date(),
       rawPayload,
@@ -130,30 +130,53 @@ export class WebhookIngestService {
       throw new BadRequestException("Invalid C2B callback payload");
     }
 
+    // A C2B confirmation is FLAT — it has no Body.stkCallback wrapper, no
+    // CheckoutRequestID and no CallbackMetadata. This method used to read the STK
+    // shape, so it threw "Missing Body.stkCallback" on every genuine C2B payload
+    // Safaricom sends. TransID is the only identifier such a payload carries, which
+    // is why extractNaturalKey keys C2B idempotency on it.
     const payload = rawPayload as DarajaC2bCallback;
-    const stk = payload.Body?.stkCallback;
 
-    if (!stk) {
-      throw new BadRequestException("Missing Body.stkCallback in C2B callback");
+    if (typeof payload.TransID !== "string" || payload.TransID.length === 0) {
+      throw new BadRequestException("Missing TransID in C2B confirmation");
     }
 
-    const metadata = stk.CallbackMetadata?.Item ?? [];
-    const metaMap = new Map(metadata.map((item) => [item.Name, item.Value]));
-
     return {
-      checkoutRequestId: stk.CheckoutRequestID,
-      mpesaReceiptNumber: metaMap.get("MpesaReceiptNumber") as string | undefined,
-      resultCode: stk.ResultCode,
-      resultDesc: stk.ResultDesc,
-      success: stk.ResultCode === 0,
-      amount: metaMap.get("Amount") ? Number(metaMap.get("Amount")) : undefined,
-      transactionDate: metaMap.get("TransactionDate") ? new Date(String(metaMap.get("TransactionDate"))) : undefined,
-      msisdn: metaMap.get("PhoneNumber") ? String(metaMap.get("PhoneNumber")) : undefined,
+      mpesaReceiptNumber: payload.TransID,
+      // Safaricom only sends a confirmation for a payment that already went
+      // through — there is no failure variant of this callback to represent.
+      resultCode: 0,
+      resultDesc: "C2B confirmation received",
+      success: true,
+      amount: payload.TransAmount !== undefined ? Number(payload.TransAmount) : undefined,
+      transactionDate: parseDarajaTimestamp(payload.TransTime),
+      msisdn: payload.MSISDN !== undefined ? String(payload.MSISDN) : undefined,
       callbackType: "c2b",
       receivedAt: new Date(),
       rawPayload,
     };
   }
+}
+
+/**
+ * Daraja stamps times as YYYYMMDDHHmmss in Nairobi local time (UTC+3), e.g.
+ * 20231129133424. That is not a format the Date constructor understands — passing
+ * it straight to `new Date(...)` yields an Invalid Date, which is what this code
+ * used to do, silently producing a NaN timestamp rather than failing. Parse the
+ * fields out explicitly and pin the offset, so the value doesn't shift with
+ * whatever timezone the server happens to run in.
+ */
+export function parseDarajaTimestamp(value: string | number | undefined): Date | undefined {
+  if (value === undefined || value === null) return undefined;
+
+  const digits = String(value).trim();
+  const match = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/.exec(digits);
+  if (!match) return undefined;
+
+  const [, year, month, day, hour, minute, second] = match;
+  const parsed = new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}+03:00`);
+
+  return Number.isNaN(parsed.getTime()) ? undefined : parsed;
 }
 
 /**

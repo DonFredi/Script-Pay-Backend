@@ -1,7 +1,9 @@
+import "reflect-metadata";
 import type { Response } from "express";
 import { AuthController } from "./auth.controller";
 import { AuthService } from "./auth.service";
 import { RefreshTokenService } from "./refresh-token.service";
+import { RefreshCsrfGuard } from "./refresh-csrf.guard";
 
 type FakeResponse = Response & {
   cookies: Record<string, { value: string; options: Record<string, unknown> }>;
@@ -112,11 +114,32 @@ describe("AuthController", () => {
       expect(result).toEqual({ accessToken: "new-access" });
       expect(res.cookies.refresh_token.value).toBe("new-refresh");
       expect(res.cookies.access_token.value).toBe("new-access");
-      // The csrf-token cookie's own maxAge (7 days) is shorter than a session's
-      // real lifetime, which persists indefinitely via silent refresh — reissuing
-      // it here keeps it exactly as fresh as the session, closing a real bug where
-      // any session older than 7 days lost CSRF protection entirely.
+      // A session persists indefinitely via silent refresh, so reissuing the
+      // csrf-token here keeps it exactly as fresh as the session, closing a real
+      // bug where any session older than the cookie's maxAge lost CSRF protection.
       expect(res.cookies["csrf-token"].value).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    it("is CSRF-protected, like every other state-changing route on this controller", () => {
+      const guards: unknown[] = Reflect.getMetadata("__guards__", AuthController.prototype.refresh) ?? [];
+
+      expect(guards).toContain(RefreshCsrfGuard);
+    });
+
+    it("gives csrf-token the same lifetime as refresh_token, so it can never expire first", async () => {
+      jest
+        .spyOn(authService, "refresh")
+        .mockResolvedValueOnce({ accessToken: "new-access", refreshToken: "new-refresh" });
+      const res = fakeResponse();
+      const req = { cookies: { refresh_token: "old-refresh" } } as any;
+
+      await controller.refresh(req, res);
+
+      // Now that refresh itself requires a CSRF token, a csrf-token cookie that
+      // expired before the refresh_token would be an unrecoverable lockout: the
+      // only routes that issue a new one are login and refresh, and refresh would
+      // reject the request. Tying the two lifetimes together removes that state.
+      expect(res.cookies["csrf-token"].options.maxAge).toBe(res.cookies.refresh_token.options.maxAge);
     });
   });
 

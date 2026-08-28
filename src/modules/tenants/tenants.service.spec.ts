@@ -177,6 +177,37 @@ describe("TenantsService", () => {
         mpesaPasskeyEncrypted: "plain-pk",
       });
     });
+
+    it("refuses to hand out credentials for a suspended tenant, even with everything configured", async () => {
+      // Suspending a tenant does not revoke their API keys, so without this check
+      // nothing between ApiKeyGuard and Daraja stopped a suspended merchant from
+      // continuing to charge customers.
+      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({
+        status: "suspended",
+        businessShortcode: "174379",
+        mpesaConsumerKey: "ck",
+        mpesaConsumerSecretEncrypted: "enc-cs",
+        mpesaPasskeyEncrypted: "enc-pk",
+      } as any);
+
+      await expect(service.getMpesaCredentialsForPayment("tenant-1")).rejects.toThrow(ForbiddenException);
+      expect(encryption.decrypt).not.toHaveBeenCalled();
+    });
+
+    it("still allows a pending_kyc tenant to transact, so they can test against the sandbox", async () => {
+      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({
+        status: "pending_kyc",
+        businessShortcode: "174379",
+        mpesaConsumerKey: "ck",
+        mpesaConsumerSecretEncrypted: "enc-cs",
+        mpesaPasskeyEncrypted: "enc-pk",
+      } as any);
+      jest.spyOn(encryption, "decrypt").mockImplementation((v) => v.replace("enc-", "plain-"));
+
+      await expect(service.getMpesaCredentialsForPayment("tenant-1")).resolves.toMatchObject({
+        mpesaConsumerKey: "ck",
+      });
+    });
   });
 
   describe("findOne", () => {

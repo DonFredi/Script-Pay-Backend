@@ -51,39 +51,40 @@ export interface DarajaStkCallback {
  * C2B Confirmation Callback
  * Sent after M-Pesa payment to a paybill/till number
  *
+ * NOTE: this is a FLAT payload — it is NOT wrapped in Body.stkCallback, and it
+ * carries no CheckoutRequestID/ResultCode/CallbackMetadata at all. Safaricom only
+ * sends a confirmation for a payment that already succeeded, so there is no result
+ * code to inspect. This interface previously duplicated the STK shape above, which
+ * meant nothing could ever parse a real C2B payload. `extractNaturalKey` and
+ * `WebhookPollerService.processC2bConfirmation` both already read the flat fields —
+ * this type now matches what they (and Safaricom) actually use.
+ *
  * Example:
  * {
- *   "Body": {
- *     "stkCallback": {
- *       "CheckoutRequestID": "...",
- *       "ResultCode": 0,
- *       "ResultDesc": "...",
- *       "CallbackMetadata": {
- *         "Item": [
- *           { "Name": "Amount", "Value": 100 },
- *           { "Name": "MpesaReceiptNumber", "Value": "LHG31H5V60K0" },
- *           { "Name": "TransactionDate", "Value": 20231129133424 },
- *           { "Name": "PhoneNumber", "Value": 254717123456 }
- *         ]
- *       }
- *     }
- *   }
+ *   "TransactionType": "Pay Bill",
+ *   "TransID": "LHG31H5V60K0",
+ *   "TransTime": "20231129133424",
+ *   "TransAmount": "100.00",
+ *   "BusinessShortCode": "600000",
+ *   "BillRefNumber": "INV-1",
+ *   "MSISDN": "254717123456",
+ *   "FirstName": "Jane"
  * }
  */
 export interface DarajaC2bCallback {
-  Body: {
-    stkCallback: {
-      CheckoutRequestID: string;
-      ResultCode: number;
-      ResultDesc: string;
-      CallbackMetadata?: {
-        Item: Array<{
-          Name: string;
-          Value: string | number;
-        }>;
-      };
-    };
-  };
+  TransactionType?: string;
+  TransID: string;
+  TransTime?: string | number;
+  TransAmount?: string | number;
+  BusinessShortCode?: string | number;
+  BillRefNumber?: string;
+  InvoiceNumber?: string;
+  OrgAccountBalance?: string | number;
+  ThirdPartyTransID?: string;
+  MSISDN?: string | number;
+  FirstName?: string;
+  MiddleName?: string;
+  LastName?: string;
 }
 
 /**
@@ -92,7 +93,11 @@ export interface DarajaC2bCallback {
  */
 export interface NormalizedWebhookPayload {
   // Identifiers
-  checkoutRequestId: string;
+  // Optional because only STK Push has one — a C2B confirmation is unsolicited by
+  // definition (the customer initiated it on their handset), so there is no
+  // checkout request for it to refer back to. It is keyed by mpesaReceiptNumber
+  // (Daraja's TransID) instead.
+  checkoutRequestId?: string;
   mpesaReceiptNumber?: string;
 
   // Status

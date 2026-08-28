@@ -4,7 +4,8 @@ import { ThrottlerGuard } from "@nestjs/throttler";
 import { AuthService } from "./auth.service";
 import { RefreshTokenService } from "./refresh-token.service";
 import { ZodValidationPipe } from "../../common/pipes/zod-validation.pipe";
-import { CsrfGuard, generateCsrfToken } from "../../common/guards/csrf.guard"; // ← ADD IMPORT
+import { CsrfGuard, generateCsrfToken } from "../../common/guards/csrf.guard";
+import { RefreshCsrfGuard } from "./refresh-csrf.guard";
 import {
   forgotPasswordSchema,
   loginSchema,
@@ -54,7 +55,7 @@ export class AuthController {
     const session = await this.authService.signup(dto);
     this.setRefreshCookie(res, session.refreshToken);
     this.setAccessCookie(res, session.accessToken);
-    this.setCsrfCookie(res); // ← ADD THIS LINE
+    this.setCsrfCookie(res);
     return { user: session.user, accessToken: session.accessToken };
   }
 
@@ -64,11 +65,26 @@ export class AuthController {
     const session = await this.authService.login(dto);
     this.setRefreshCookie(res, session.refreshToken);
     this.setAccessCookie(res, session.accessToken);
-    this.setCsrfCookie(res); // ← ADD THIS LINE
+    this.setCsrfCookie(res);
     return { user: session.user, accessToken: session.accessToken };
   }
 
+  // CSRF protection here matches every other state-changing route on this controller.
+  // It was previously the one POST without it — which made /auth/refresh the only
+  // backend route a same-site attacker could trigger with no CSRF token. The damage
+  // was bounded (it only reads an httpOnly cookie and reissues session cookies —
+  // nothing readable cross-origin), but a forged refresh still rotates the victim's
+  // refresh token, and a rotated-token race outside RefreshTokenService's 10s grace
+  // window trips the theft branch and revokes every session for that user.
+  // The frontend's apiPrivate already sends X-CSRF-Token on this call.
+  //
+  // RefreshCsrfGuard rather than plain CsrfGuard: it enforces CSRF whenever a
+  // refresh_token cookie is actually present, but lets a cookie-less request
+  // through to the no-op path below, so a logged-out visitor still gets
+  // { accessToken: null } instead of a 403. See that guard for why the exemption
+  // gives up nothing.
   @Post("refresh")
+  @UseGuards(RefreshCsrfGuard)
   async refresh(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
     const rawRefreshToken = req.cookies?.[REFRESH_COOKIE];
     if (!rawRefreshToken) {
@@ -78,19 +94,18 @@ export class AuthController {
     const { accessToken, refreshToken } = await this.authService.refresh(rawRefreshToken);
     this.setRefreshCookie(res, refreshToken);
     this.setAccessCookie(res, accessToken);
-    // csrf-token's own maxAge (7 days) is shorter than a session's real lifetime —
-    // sessions stay alive indefinitely via silent refresh, but nothing used to
-    // reissue this cookie after the initial login. A session older than 7 days lost
-    // CSRF protection entirely (every state-changing request, logout included,
-    // failed with "CSRF token missing") until the user logged in again. Reissuing
-    // it here keeps it exactly as fresh as the session itself.
+    // Sessions stay alive indefinitely via silent refresh, but nothing used to
+    // reissue this cookie after the initial login, so a session that outlived the
+    // csrf cookie lost CSRF protection entirely (every state-changing request,
+    // logout included, failed with "CSRF token missing") until the user logged in
+    // again. Reissuing it here keeps it exactly as fresh as the session itself.
     this.setCsrfCookie(res);
     return { accessToken };
   }
 
   @Post("forgot-password")
   @StrictPaymentThrottle()
-  @UseGuards(CsrfGuard) // ← ADD CSRF GUARD
+  @UseGuards(CsrfGuard)
   async forgotPassword(@Body(new ZodValidationPipe(forgotPasswordSchema)) dto: ForgotPasswordDto) {
     await this.authService.requestPasswordReset(dto);
     return { message: "If an account exists for that email, a reset link has been sent." };
@@ -98,14 +113,14 @@ export class AuthController {
 
   @Post("reset-password")
   @StrictPaymentThrottle()
-  @UseGuards(CsrfGuard) // ← ADD CSRF GUARD
+  @UseGuards(CsrfGuard)
   async resetPassword(@Body(new ZodValidationPipe(resetPasswordSchema)) dto: ResetPasswordDto) {
     await this.authService.resetPassword(dto);
     return { message: "Password updated. Please log in again." };
   }
 
   @Post("verify-email")
-  @UseGuards(CsrfGuard) // ← ADD CSRF GUARD
+  @UseGuards(CsrfGuard)
   async verifyEmail(@Body(new ZodValidationPipe(verifyEmailSchema)) dto: VerifyEmailDto) {
     await this.authService.verifyEmail(dto);
     return { message: "Email verified." };
@@ -113,7 +128,7 @@ export class AuthController {
 
   @Post("resend-verification")
   @StrictPaymentThrottle()
-  @UseGuards(CsrfGuard) // ← ADD CSRF GUARD
+  @UseGuards(CsrfGuard)
   async resendVerification(@Body(new ZodValidationPipe(resendVerificationSchema)) dto: ResendVerificationDto) {
     await this.authService.resendVerification(dto);
     return { message: "If that account needs verification, a new link has been sent." };
@@ -139,15 +154,22 @@ export class AuthController {
     });
   }
 
-  // ← ADD THIS METHOD
   private setCsrfCookie(res: Response) {
     const csrfToken = generateCsrfToken();
     res.cookie("csrf-token", csrfToken, {
-      httpOnly: false, // ← JavaScript MUST read this (not httpOnly)
+      httpOnly: false, // the frontend must be able to read this to echo it back as X-CSRF-Token
       secure: process.env.NODE_ENV === "production",
       sameSite: "lax",
       path: "/",
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      // Deliberately the SAME lifetime as the refresh cookie, not a shorter fixed 7
+      // days. Now that /auth/refresh is itself CsrfGuard-protected, a csrf-token that
+      // outlives-less-than the refresh token is a lockout: a session idle past the
+      // csrf cookie's expiry would present a still-valid refresh_token with no
+      // csrf-token, get 403 from the guard, and have no way to obtain a new csrf
+      // cookie (only login and refresh issue one) — a silent forced re-login. Tying
+      // the two together means the only cookie that can expire first is the 15-minute
+      // access token, which is exactly what refresh exists to replace.
+      maxAge: this.refreshTokens.refreshTtlDays * 24 * 60 * 60 * 1000,
     });
   }
 }
