@@ -8,7 +8,7 @@ import { EmailService } from "../auth/email.service";
 import type { AuthenticatedUser } from "../../common/decorators/current-user.decorator";
 import type { CreateTenantDto, UpdateTenantStatusDto } from "./tenant.dto";
 import type { MpesaCredentialsDto } from "./tenants.schema";
-import type { TenantMpesaCredentials } from "../../infrastructure/daraja/daraja.client";
+import type { TenantMpesaCredentials, TenantPayoutCredentials } from "../../infrastructure/daraja/daraja.client";
 import { CredentialsEncryptionService } from "./credentials-encryption.service";
 
 @Injectable()
@@ -54,6 +54,17 @@ export class TenantsService {
           mpesaConsumerSecretEncrypted: this.encryption.encrypt(dto.consumerSecret),
           mpesaPasskeyEncrypted: this.encryption.encrypt(dto.passkey),
           mpesaCredentialsConfiguredAt: new Date(),
+          // Spread rather than set unconditionally: a tenant re-submitting only their
+          // collection credentials must not silently wipe payout credentials they
+          // configured earlier. The zod schema guarantees these two arrive together
+          // or not at all, so one being present implies the other.
+          ...(dto.initiatorName && dto.securityCredential
+            ? {
+                mpesaInitiatorName: dto.initiatorName,
+                mpesaSecurityCredentialEncrypted: this.encryption.encrypt(dto.securityCredential),
+                mpesaPayoutConfiguredAt: new Date(),
+              }
+            : {}),
         },
       }),
     );
@@ -63,6 +74,8 @@ export class TenantsService {
       actorType: "user",
       actorId: actor.id,
       action: "tenant.mpesa_credentials_configured",
+      // Records WHETHER payout access was configured, never the credential itself.
+      metadata: { payoutCredentialsConfigured: Boolean(dto.initiatorName && dto.securityCredential) },
     });
 
     // Never echo the secret/passkey back, even to the tenant that just set it.
@@ -127,6 +140,53 @@ export class TenantsService {
       mpesaConsumerKey: tenant.mpesaConsumerKey,
       mpesaConsumerSecretEncrypted: this.encryption.decrypt(tenant.mpesaConsumerSecretEncrypted),
       mpesaPasskeyEncrypted: this.encryption.decrypt(tenant.mpesaPasskeyEncrypted),
+    };
+  }
+
+  /**
+   * Payout counterpart to getMpesaCredentialsForPayment. A separate method rather
+   * than an optional-fields variant of that one, because the two need genuinely
+   * different secrets: collections need the passkey and no initiator, payouts the
+   * exact reverse. One union-shaped return would leave every caller re-checking
+   * which half it actually received — and would decrypt a passkey the payout path
+   * has no use for.
+   */
+  async getMpesaCredentialsForPayout(tenantId: string): Promise<TenantPayoutCredentials> {
+    const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
+
+    // The same kill switch the collection path applies. A suspended tenant must not
+    // move money in EITHER direction, and outbound is the direction where it matters
+    // more — suspension often means exactly "we don't trust this account right now."
+    if (tenant.status === "suspended") {
+      throw new ForbiddenException("This tenant is suspended and cannot initiate payments");
+    }
+
+    if (!tenant.mpesaConsumerKey || !tenant.mpesaConsumerSecretEncrypted) {
+      throw new ForbiddenException(
+        "M-Pesa credentials aren't configured for this tenant yet — set them up before initiating payments",
+      );
+    }
+
+    // Deliberately a different message from the one above. A tenant that has been
+    // collecting successfully for months hits THIS branch the first time they try to
+    // pay out, and telling them their "M-Pesa credentials aren't configured" would be
+    // actively misleading — theirs plainly are. B2C initiator access is a separate
+    // registration on Safaricom's side, not something the collection setup implies.
+    if (!tenant.mpesaInitiatorName || !tenant.mpesaSecurityCredentialEncrypted) {
+      throw new ForbiddenException(
+        "B2C payout credentials aren't configured for this tenant yet — an initiator name and security " +
+          "credential are required before sending payments",
+      );
+    }
+
+    return {
+      shortcode: tenant.businessShortcode,
+      mpesaConsumerKey: tenant.mpesaConsumerKey,
+      mpesaConsumerSecretEncrypted: this.encryption.decrypt(tenant.mpesaConsumerSecretEncrypted),
+      initiatorName: tenant.mpesaInitiatorName,
+      // Decrypts the AES layer only. What comes out is still Safaricom's
+      // RSA-encrypted blob, which is exactly what the B2C request expects.
+      securityCredential: this.encryption.decrypt(tenant.mpesaSecurityCredentialEncrypted),
     };
   }
 

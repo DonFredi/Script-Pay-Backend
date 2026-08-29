@@ -90,4 +90,65 @@ export class DarajaWebhookController {
       return { ResultCode: 0, ResultDesc: "Accepted" };
     }
   }
+
+  /**
+   * B2C Result Callback (Safaricom -> ResultURL)
+   * The authoritative outcome of a payout: whether the money actually left the
+   * shortcode. Unlike the sync response to the payment request, a ResultCode of 0
+   * here does mean completed.
+   */
+  @Post("b2c-result")
+  @HttpCode(200)
+  async handleB2cResult(@Body() rawPayload: unknown) {
+    try {
+      this.logger.log("Received B2C result callback");
+
+      if (!rawPayload || typeof rawPayload !== "object") {
+        throw new BadRequestException("Invalid payload: must be an object");
+      }
+
+      await this.ingest.ingest("daraja_b2c_result", rawPayload);
+
+      return { ResultCode: 0, ResultDesc: "Accepted" };
+    } catch (error) {
+      this.logger.error(`Failed to ingest B2C result: ${String(error)}`, {
+        error: String(error),
+        payload: rawPayload,
+      });
+
+      return { ResultCode: 0, ResultDesc: "Accepted" };
+    }
+  }
+
+  /**
+   * B2C Queue Timeout Callback (Safaricom -> QueueTimeOutURL)
+   *
+   * Fires when Safaricom couldn't process a payout request within its queue window.
+   * This is NOT a failure notice — the payout may still complete and post a real
+   * result afterwards — so ingestion is all that happens here; see
+   * WebhookPollerService.processB2cTimeout for why nothing is transitioned or
+   * released off the back of it.
+   */
+  @Post("b2c-timeout")
+  @HttpCode(200)
+  async handleB2cTimeout(@Body() rawPayload: unknown) {
+    try {
+      this.logger.warn("Received B2C queue-timeout callback");
+
+      if (!rawPayload || typeof rawPayload !== "object") {
+        throw new BadRequestException("Invalid payload: must be an object");
+      }
+
+      await this.ingest.ingest("daraja_b2c_timeout", rawPayload);
+
+      return { ResultCode: 0, ResultDesc: "Accepted" };
+    } catch (error) {
+      this.logger.error(`Failed to ingest B2C timeout: ${String(error)}`, {
+        error: String(error),
+        payload: rawPayload,
+      });
+
+      return { ResultCode: 0, ResultDesc: "Accepted" };
+    }
+  }
 }

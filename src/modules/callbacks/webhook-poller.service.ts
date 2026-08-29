@@ -56,6 +56,10 @@ export class WebhookPollerService {
         await this.processStkCallback(event.payload as any);
       } else if (event.source === "daraja_c2b_confirmation") {
         await this.processC2bConfirmation(event.payload as any);
+      } else if (event.source === "daraja_b2c_result") {
+        await this.processB2cResult(event.payload as any);
+      } else if (event.source === "daraja_b2c_timeout") {
+        await this.processB2cTimeout(event.payload as any);
       }
 
       await this.prisma.webhookEvent.update({
@@ -130,6 +134,130 @@ export class WebhookPollerService {
         context: { transactionId: transaction.id, tenantId: transaction.tenantId, resultCode },
       });
     }
+  }
+
+  /**
+   * Outbound counterpart to processStkCallback. Correlates on
+   * originatorConversationId — the id ScriptPay generated before the request went
+   * out — rather than anything Safaricom assigned, and routes into the PAYOUT state
+   * machine methods, whose ledger writes are the opposite direction from the
+   * collection ones.
+   */
+  private async processB2cResult(payload: any) {
+    const result = payload?.Result;
+    const originatorConversationId = result?.OriginatorConversationID;
+    const resultCode = Number(result?.ResultCode);
+
+    if (!originatorConversationId) {
+      // Guarded rather than passed straight to findUnique, which throws on an
+      // undefined filter and would burn all five retry attempts on a payload that
+      // is never going to become valid.
+      this.logger.warn("B2C result callback carried no OriginatorConversationID — ignoring");
+      await this.auditLog.record({
+        actorType: "system",
+        action: "daraja.b2c_callback_unmatched",
+        metadata: { reason: "missing_originator_conversation_id" },
+      });
+      return;
+    }
+
+    const transaction = await this.prisma.transaction.findUnique({ where: { originatorConversationId } });
+
+    if (!transaction) {
+      this.logger.warn(`B2C result for unknown OriginatorConversationID ${originatorConversationId} — ignoring`);
+      await this.auditLog.record({
+        actorType: "system",
+        action: "daraja.b2c_callback_unmatched",
+        metadata: { originatorConversationId },
+      });
+      return;
+    }
+
+    if (resultCode === 0) {
+      // ResultParameters uses Key/Value; the STK callback's CallbackMetadata uses
+      // Name/Value. Reading the wrong one yields undefined, not an error.
+      const params = result?.ResultParameters?.ResultParameter ?? [];
+      const receiptParam = params.find((p: any) => p.Key === "TransactionReceipt");
+      const mpesaReceiptNumber = (receiptParam?.Value ?? result?.TransactionID) as string | undefined;
+
+      await this.stateMachine.transitionPayoutToSettled(transaction.id, {
+        mpesaReceiptNumber: mpesaReceiptNumber ? String(mpesaReceiptNumber) : undefined,
+      });
+      await this.auditLog.record({
+        tenantId: transaction.tenantId,
+        actorType: "system",
+        action: "daraja.b2c_settled",
+        targetType: "Transaction",
+        targetId: transaction.id,
+        metadata: { originatorConversationId, mpesaReceiptNumber },
+      });
+    } else {
+      await this.stateMachine.transitionPayoutToFailed(transaction.id, {
+        failureReason: result?.ResultDesc ?? "unknown_failure",
+      });
+      await this.auditLog.record({
+        tenantId: transaction.tenantId,
+        actorType: "system",
+        action: "daraja.b2c_failed",
+        targetType: "Transaction",
+        targetId: transaction.id,
+        metadata: { originatorConversationId, resultCode, resultDesc: result?.ResultDesc },
+      });
+      await this.alerts.send({
+        title: "B2C payout failed at Safaricom",
+        detail: `Payout ${transaction.id}: ${result?.ResultDesc ?? "no reason given"}. Reserved funds have been returned to the tenant's balance.`,
+        severity: "warning",
+        context: { transactionId: transaction.id, tenantId: transaction.tenantId, resultCode },
+      });
+    }
+  }
+
+  /**
+   * Queue timeout. DELIBERATELY performs no state transition and releases no
+   * reservation.
+   *
+   * A timeout means Safaricom could not process the request inside its queue window
+   * — not that the money stayed put. The result callback may still arrive minutes
+   * later reporting success. Failing the payout here would return the reserved funds
+   * to the tenant's spendable balance while the payout is potentially still in
+   * flight, letting the same shillings go out twice. The transaction therefore stays
+   * PROCESSING with its reservation held, and a human is alerted.
+   *
+   * The cost of that choice is a payout that can sit PROCESSING indefinitely if the
+   * result callback never comes at all. That case belongs to DriftDetectorService,
+   * which queries Safaricom for the real answer — the correct way to resolve an
+   * unknown, rather than guessing here.
+   */
+  private async processB2cTimeout(payload: any) {
+    const result = payload?.Result;
+    const originatorConversationId = result?.OriginatorConversationID;
+
+    const transaction = originatorConversationId
+      ? await this.prisma.transaction.findUnique({ where: { originatorConversationId } })
+      : null;
+
+    this.logger.warn(
+      `B2C queue timeout for OriginatorConversationID ${originatorConversationId ?? "(missing)"} — ` +
+        `leaving the payout PROCESSING with its reservation held`,
+    );
+
+    await this.auditLog.record({
+      tenantId: transaction?.tenantId,
+      actorType: "system",
+      action: "daraja.b2c_timeout",
+      targetType: transaction ? "Transaction" : undefined,
+      targetId: transaction?.id,
+      metadata: { originatorConversationId, resultDesc: result?.ResultDesc },
+    });
+
+    await this.alerts.send({
+      title: "B2C payout timed out in Safaricom's queue — needs review",
+      detail:
+        `Payout ${transaction?.id ?? "(unmatched)"} timed out at Safaricom. It has NOT been failed and its funds ` +
+        `remain reserved, because the payout may still complete. Drift detection will query the real status.`,
+      severity: "critical",
+      context: { transactionId: transaction?.id, tenantId: transaction?.tenantId, originatorConversationId },
+    });
   }
 
   private async processC2bConfirmation(payload: any) {

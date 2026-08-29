@@ -105,6 +105,24 @@ full validation applies.
 - **Scoped API keys**: `@RequireScopes(...)` limits what an API key can do
   independent of which tenant it belongs to — a leaked read-only reporting
   key cannot initiate payments.
+- **`PAYMENTS_DISBURSE` is separate from `PAYMENTS_INITIATE` on purpose.**
+  Sending money out (`POST /v1/payments/b2c`) is the one capability that can
+  drain a tenant's balance, so it is not implied by the scope that collects
+  payments. Every API key already in the database carries
+  `PAYMENTS_INITIATE` — it is in the default set auto-provisioned on tenant
+  activation (`ApiKeysService.provisionDefaultKeyIfNeeded`) — so widening
+  that scope's meaning to cover payouts would have silently granted the
+  capability to every existing key the moment the route shipped. It is also
+  deliberately absent from that default set: a tenant gets payout ability
+  only on a key somebody issued with it explicitly. Note the scope list is
+  duplicated by hand in `api-key.dto.ts` (zod cannot read a Prisma enum), so
+  both must be edited together.
+- **Solvency is enforced in the ledger, not the guard.** A caller holding
+  `PAYMENTS_DISBURSE` still cannot pay out more than the tenant's balance:
+  `LedgerService.assertSufficientBalance` takes a `FOR UPDATE` lock on the
+  tenant row and sums `LedgerEntry` inside the same transaction that writes
+  the debit, so two concurrent payouts cannot both pass the same check. See
+  `docs/decisions.md` entry 15.
 - **Tenant status is an authorization check, not just a label.** Suspending a
   tenant does *not* revoke their API keys, so `ApiKeyGuard` alone will keep
   authenticating them. `TenantsService.getMpesaCredentialsForPayment` refuses
@@ -166,10 +184,23 @@ credentials to. Trust is established structurally instead:
 - `WebhookEvent`'s unique constraint on `(source, naturalKey)` is the
   idempotency guard — the actual defense against replay, not an
   authentication check.
-- A callback for an unrecognized `CheckoutRequestID`/`businessShortcode` is
-  logged and audit-recorded (`daraja.callback_unmatched` /
-  `daraja.c2b_unmatched`) but otherwise ignored — it cannot mutate a
+- A callback for an unrecognized `CheckoutRequestID`/`businessShortcode`/
+  `OriginatorConversationID` is logged and audit-recorded
+  (`daraja.callback_unmatched` / `daraja.c2b_unmatched` /
+  `daraja.b2c_callback_unmatched`) but otherwise ignored — it cannot mutate a
   transaction it isn't the legitimate result for.
+- **Collections and payouts cannot cross-contaminate.** The two directions
+  correlate on different columns (`checkoutRequestId` vs
+  `originatorConversationId`), so an STK callback structurally cannot match a
+  payout row and vice versa. `TransactionStateMachine` additionally refuses
+  the crossing outright — `assertNotOutbound` on the collection transitions,
+  `assertOutbound` on the payout ones — because the failure mode there is not
+  a wrong response but ledger entries written in the wrong direction, which
+  nothing downstream would flag.
+- **A B2C queue timeout is not treated as a failure.** Releasing a
+  reservation on a timeout, when the payout may still complete, is a
+  double-spend. The handler holds the reservation and escalates instead — see
+  `docs/api.md` on `/v1/webhooks/daraja/b2c-timeout`.
 - The endpoint always returns HTTP 200, even on internal failure — this is a
   protocol requirement (Safaricom retries aggressively on anything else),
   not a security relaxation; failures are captured in `WebhookEvent.processingError`
@@ -232,3 +263,17 @@ in the codebase is not, by itself, sufficient to leak cross-tenant data.
   check that it was actually run against a given database — a fresh
   environment that skips this step loses the second isolation layer without
   any error surfacing.
+- **Stuck payouts are escalated to a human, not auto-recovered.** A payout
+  left `PROCESSING` (no result callback, or a queue timeout) keeps its funds
+  reserved and unspendable until someone resolves it in Safaricom's portal.
+  `DriftDetectorService.detectStuckPayouts` alerts once per payout after 5
+  minutes; it cannot settle or fail one itself, because Daraja's Transaction
+  Status API answers asynchronously and auto-recovery therefore needs its own
+  callback route and correlation. See `docs/decisions.md` entry 18. The
+  collection path does self-heal, so this asymmetry is specific to payouts.
+- **The B2C amount ceiling in `initiate-b2c.dto.ts` (KES 250,000) has not
+  been verified against live Daraja documentation** for a specific shortcode,
+  and it is explicitly *not* the same limit as the STK push one. It bounds
+  requests that Safaricom would reject anyway; it is not what protects the
+  platform from over-spending — the ledger balance check is. Confirm it
+  before going live.
