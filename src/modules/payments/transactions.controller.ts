@@ -6,7 +6,7 @@ import { CurrentUser, type AuthenticatedUser } from "../../common/decorators/cur
 import { ReadThrottle } from "../../common/throttle-tiers";
 import { PrismaService } from "../prisma/prisma.service";
 import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
-import type { TransactionStatus } from "@prisma/client";
+import type { TransactionStatus, TransactionDirection } from "@prisma/client";
 
 /**
  * Dashboard-facing reads only. Tenant staff/admins see only their own tenant's
@@ -34,6 +34,13 @@ export class TransactionsController {
     @CurrentUser() user: AuthenticatedUser,
     @Query("status") status?: TransactionStatus,
     @Query("tenantId") queryTenantId?: string,
+    // Payouts live in the same table as collections (they share the ledger,
+    // reconciliation and webhook-delivery machinery keyed on Transaction), so without
+    // this filter a dashboard list built for collections silently starts showing
+    // money going out alongside money coming in. Unfiltered still returns both —
+    // that's the honest default for "all transactions" — but a caller that means one
+    // direction can now say so.
+    @Query("direction") direction?: TransactionDirection,
   ) {
     // resolveTenantId always resolves to exactly one concrete tenant, even for
     // SUPER_ADMIN (it requires ?tenantId= explicitly, see below) — so this can
@@ -43,7 +50,7 @@ export class TransactionsController {
 
     return this.prisma.withTenantContext(tenantId, (tx) =>
       tx.transaction.findMany({
-        where: { tenantId, ...(status ? { status } : {}) },
+        where: { tenantId, ...(status ? { status } : {}), ...(direction ? { direction } : {}) },
         orderBy: { createdAt: "desc" },
         take: 100,
       }),

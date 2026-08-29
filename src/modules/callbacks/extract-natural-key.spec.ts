@@ -36,4 +36,39 @@ describe("extractNaturalKey", () => {
     expect(extractNaturalKey("daraja_c2b_confirmation", "a string")).toBeNull();
     expect(extractNaturalKey("daraja_c2b_confirmation", undefined)).toBeNull();
   });
+
+  describe("B2C callbacks", () => {
+    const b2cPayload = { Result: { ResultCode: 0, OriginatorConversationID: "oc-42" } };
+
+    it("keys a B2C result on OriginatorConversationID", () => {
+      expect(extractNaturalKey("daraja_b2c_result", b2cPayload)).toBe("oc-42");
+    });
+
+    it("keys a B2C timeout on OriginatorConversationID", () => {
+      expect(extractNaturalKey("daraja_b2c_timeout", b2cPayload)).toBe("oc-42");
+    });
+
+    // Separate sources are separate idempotency namespaces — the unique constraint is
+    // on (source, naturalKey) — so a result and a timeout for the SAME payout are two
+    // distinct events and both get processed. That's intended: they mean different
+    // things, and the timeout handler must still run even when a result also arrived.
+    it("gives the same key for both sources, which stay distinct events", () => {
+      expect(extractNaturalKey("daraja_b2c_result", b2cPayload)).toBe(
+        extractNaturalKey("daraja_b2c_timeout", b2cPayload),
+      );
+    });
+
+    it("returns null when the Result envelope is missing or malformed", () => {
+      expect(extractNaturalKey("daraja_b2c_result", {})).toBeNull();
+      expect(extractNaturalKey("daraja_b2c_result", { Result: {} })).toBeNull();
+      expect(extractNaturalKey("daraja_b2c_result", { Result: { OriginatorConversationID: 42 } })).toBeNull();
+      expect(extractNaturalKey("daraja_b2c_result", null)).toBeNull();
+    });
+
+    // The STK shape must not accidentally satisfy the B2C branch, or a misrouted
+    // payload would be stored under the wrong source.
+    it("does not extract a key from an STK payload sent to the B2C source", () => {
+      expect(extractNaturalKey("daraja_b2c_result", { Body: { stkCallback: { CheckoutRequestID: "cr-1" } } })).toBeNull();
+    });
+  });
 });

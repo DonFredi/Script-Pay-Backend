@@ -7,6 +7,7 @@ import { AuditLogService } from "../audit-log/audit-log.service";
 import { CredentialsEncryptionService } from "./credentials-encryption.service";
 import { ApiKeysService } from "../api-keys/api-keys.service";
 import { EmailService } from "../auth/email.service";
+import { DarajaClient } from "../../infrastructure/daraja/daraja.client";
 import type { AuthenticatedUser } from "../../common/decorators/current-user.decorator";
 
 function uniqueConstraintError(): Prisma.PrismaClientKnownRequestError {
@@ -27,6 +28,7 @@ describe("TenantsService", () => {
   let encryption: CredentialsEncryptionService;
   let apiKeysService: ApiKeysService;
   let emailService: EmailService;
+  let daraja: DarajaClient;
 
   beforeEach(async () => {
     const prismaMock: any = {
@@ -55,6 +57,13 @@ describe("TenantsService", () => {
         { provide: CredentialsEncryptionService, useValue: { encrypt: jest.fn(), decrypt: jest.fn() } },
         { provide: ApiKeysService, useValue: { provisionDefaultKeyIfNeeded: jest.fn() } },
         { provide: EmailService, useValue: { sendApiKeyProvisionedEmail: jest.fn() } },
+        {
+          provide: DarajaClient,
+          useValue: {
+            verifyCredentials: jest.fn().mockResolvedValue(undefined),
+            registerC2bUrl: jest.fn().mockResolvedValue(undefined),
+          },
+        },
       ],
     }).compile();
 
@@ -64,6 +73,7 @@ describe("TenantsService", () => {
     encryption = module.get(CredentialsEncryptionService);
     apiKeysService = module.get(ApiKeysService);
     emailService = module.get(EmailService);
+    daraja = module.get(DarajaClient);
   });
 
   describe("setMpesaCredentials", () => {
@@ -99,9 +109,42 @@ describe("TenantsService", () => {
           }),
         }),
       );
-      expect(result).toEqual({ configured: true });
+      expect(result).toEqual({ configured: true, c2bUrlRegistered: true });
       expect(JSON.stringify(result)).not.toContain("cs");
       expect(JSON.stringify(result)).not.toContain("pk");
+    });
+
+    it("verifies the consumer key/secret against Daraja before persisting anything", async () => {
+      jest.spyOn(daraja, "verifyCredentials").mockRejectedValueOnce(new Error("bad credentials"));
+
+      await expect(service.setMpesaCredentials("tenant-1", dto, user())).rejects.toThrow("bad credentials");
+      expect(prisma.tenant.update).not.toHaveBeenCalled();
+    });
+
+    it("auto-registers the C2B confirmation URL for the shortcode after saving", async () => {
+      jest.spyOn(encryption, "encrypt").mockReturnValue("enc-value");
+      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({} as any);
+
+      await service.setMpesaCredentials("tenant-1", dto, user());
+
+      expect(daraja.registerC2bUrl).toHaveBeenCalledWith({
+        mpesaConsumerKey: "ck",
+        mpesaConsumerSecretEncrypted: "cs",
+        shortcode: "174379",
+      });
+    });
+
+    it("saves credentials successfully even when C2B URL registration fails, and reports it in the result", async () => {
+      jest.spyOn(encryption, "encrypt").mockReturnValue("enc-value");
+      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({} as any);
+      jest.spyOn(daraja, "registerC2bUrl").mockRejectedValueOnce(new Error("Daraja rejected C2B URL registration"));
+
+      const result = await service.setMpesaCredentials("tenant-1", dto, user());
+
+      expect(result).toEqual({ configured: true, c2bUrlRegistered: false });
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: "daraja.c2b_url_registration_failed" }),
+      );
     });
 
     it("turns a shortcode collision with another active tenant into a clear 409, not a raw DB error", async () => {

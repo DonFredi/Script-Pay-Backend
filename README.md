@@ -15,9 +15,10 @@ src/
 │   ├── auth/            signup/login/refresh/password-reset/email-verification, JWT issuance
 │   ├── tenants/          tenant CRUD, scoped by role, encrypted Daraja credentials
 │   ├── api-keys/         issue/list/revoke scoped, argon2-hashed API keys
-│   ├── payments/         STK Push initiation (tenant + dashboard variants), transaction reads, state machine
+│   ├── ledger/           tenant balance computed from LedgerEntry; authorizes payouts behind a row lock
+│   ├── payments/         STK Push + B2C payouts (tenant + dashboard variants each), transaction reads, state machine
 │   ├── callbacks/        idempotent webhook ingestion + Postgres-polling retry/backoff
-│   ├── reconciliation/   active drift detection against Daraja's status API
+│   ├── reconciliation/   drift detection: active recovery for collections, escalation for stuck payouts
 │   ├── reporting/        GET /v1/reporting/summary — aggregated success/failure metrics
 │   ├── audit-log/        global AuditLogService — records every sensitive action and M-Pesa interaction
 │   └── alerts/           global AlertsService — Slack webhook notifications on failures

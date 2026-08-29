@@ -1,6 +1,7 @@
 import { Test, TestingModule } from "@nestjs/testing";
 import { TransactionStateMachine } from "./transaction-state-machine";
 import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
+import { LedgerService } from "../ledger/ledger.service";
 
 describe("TransactionStateMachine", () => {
   let service: TransactionStateMachine;
@@ -22,6 +23,10 @@ describe("TransactionStateMachine", () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         TransactionStateMachine,
+        // The real LedgerService, not a mock: the methods used here are pure builders
+        // with no I/O, and asserting against the actual account/direction pairs is the
+        // point of the payout ledger tests below.
+        LedgerService,
         {
           provide: PrismaPrivilegedService,
           useValue: {
@@ -70,6 +75,8 @@ describe("TransactionStateMachine", () => {
         id: "tx-1",
         tenantId: "tenant-1",
         status: "PROCESSING",
+        direction: "INBOUND",
+        channel: "STK_PUSH",
         amountMinorUnits: 10000,
         metadata: { orderRef: "abc" },
         tenant: { webhookUrl: "https://example.com/webhooks/scriptpay" },
@@ -84,6 +91,10 @@ describe("TransactionStateMachine", () => {
           payload: {
             transactionId: "tx-1",
             status: "SETTLED",
+            // Present on collections too, not just payouts — a consumer shouldn't
+            // have to infer direction from the absence of a field.
+            direction: "INBOUND",
+            channel: "STK_PUSH",
             mpesaReceiptNumber: "REC123",
             amountMinorUnits: 10000,
             metadata: { orderRef: "abc" },
@@ -225,6 +236,8 @@ describe("TransactionStateMachine", () => {
         id: "tx-1",
         tenantId: "tenant-1",
         status: "PROCESSING",
+        direction: "INBOUND",
+        channel: "STK_PUSH",
         amountMinorUnits: 10000,
         metadata: null,
         tenant: { webhookUrl: "https://example.com/webhooks/scriptpay" },
@@ -239,6 +252,8 @@ describe("TransactionStateMachine", () => {
           payload: {
             transactionId: "tx-1",
             status: "FAILED",
+            direction: "INBOUND",
+            channel: "STK_PUSH",
             mpesaReceiptNumber: null,
             amountMinorUnits: 10000,
             metadata: null,
@@ -300,6 +315,149 @@ describe("TransactionStateMachine", () => {
       expect(tx.ledgerEntry.createMany).toHaveBeenCalled();
       expect(tx.reconciliationRecord.create).toHaveBeenCalled();
       expect(result.id).toBe("tx-c2b-1");
+    });
+  });
+
+  describe("payout transitions", () => {
+    const payoutRow = (overrides: Record<string, unknown> = {}) => ({
+      id: "payout-1",
+      tenantId: "tenant-1",
+      status: "PROCESSING",
+      direction: "OUTBOUND",
+      channel: "B2C",
+      amountMinorUnits: 50000,
+      ...overrides,
+    });
+
+    /** The ledger entries written by the call under test, as {account, direction} pairs. */
+    const writtenEntries = () =>
+      (tx.ledgerEntry.createMany.mock.calls[0]?.[0].data as Array<{ account: string; direction: string }>).map(
+        ({ account, direction }) => ({ account, direction }),
+      );
+
+    describe("transitionPayoutToSettled", () => {
+      it("discharges the reservation into payouts_paid", async () => {
+        tx.transaction.findUniqueOrThrow.mockResolvedValueOnce(payoutRow());
+
+        await service.transitionPayoutToSettled("payout-1", { mpesaReceiptNumber: "REC-OUT-1" });
+
+        expect(tx.transaction.update).toHaveBeenCalledWith(
+          expect.objectContaining({ data: expect.objectContaining({ status: "SETTLED" }) }),
+        );
+        expect(writtenEntries()).toEqual([
+          { account: "payout_reserved", direction: "debit" },
+          { account: "payouts_paid", direction: "credit" },
+        ]);
+      });
+
+      // The whole reason this isn't a branch inside transitionToSettled: crediting
+      // tenant_balance here would pay the tenant for money they just sent.
+      it("does NOT touch tenant_balance — the reservation already deducted it", async () => {
+        tx.transaction.findUniqueOrThrow.mockResolvedValueOnce(payoutRow());
+
+        await service.transitionPayoutToSettled("payout-1", { mpesaReceiptNumber: "REC-OUT-1" });
+
+        expect(writtenEntries().some((e) => e.account === "tenant_balance")).toBe(false);
+      });
+
+      it("writes a reconciliation record", async () => {
+        tx.transaction.findUniqueOrThrow.mockResolvedValueOnce(payoutRow());
+
+        await service.transitionPayoutToSettled("payout-1", { mpesaReceiptNumber: "REC-OUT-1" });
+
+        expect(tx.reconciliationRecord.create).toHaveBeenCalled();
+      });
+
+      it("is idempotent on a redelivered callback — never discharges the reservation twice", async () => {
+        tx.transaction.findUniqueOrThrow.mockResolvedValueOnce(
+          payoutRow({ status: "SETTLED", mpesaReceiptNumber: "REC-OUT-1" }),
+        );
+
+        await service.transitionPayoutToSettled("payout-1", { mpesaReceiptNumber: "REC-OUT-1" });
+
+        expect(tx.ledgerEntry.createMany).not.toHaveBeenCalled();
+      });
+
+      it("back-fills a receipt number onto an already-settled payout without re-writing the ledger", async () => {
+        tx.transaction.findUniqueOrThrow.mockResolvedValueOnce(
+          payoutRow({ status: "SETTLED", mpesaReceiptNumber: null }),
+        );
+
+        await service.transitionPayoutToSettled("payout-1", { mpesaReceiptNumber: "REC-OUT-1" });
+
+        expect(tx.transaction.update).toHaveBeenCalledWith(
+          expect.objectContaining({ data: { mpesaReceiptNumber: "REC-OUT-1" } }),
+        );
+        expect(tx.ledgerEntry.createMany).not.toHaveBeenCalled();
+      });
+
+      it("refuses a collection — payout ledger writes must never apply to an INBOUND row", async () => {
+        tx.transaction.findUniqueOrThrow.mockResolvedValueOnce(
+          payoutRow({ direction: "INBOUND", channel: "STK_PUSH" }),
+        );
+
+        await expect(service.transitionPayoutToSettled("payout-1", {})).rejects.toThrow(
+          /must not be applied to a collection/,
+        );
+        expect(tx.ledgerEntry.createMany).not.toHaveBeenCalled();
+      });
+
+      it("includes direction and channel in the tenant webhook payload", async () => {
+        tx.transaction.findUniqueOrThrow.mockResolvedValueOnce(
+          payoutRow({ tenant: { webhookUrl: "https://merchant.test/hook" } }),
+        );
+
+        await service.transitionPayoutToSettled("payout-1", { mpesaReceiptNumber: "REC-OUT-1" });
+
+        const payload = tx.tenantWebhookDelivery.create.mock.calls[0][0].data.payload;
+        expect(payload).toMatchObject({ status: "SETTLED", direction: "OUTBOUND", channel: "B2C" });
+      });
+    });
+
+    describe("transitionPayoutToFailed", () => {
+      it("returns the reserved funds to the tenant's spendable balance", async () => {
+        tx.transaction.findUniqueOrThrow.mockResolvedValueOnce(payoutRow());
+
+        await service.transitionPayoutToFailed("payout-1", { failureReason: "insufficient float" });
+
+        expect(tx.transaction.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({ status: "FAILED", failureReason: "insufficient float" }),
+          }),
+        );
+        expect(writtenEntries()).toEqual([
+          { account: "payout_reserved", direction: "debit" },
+          { account: "tenant_balance", direction: "credit" },
+        ]);
+      });
+
+      it("refuses a collection", async () => {
+        tx.transaction.findUniqueOrThrow.mockResolvedValueOnce(payoutRow({ direction: "INBOUND" }));
+
+        await expect(
+          service.transitionPayoutToFailed("payout-1", { failureReason: "whatever" }),
+        ).rejects.toThrow(/must not be applied to a collection/);
+        expect(tx.ledgerEntry.createMany).not.toHaveBeenCalled();
+      });
+    });
+
+    // The mirror guard: the collection path must equally refuse a payout row, or a
+    // misrouted callback would credit tenant_balance for money that left the account.
+    it("transitionToSettled refuses an OUTBOUND transaction", async () => {
+      tx.transaction.findUniqueOrThrow.mockResolvedValueOnce(payoutRow());
+
+      await expect(service.transitionToSettled("payout-1", {})).rejects.toThrow(
+        /must not be settled through the collection path/,
+      );
+      expect(tx.ledgerEntry.createMany).not.toHaveBeenCalled();
+    });
+
+    it("transitionToFailed refuses an OUTBOUND transaction", async () => {
+      tx.transaction.findUniqueOrThrow.mockResolvedValueOnce(payoutRow());
+
+      await expect(service.transitionToFailed("payout-1", { failureReason: "x" })).rejects.toThrow(
+        /must not be settled through the collection path/,
+      );
     });
   });
 });

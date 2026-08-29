@@ -1,7 +1,12 @@
 import { Injectable, Logger, BadRequestException } from "@nestjs/common";
 import { PrismaService } from "../prisma/prisma.service";
 import { extractNaturalKey } from "./extract-natural-key";
-import type { DarajaStkCallback, DarajaC2bCallback, NormalizedWebhookPayload } from "./daraja-callback.interface";
+import type {
+  DarajaStkCallback,
+  DarajaC2bCallback,
+  NormalizedWebhookPayload,
+  WebhookSource,
+} from "./daraja-callback.interface";
 
 @Injectable()
 export class WebhookIngestService {
@@ -21,7 +26,7 @@ export class WebhookIngestService {
    * This method returns immediately (200 OK to Safaricom)
    * Actual business logic happens async in webhook-processor
    */
-  async ingest(source: "daraja_stk_callback" | "daraja_c2b_confirmation", rawPayload: unknown): Promise<void> {
+  async ingest(source: WebhookSource, rawPayload: unknown): Promise<void> {
     // 1. Validate payload structure
     if (!rawPayload || typeof rawPayload !== "object") {
       this.logger.warn(`Invalid ${source} payload: not an object`, { rawPayload });

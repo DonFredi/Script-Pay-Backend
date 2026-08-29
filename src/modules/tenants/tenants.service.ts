@@ -8,8 +8,9 @@ import { EmailService } from "../auth/email.service";
 import type { AuthenticatedUser } from "../../common/decorators/current-user.decorator";
 import type { CreateTenantDto, UpdateTenantStatusDto } from "./tenant.dto";
 import type { MpesaCredentialsDto } from "./tenants.schema";
-import type { TenantMpesaCredentials } from "../../infrastructure/daraja/daraja.client";
+import type { TenantMpesaCredentials, TenantPayoutCredentials } from "../../infrastructure/daraja/daraja.client";
 import { CredentialsEncryptionService } from "./credentials-encryption.service";
+import { DarajaClient } from "../../infrastructure/daraja/daraja.client";
 
 @Injectable()
 export class TenantsService {
@@ -21,6 +22,7 @@ export class TenantsService {
     private readonly encryption: CredentialsEncryptionService,
     private readonly apiKeysService: ApiKeysService,
     private readonly emailService: EmailService,
+    private readonly daraja: DarajaClient,
   ) {}
 
   /** SUPER_ADMIN only — enforced at the controller via @Roles(), not re-checked here on purpose:
@@ -45,6 +47,16 @@ export class TenantsService {
       throw new ForbiddenException("Cannot configure another tenant's credentials");
     }
 
+    // Fail fast: confirm this consumer key/secret actually authenticate with Daraja
+    // BEFORE persisting anything. Without this, a typo'd secret saves silently and
+    // the tenant only discovers it at their first real STK push — a much worse place
+    // to find out. Throws BadGatewayException on rejection, which the controller lets
+    // through as-is (same pattern as the payment paths).
+    await this.daraja.verifyCredentials({
+      mpesaConsumerKey: dto.consumerKey,
+      mpesaConsumerSecretEncrypted: dto.consumerSecret,
+    });
+
     await this.rejectingShortcodeConflict(
       this.prisma.tenant.update({
         where: { id: tenantId },
@@ -54,19 +66,55 @@ export class TenantsService {
           mpesaConsumerSecretEncrypted: this.encryption.encrypt(dto.consumerSecret),
           mpesaPasskeyEncrypted: this.encryption.encrypt(dto.passkey),
           mpesaCredentialsConfiguredAt: new Date(),
+          // Spread rather than set unconditionally: a tenant re-submitting only their
+          // collection credentials must not silently wipe payout credentials they
+          // configured earlier. The zod schema guarantees these two arrive together
+          // or not at all, so one being present implies the other.
+          ...(dto.initiatorName && dto.securityCredential
+            ? {
+                mpesaInitiatorName: dto.initiatorName,
+                mpesaSecurityCredentialEncrypted: this.encryption.encrypt(dto.securityCredential),
+                mpesaPayoutConfiguredAt: new Date(),
+              }
+            : {}),
         },
       }),
     );
+
+    // Best-effort: tells Safaricom where to deliver C2B confirmations for direct
+    // till/paybill payments (ones that skip STK Push). Credentials are already
+    // verified and saved above, so a failure here must not undo that or fail the
+    // whole request — it only means manual payments on this shortcode stay
+    // untracked until this is retried (e.g. by re-submitting the same credentials).
+    let c2bUrlRegistered = true;
+    try {
+      await this.daraja.registerC2bUrl({
+        mpesaConsumerKey: dto.consumerKey,
+        mpesaConsumerSecretEncrypted: dto.consumerSecret,
+        shortcode: dto.businessShortcode,
+      });
+    } catch (error) {
+      c2bUrlRegistered = false;
+      this.logger.warn(`C2B URL registration failed for tenant ${tenantId}: ${String(error)}`);
+      await this.auditLog.record({
+        tenantId,
+        actorType: "system",
+        action: "daraja.c2b_url_registration_failed",
+        metadata: { error: String(error) },
+      });
+    }
 
     await this.auditLog.record({
       tenantId,
       actorType: "user",
       actorId: actor.id,
       action: "tenant.mpesa_credentials_configured",
+      // Records WHETHER payout access was configured, never the credential itself.
+      metadata: { payoutCredentialsConfigured: Boolean(dto.initiatorName && dto.securityCredential), c2bUrlRegistered },
     });
 
     // Never echo the secret/passkey back, even to the tenant that just set it.
-    return { configured: true };
+    return { configured: true, c2bUrlRegistered };
   }
 
   /**
@@ -127,6 +175,53 @@ export class TenantsService {
       mpesaConsumerKey: tenant.mpesaConsumerKey,
       mpesaConsumerSecretEncrypted: this.encryption.decrypt(tenant.mpesaConsumerSecretEncrypted),
       mpesaPasskeyEncrypted: this.encryption.decrypt(tenant.mpesaPasskeyEncrypted),
+    };
+  }
+
+  /**
+   * Payout counterpart to getMpesaCredentialsForPayment. A separate method rather
+   * than an optional-fields variant of that one, because the two need genuinely
+   * different secrets: collections need the passkey and no initiator, payouts the
+   * exact reverse. One union-shaped return would leave every caller re-checking
+   * which half it actually received — and would decrypt a passkey the payout path
+   * has no use for.
+   */
+  async getMpesaCredentialsForPayout(tenantId: string): Promise<TenantPayoutCredentials> {
+    const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
+
+    // The same kill switch the collection path applies. A suspended tenant must not
+    // move money in EITHER direction, and outbound is the direction where it matters
+    // more — suspension often means exactly "we don't trust this account right now."
+    if (tenant.status === "suspended") {
+      throw new ForbiddenException("This tenant is suspended and cannot initiate payments");
+    }
+
+    if (!tenant.mpesaConsumerKey || !tenant.mpesaConsumerSecretEncrypted) {
+      throw new ForbiddenException(
+        "M-Pesa credentials aren't configured for this tenant yet — set them up before initiating payments",
+      );
+    }
+
+    // Deliberately a different message from the one above. A tenant that has been
+    // collecting successfully for months hits THIS branch the first time they try to
+    // pay out, and telling them their "M-Pesa credentials aren't configured" would be
+    // actively misleading — theirs plainly are. B2C initiator access is a separate
+    // registration on Safaricom's side, not something the collection setup implies.
+    if (!tenant.mpesaInitiatorName || !tenant.mpesaSecurityCredentialEncrypted) {
+      throw new ForbiddenException(
+        "B2C payout credentials aren't configured for this tenant yet — an initiator name and security " +
+          "credential are required before sending payments",
+      );
+    }
+
+    return {
+      shortcode: tenant.businessShortcode,
+      mpesaConsumerKey: tenant.mpesaConsumerKey,
+      mpesaConsumerSecretEncrypted: this.encryption.decrypt(tenant.mpesaConsumerSecretEncrypted),
+      initiatorName: tenant.mpesaInitiatorName,
+      // Decrypts the AES layer only. What comes out is still Safaricom's
+      // RSA-encrypted blob, which is exactly what the B2C request expects.
+      securityCredential: this.encryption.decrypt(tenant.mpesaSecurityCredentialEncrypted),
     };
   }
 

@@ -40,12 +40,16 @@ AuditLogModule (global)    — AuditLogService, append-only log writes
 AuthModule                 — signup/login/refresh/password-reset/email-verification
 TenantsModule              — tenant CRUD, encrypted Daraja credential storage
 ApiKeysModule               — issue/list/revoke scoped API keys
+LedgerModule                — LedgerService: computes tenant balance from LedgerEntry,
+                                and guards the payout spend path (FOR UPDATE on the tenant
+                                row, then sum) — see decisions.md entry 15
 PaymentsModule              — STK Push initiation, transaction reads, TransactionStateMachine
   └─ exports TransactionStateMachine → consumed by CallbacksModule and ReconciliationModule
 CallbacksModule              — inbound Daraja webhook ingestion + Postgres-polling processor;
                                 also outbound tenant-webhook delivery (TenantWebhookPollerService)
                                 — imports TenantsModule for CredentialsEncryptionService
-ReconciliationModule         — DriftDetectorService, active recovery for stuck transactions
+ReconciliationModule         — DriftDetectorService: active recovery for stuck collections,
+                                escalation-only for stuck payouts (decisions.md entry 18)
 ReportingModule              — GET /v1/reporting/summary
 ```
 

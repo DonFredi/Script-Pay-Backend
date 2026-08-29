@@ -1,7 +1,9 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 import { Prisma } from "@prisma/client";
-import type { TransactionStatus } from "@prisma/client";
+import type { TransactionStatus, TransactionChannel, TransactionDirection } from "@prisma/client";
+import { LedgerAccount, LedgerDirection } from "../ledger/ledger.accounts";
+import { LedgerService } from "../ledger/ledger.service";
 
 /**
  * Every allowed transition is enumerated. An attempt to move a transaction through
@@ -24,7 +26,13 @@ export class TransactionStateMachine {
   // Only ever invoked by WebhookPollerService/DriftDetectorService — both
   // cross-tenant background jobs with no single tenant to scope by. See
   // PrismaPrivilegedService's own doc comment.
-  constructor(private readonly prisma: PrismaPrivilegedService) {}
+  constructor(
+    private readonly prisma: PrismaPrivilegedService,
+    // Injected for its pure ledger-pair builders only — the balance read and its
+    // FOR UPDATE lock belong to the request path, not to these callback-driven
+    // transitions, which spend nothing and so have nothing to authorize.
+    private readonly ledger: LedgerService,
+  ) {}
 
   /**
    * mpesaReceiptNumber is OPTIONAL: DriftDetectorService settles a transaction from
@@ -39,6 +47,8 @@ export class TransactionStateMachine {
         where: { id: transactionId },
         include: { tenant: { select: { webhookUrl: true } } },
       });
+
+      this.assertNotOutbound(transaction, "transitionToSettled");
 
       if (transaction.status === "SETTLED") {
         // Already settled — most commonly Safaricom redelivering the same callback, but
@@ -75,15 +85,15 @@ export class TransactionStateMachine {
           {
             tenantId: transaction.tenantId,
             transactionId: transaction.id,
-            account: "tenant_balance",
-            direction: "credit",
+            account: LedgerAccount.TENANT_BALANCE,
+            direction: LedgerDirection.CREDIT,
             amountMinorUnits: transaction.amountMinorUnits,
           },
           {
             tenantId: transaction.tenantId,
             transactionId: transaction.id,
-            account: "pending_settlement",
-            direction: "debit",
+            account: LedgerAccount.PENDING_SETTLEMENT,
+            direction: LedgerDirection.DEBIT,
             amountMinorUnits: transaction.amountMinorUnits,
           },
         ],
@@ -112,11 +122,126 @@ export class TransactionStateMachine {
         where: { id: transactionId },
         include: { tenant: { select: { webhookUrl: true } } },
       });
+      this.assertNotOutbound(transaction, "transitionToFailed");
       this.assertTransitionAllowed(transaction.status, "FAILED");
 
       await tx.transaction.update({
         where: { id: transactionId },
         data: { status: "FAILED", failureReason: data.failureReason },
+      });
+
+      await this.enqueueWebhookDelivery(tx, transaction, "FAILED", null);
+    });
+  }
+
+  /**
+   * Payout counterpart to transitionToSettled — a separate method rather than a
+   * branch inside it because THE LEDGER DIRECTION IS OPPOSITE. transitionToSettled
+   * credits tenant_balance; putting a payout through it would credit the tenant for
+   * money they just sent, drifting the ledger by twice the payout on every single
+   * disbursement.
+   *
+   * The reservation (B2cService, which owns the request's tenant context) has already
+   * debited tenant_balance and credited payout_reserved. This discharges that
+   * reservation into payouts_paid and deliberately leaves tenant_balance untouched:
+   * the money left the spendable balance the moment the payout was authorized, not
+   * now. Settlement is confirmation, not the deduction.
+   *
+   * mpesaReceiptNumber is optional for the same reason it is on the inbound path —
+   * see that method's comment and decisions.md entry 5.
+   */
+  async transitionPayoutToSettled(transactionId: string, data: { mpesaReceiptNumber?: string }) {
+    await this.prisma.$transaction(async (tx) => {
+      const transaction = await tx.transaction.findUniqueOrThrow({
+        where: { id: transactionId },
+        include: { tenant: { select: { webhookUrl: true } } },
+      });
+
+      this.assertOutbound(transaction, "transitionPayoutToSettled");
+
+      if (transaction.status === "SETTLED") {
+        // Identical duplicate-delivery handling to the inbound path: back-fill a
+        // receipt number drift detection couldn't supply, otherwise no-op. Critically
+        // this returns BEFORE the ledger writes below — a redelivered result callback
+        // must never discharge the same reservation twice.
+        if (!transaction.mpesaReceiptNumber && data.mpesaReceiptNumber) {
+          await tx.transaction.update({
+            where: { id: transactionId },
+            data: { mpesaReceiptNumber: data.mpesaReceiptNumber },
+          });
+          return;
+        }
+        if (!data.mpesaReceiptNumber || transaction.mpesaReceiptNumber === data.mpesaReceiptNumber) {
+          return;
+        }
+        throw new Error(
+          `Payout ${transactionId} already settled with a different receipt number ` +
+            `(existing: ${transaction.mpesaReceiptNumber}, incoming: ${data.mpesaReceiptNumber})`,
+        );
+      }
+
+      this.assertTransitionAllowed(transaction.status, "SETTLED");
+
+      await tx.transaction.update({
+        where: { id: transactionId },
+        data: { status: "SETTLED", mpesaReceiptNumber: data.mpesaReceiptNumber },
+      });
+
+      await tx.ledgerEntry.createMany({
+        data: this.ledger.settlementEntries({
+          tenantId: transaction.tenantId,
+          transactionId: transaction.id,
+          amountMinorUnits: transaction.amountMinorUnits,
+        }),
+      });
+
+      await tx.reconciliationRecord.create({
+        data: {
+          tenantId: transaction.tenantId,
+          transactionId: transaction.id,
+          expectedAmount: transaction.amountMinorUnits,
+          confirmedAmount: transaction.amountMinorUnits,
+          reconciledAt: new Date(),
+        },
+      });
+
+      await this.enqueueWebhookDelivery(tx, transaction, "SETTLED", data.mpesaReceiptNumber ?? null);
+    });
+  }
+
+  /**
+   * Payout failed at Safaricom. Writes the compensating pair that returns the
+   * reserved funds to the tenant's spendable balance — without this the money stays
+   * stranded in payout_reserved forever and the tenant is permanently poorer by a
+   * payout that never happened.
+   *
+   * NOTE this must NOT be called from the queue-timeout callback. A timeout means
+   * Safaricom could not process the request in time, not that the money stayed put;
+   * the result callback may still arrive afterwards. Releasing the reservation on a
+   * timeout and then having the payout succeed lets the same shillings be spent
+   * twice. See the b2c-timeout handler for what happens there instead.
+   */
+  async transitionPayoutToFailed(transactionId: string, data: { failureReason: string }) {
+    await this.prisma.$transaction(async (tx) => {
+      const transaction = await tx.transaction.findUniqueOrThrow({
+        where: { id: transactionId },
+        include: { tenant: { select: { webhookUrl: true } } },
+      });
+
+      this.assertOutbound(transaction, "transitionPayoutToFailed");
+      this.assertTransitionAllowed(transaction.status, "FAILED");
+
+      await tx.transaction.update({
+        where: { id: transactionId },
+        data: { status: "FAILED", failureReason: data.failureReason },
+      });
+
+      await tx.ledgerEntry.createMany({
+        data: this.ledger.releaseEntries({
+          tenantId: transaction.tenantId,
+          transactionId: transaction.id,
+          amountMinorUnits: transaction.amountMinorUnits,
+        }),
       });
 
       await this.enqueueWebhookDelivery(tx, transaction, "FAILED", null);
@@ -139,6 +264,8 @@ export class TransactionStateMachine {
       amountMinorUnits: number;
       metadata: unknown;
       mpesaReceiptNumber?: string | null;
+      channel?: TransactionChannel;
+      direction?: TransactionDirection;
       tenant?: { webhookUrl: string | null } | null;
     },
     status: "SETTLED" | "FAILED",
@@ -153,6 +280,11 @@ export class TransactionStateMachine {
         payload: {
           transactionId: transaction.id,
           status,
+          // Added when payouts landed. Without these a tenant's webhook endpoint
+          // sees "SETTLED, 500 shillings" and cannot tell money arriving from money
+          // leaving. Additive for existing consumers, which simply ignore them.
+          direction: transaction.direction ?? null,
+          channel: transaction.channel ?? null,
           mpesaReceiptNumber: mpesaReceiptNumber ?? transaction.mpesaReceiptNumber ?? null,
           amountMinorUnits: transaction.amountMinorUnits,
           metadata: transaction.metadata ?? null,
@@ -193,15 +325,15 @@ export class TransactionStateMachine {
           {
             tenantId: params.tenantId,
             transactionId: transaction.id,
-            account: "tenant_balance",
-            direction: "credit",
+            account: LedgerAccount.TENANT_BALANCE,
+            direction: LedgerDirection.CREDIT,
             amountMinorUnits: params.amountMinorUnits,
           },
           {
             tenantId: params.tenantId,
             transactionId: transaction.id,
-            account: "pending_settlement",
-            direction: "debit",
+            account: LedgerAccount.PENDING_SETTLEMENT,
+            direction: LedgerDirection.DEBIT,
             amountMinorUnits: params.amountMinorUnits,
           },
         ],
@@ -219,6 +351,42 @@ export class TransactionStateMachine {
 
       return transaction;
     });
+  }
+
+  /**
+   * The two direction guards below are asymmetric on purpose, and between them every
+   * dangerous crossing is covered:
+   *
+   *   - a payout pushed through the INBOUND methods  → caught by assertNotOutbound
+   *   - a collection pushed through the PAYOUT methods → caught by assertOutbound
+   *
+   * assertNotOutbound rejects only an explicit OUTBOUND rather than demanding an
+   * explicit INBOUND, so it can't misfire on a caller that didn't select the column.
+   * Nothing is lost by that leniency: real rows always carry a direction (NOT NULL
+   * DEFAULT 'INBOUND'), and the one crossing it would otherwise catch is already
+   * caught by its counterpart.
+   *
+   * Both throw rather than trusting WebhookPollerService to route every callback to
+   * the right method, because the failure mode here isn't a wrong HTTP response —
+   * it's ledger entries written in the wrong direction, which nothing downstream
+   * would flag.
+   */
+  private assertNotOutbound(transaction: { id: string; direction?: TransactionDirection }, method: string) {
+    if (transaction.direction === "OUTBOUND") {
+      throw new Error(
+        `${method} called for OUTBOUND transaction ${transaction.id} — ` +
+          `a payout must not be settled through the collection path`,
+      );
+    }
+  }
+
+  private assertOutbound(transaction: { id: string; direction?: TransactionDirection }, method: string) {
+    if (transaction.direction !== "OUTBOUND") {
+      throw new Error(
+        `${method} called for ${transaction.direction ?? "unknown-direction"} transaction ${transaction.id} — ` +
+          `payout transitions must not be applied to a collection`,
+      );
+    }
   }
 
   private assertTransitionAllowed(from: TransactionStatus, to: TransactionStatus) {

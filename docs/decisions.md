@@ -321,3 +321,145 @@ provisioning failure (email or key creation) is caught and logged, never
 allowed to fail the status-change request itself — same "a side effect's
 failure isn't the main action's failure" reasoning already used by
 `AlertsService`.
+
+## 15. Payout authorization: computed balance behind a tenant-row lock, not a stored balance or an unlocked read
+
+**Problem**: Entry 11 established that a tenant's balance is a *computed*
+value summed from `LedgerEntry`, never a mutable counter. Nothing ever
+computed it — `TransactionStateMachine` wrote balanced credit/debit pairs
+and no code path read them back, which stayed harmless only because every
+write so far *credits* the balance. Outbound payments (Daraja B2C) end
+that: a payout must be refused when it exceeds available funds, and "read
+the balance, then spend against it" is a race by default. Two concurrent
+payout requests reading the same KES 1,000 balance will both authorize
+KES 600 and both send. The window is milliseconds; the loss is real money.
+
+**Rejected**: (a) A materialized `balanceMinorUnits` column on `Tenant`,
+updated on every settlement — reintroduces precisely the mutable counter
+entry 11 rejected, now with a correctness stake (authorizing a spend)
+rather than only a reporting one. (b) Reading the balance without a lock,
+inside the transaction or outside it — the check reads as correct in
+review and prevents nothing, since both racers still see the pre-spend
+balance. (c) `isolationLevel: "Serializable"` on the reservation
+transaction — genuinely correct, but it makes serialization failures
+(Postgres `40001`) a normal outcome the caller must retry, and no retry
+discipline exists anywhere else in this codebase; one call site isn't
+reason enough to introduce one. (d) Locking the `ledger_entries` rows
+themselves — the balance is an aggregate, and the rows a concurrent
+payout is about to insert cannot be locked before they exist, which is
+exactly what's being raced on.
+
+**Chosen**: `LedgerService.assertSufficientBalance` takes a row-level lock
+on the *tenant* row (`SELECT id FROM tenants WHERE id = $1 FOR UPDATE`)
+and only then sums the ledger. The tenant row is the common object two
+concurrent payouts can queue on — a stand-in for an aggregate that has no
+single row of its own to lock. Reservations debit `tenant_balance`
+directly rather than only writing to `payout_reserved`, so in-flight
+payouts are already subtracted from every subsequent read with no
+special-casing anywhere.
+
+The lock deliberately guards payout-against-payout only. Collections are
+not serialized against it: `transitionToSettled` and
+`recordInboundSettlement` only ever *credit* `tenant_balance`, so a
+collection landing mid-payout can only make the balance larger, leaving
+the check reading a stale, lower figure — the safe direction to be wrong
+in. That reasoning holds only while nothing else debits the balance, and
+must be revisited if reversals are ever implemented (`SETTLED →
+REVERSED` is legal in `ALLOWED_TRANSITIONS`, but no code performs it
+today).
+
+`LedgerService` injects no Prisma client of its own; every method takes
+the caller's transaction client instead. A balance read on a different
+connection than the write it authorizes is only a number that *was* true
+a moment ago, so requiring the caller to hand over its own transaction is
+what makes check-then-spend atomic. `assertSufficientBalance` further
+refuses to run on a client exposing `$transaction`: a `FOR UPDATE` taken
+outside a transaction is released the instant its statement finishes,
+leaving a check that still looks correct while guaranteeing nothing.
+Prisma's interactive-transaction client omits `$transaction` where a
+plain `PrismaClient` exposes it; should a future Prisma version stop
+omitting it, this throws on a legitimate call — loud, rather than
+silently unguarding the spend path.
+
+## 16. Payouts extend `Transaction` rather than getting their own model
+
+**Problem**: B2C payouts are the mirror image of collections — different
+API, different callbacks, opposite ledger direction — and modelling them as
+a separate `Payout` table looks like the tidier choice.
+
+**Rejected**: A dedicated `Payout` model. `LedgerEntry.transactionId` is a
+*required* FK to `Transaction`, and so are `ReconciliationRecord.transactionId`
+(also `@unique`) and `TenantWebhookDelivery.transactionId`. A separate model
+could not have written a single ledger entry without either making that FK
+nullable or growing a parallel `payoutId` on all three — and the ledger is
+precisely what proves money moved. The tidier-looking option would have cost
+the one thing worth keeping.
+
+**Chosen**: One table, plus a `direction` column (`INBOUND`/`OUTBOUND`)
+defaulted to `INBOUND` so the migration is a pure column add with no
+backfill. Payouts inherit the ledger, reconciliation and outbound-webhook
+machinery unchanged. The costs are real and were paid explicitly rather than
+absorbed silently: `msisdn` stops meaning "payer" and becomes the
+counterparty; `GET /v1/transactions` gained a `direction` filter, because a
+list built for collections would otherwise start showing money going out;
+and `ReportingService` now groups by direction, because a run of failed
+payouts blended into one success rate would drag down the collection figure
+the dashboard shows.
+
+## 17. Tenant security credential stored as Safaricom already encrypted it
+
+**Problem**: B2C authenticates with an `InitiatorName` and a
+`SecurityCredential` — the initiator password RSA-encrypted against
+Safaricom's public certificate. Something has to perform that encryption.
+
+**Rejected**: Taking the raw initiator password from the tenant and doing
+the RSA step ourselves. That means handling the password in plaintext at
+some point in the request path, bundling and shipping Safaricom's
+certificate, tracking its rotation, and carrying separate sandbox and
+production certificates — all to arrive at exactly the string Safaricom's
+own Daraja portal already hands the tenant.
+
+**Chosen**: Tenants paste the portal's output. ScriptPay stores it
+AES-256-GCM-encrypted at rest (entry 8's mechanism, reused) and passes it
+through to Daraja verbatim, never seeing the underlying password and holding
+no certificate. `getMpesaCredentialsForPayout` is a separate method from
+`getMpesaCredentialsForPayment` for the same reason the credentials are
+separate columns: collections need the passkey and no initiator, payouts the
+exact reverse, so the payout path never decrypts a secret it has no use for.
+Its "payout credentials not configured" error is deliberately worded
+differently from the collection one — a tenant who has been collecting for
+months would be actively misled by being told their M-Pesa credentials
+aren't set up.
+
+## 18. A B2C queue timeout holds the reservation instead of failing the payout
+
+**Problem**: Safaricom posts to `QueueTimeOutURL` when it cannot process a
+payout request within its queue window. The obvious handling — mark the
+payout failed, return the reserved funds to the tenant's balance — is
+wrong.
+
+**Rejected**: Treating the timeout as a failure. A timeout says Safaricom
+could not process the request *in time*, not that the money stayed put; the
+result callback may still arrive minutes later reporting success. Releasing
+the reservation and then having the payout complete lets the same shillings
+go out twice. This is the single easiest place in the payout path to lose
+real money, and it is the opposite of how the callback's name reads.
+
+**Chosen**: The timeout handler performs no state transition and releases
+nothing. The payout stays `PROCESSING` with its funds reserved, an audit
+entry is written and a `critical` alert goes to a human. The cost is a
+payout that can sit `PROCESSING` indefinitely if no result ever arrives, and
+that case belongs to drift detection rather than to a guess made here.
+
+Drift detection for payouts currently escalates rather than self-heals, and
+that is a deliberate stopping point, not an oversight. The collection path
+can resolve itself because Daraja's STK Push Query API answers
+*synchronously*. The Transaction Status API — the payout equivalent — does
+not: it accepts the query and posts the answer to a `ResultURL` later, so
+auto-recovery needs its own callback route, ingest source, and a stored
+correlation between the status query and the payout it asks about. Inventing
+Safaricom's correlation semantics on a money-recovery path is exactly the
+kind of guess this repo has already paid for once, so
+`DriftDetectorService.detectStuckPayouts` alerts a human exactly once per
+stuck payout instead. That is strictly better than the behaviour it replaced,
+which was to skip payouts silently and forever.

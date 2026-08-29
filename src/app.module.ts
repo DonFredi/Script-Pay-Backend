@@ -9,6 +9,7 @@ import { AuditLogModule } from "./modules/audit-log/audit-log.module";
 import { AuthModule } from "./modules/auth/auth.module";
 import { TenantsModule } from "./modules/tenants/tenants.module";
 import { ApiKeysModule } from "./modules/api-keys/api-keys.module";
+import { LedgerModule } from "./modules/ledger/ledger.module";
 import { PaymentsModule } from "./modules/payments/payments.module";
 import { CallbacksModule } from "./modules/callbacks/callbacks.module";
 import { ReconciliationModule } from "./modules/reconciliation/reconciliation.module";
@@ -34,6 +35,7 @@ import { ResponseTransformInterceptor } from "./common/interceptors/response-tra
     AuthModule,
     TenantsModule,
     ApiKeysModule,
+    LedgerModule,
     PaymentsModule,
     CallbacksModule,
     ReconciliationModule,
