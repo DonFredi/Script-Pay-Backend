@@ -268,6 +268,14 @@ have made a run of failed payouts drag down the collection success rate — one
 number describing two unrelated things, and therefore neither.
 `payouts.successRate` is `null`, not `0`, when the tenant has made no payouts.
 
+## Ledger — `/v1/ledger/balance`
+
+Guard chain: `AccessTokenGuard, RolesGuard, TenantAwareThrottlerGuard`, `ReadThrottle`.
+
+| Method | Path | Query | Notes |
+|---|---|---|---|
+| GET | `/v1/ledger/balance` | `tenantId?` (required if `SUPER_ADMIN`) | Returns `{ tenantId, availableMinorUnits }` — `LedgerService.availableBalance`, the same computed figure `assertSufficientBalance` checks before a payout, read outside the spend path for display only. Already reflects in-flight payouts (a reservation debits `tenant_balance` directly), so this is what a merchant should see before attempting a B2C payout that might otherwise come back with a 422. |
+
 ## Audit logs — `/v1/audit-logs`
 
 Guard chain: `AccessTokenGuard, RolesGuard`, `@Roles("SUPER_ADMIN", "TENANT_ADMIN")`,

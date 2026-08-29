@@ -37,7 +37,7 @@ src/
 │   │                         AccessTokenGuard, TokenService, RefreshTokenService, EmailService
 │   ├── tenants/               tenant CRUD/onboarding, encrypted Daraja credential storage
 │   ├── api-keys/              issue/list/revoke scoped, argon2-hashed API keys
-│   ├── ledger/                 LedgerService — tenant balance computed from LedgerEntry; guards the payout spend path
+│   ├── ledger/                 LedgerService — tenant balance computed from LedgerEntry; guards the payout spend path; GET /v1/ledger/balance for display
 │   ├── payments/               STK Push + B2C payouts (tenant + dashboard variants each), transaction reads, TransactionStateMachine
 │   ├── callbacks/               inbound Daraja webhook ingestion (WebhookIngestService) + Postgres-polling processor (WebhookPollerService)
 │   ├── reconciliation/          DriftDetectorService — active recovery for stuck collections, escalation for stuck payouts
@@ -67,6 +67,7 @@ There is no `apps/`, no `packages/`, no `k8s/`, no `docker-compose.yml`.
 | POST | `/v1/dashboard/payments/b2c` | AccessTokenGuard, CsrfGuard, RolesGuard | dashboard-initiated payout, `@Roles("TENANT_ADMIN")` only |
 | GET | `/v1/transactions`, `/v1/transactions/:id` | AccessTokenGuard | `?direction=` filters collections vs payouts; unfiltered returns both |
 | GET | `/v1/reporting/summary` | AccessTokenGuard | success rate, per-status counts, drift count — collections only at top level, payouts under `payouts` |
+| GET | `/v1/ledger/balance` | AccessTokenGuard | `{ tenantId, availableMinorUnits }` — same computed figure the B2C payout balance check uses, read outside the spend path for display |
 | GET | `/v1/audit-logs` | AccessTokenGuard, RolesGuard | |
 | POST | `/v1/webhooks/daraja/stk-callback`, `/v1/webhooks/daraja/c2b-confirmation` | Throttler only | inbound from Safaricom; always returns 200, `@SkipResponseTransform` |
 | POST | `/v1/webhooks/daraja/b2c-result`, `/v1/webhooks/daraja/b2c-timeout` | Throttler only | payout outcome / queue timeout. The timeout is NOT a failure — it releases nothing (decisions.md entry 18) |
