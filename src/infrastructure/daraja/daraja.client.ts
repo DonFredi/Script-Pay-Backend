@@ -28,7 +28,11 @@ export interface TenantPayoutCredentials {
 }
 
 /** Only the fields OAuth actually needs — shared by the collection and payout paths. */
-type OAuthCredentials = Pick<TenantMpesaCredentials, "mpesaConsumerKey" | "mpesaConsumerSecretEncrypted">;
+export type DarajaAuthCredentials = Pick<TenantMpesaCredentials, "mpesaConsumerKey" | "mpesaConsumerSecretEncrypted">;
+
+export interface C2bUrlRegistrationCredentials extends DarajaAuthCredentials {
+  shortcode: string;
+}
 
 /**
  * BusinessPayment is an ordinary merchant-to-customer disbursement (a refund, a
@@ -89,7 +93,7 @@ export class DarajaClient {
     return process.env.MPESA_ENV === "production" ? "https://api.safaricom.co.ke" : "https://sandbox.safaricom.co.ke";
   }
 
-  private async getAccessToken(creds: OAuthCredentials): Promise<string> {
+  private async getAccessToken(creds: DarajaAuthCredentials): Promise<string> {
     const now = Date.now();
     const cached = this.tokenCache.get(creds.mpesaConsumerKey);
     if (cached && cached.expiresAt > now) return cached.token;
@@ -227,6 +231,56 @@ export class DarajaClient {
       OriginatorConversationID: body.OriginatorConversationID,
       ResponseCode: body.ResponseCode,
     };
+  }
+
+  /**
+   * Confirms a tenant's consumer key/secret actually authenticate with Daraja,
+   * without initiating any payment. Called right after a tenant submits credentials
+   * so a typo surfaces immediately — as a rejected request — instead of silently
+   * saving and only failing at the tenant's first real STK push. Reuses
+   * getAccessToken's cache, so a push initiated shortly after doesn't pay for a
+   * second OAuth round-trip.
+   */
+  async verifyCredentials(creds: DarajaAuthCredentials): Promise<void> {
+    await this.getAccessToken(creds);
+  }
+
+  /**
+   * One-time-per-shortcode call telling Safaricom where to deliver C2B callbacks for
+   * payments that land on this shortcode WITHOUT going through STK Push (a customer
+   * typing the Paybill number in directly, or paying a Till). Without this,
+   * WebhookPollerService.processC2bConfirmation never receives anything to
+   * process — Safaricom has no way to know this backend exists until told.
+   *
+   * ValidationURL is pointed at the same handler as ConfirmationURL: this backend
+   * has no separate validation logic, and ResponseType "Completed" tells Safaricom
+   * to auto-accept if Validation isn't enabled on this shortcode (the default) or if
+   * ValidationURL can't be reached — so nothing here relies on that endpoint
+   * distinguishing the two calls.
+   */
+  async registerC2bUrl(creds: C2bUrlRegistrationCredentials): Promise<void> {
+    const accessToken = await this.getAccessToken(creds);
+    const callbackBaseUrl = process.env.MPESA_CALLBACK_BASE_URL;
+    const confirmationUrl = `${callbackBaseUrl}/v1/webhooks/daraja/c2b-confirmation`;
+
+    const response = await fetch(`${this.baseUrl}/mpesa/c2b/v2/registerurl`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ShortCode: creds.shortcode,
+        ResponseType: "Completed",
+        ConfirmationURL: confirmationUrl,
+        ValidationURL: confirmationUrl,
+      }),
+    });
+
+    const body = await response.json();
+    if (!response.ok || body.ResponseCode !== "0") {
+      this.logger.error(`Daraja C2B URL registration rejected: ${JSON.stringify(body)}`);
+      throw new BadGatewayException(
+        body.errorMessage ?? body.ResponseDescription ?? "Daraja rejected C2B URL registration",
+      );
+    }
   }
 
   async queryStkPushStatus(

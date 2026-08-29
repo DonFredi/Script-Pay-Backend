@@ -10,6 +10,7 @@ import type { CreateTenantDto, UpdateTenantStatusDto } from "./tenant.dto";
 import type { MpesaCredentialsDto } from "./tenants.schema";
 import type { TenantMpesaCredentials, TenantPayoutCredentials } from "../../infrastructure/daraja/daraja.client";
 import { CredentialsEncryptionService } from "./credentials-encryption.service";
+import { DarajaClient } from "../../infrastructure/daraja/daraja.client";
 
 @Injectable()
 export class TenantsService {
@@ -21,6 +22,7 @@ export class TenantsService {
     private readonly encryption: CredentialsEncryptionService,
     private readonly apiKeysService: ApiKeysService,
     private readonly emailService: EmailService,
+    private readonly daraja: DarajaClient,
   ) {}
 
   /** SUPER_ADMIN only — enforced at the controller via @Roles(), not re-checked here on purpose:
@@ -44,6 +46,16 @@ export class TenantsService {
     if (actor.tenantId !== tenantId && actor.role !== "SUPER_ADMIN") {
       throw new ForbiddenException("Cannot configure another tenant's credentials");
     }
+
+    // Fail fast: confirm this consumer key/secret actually authenticate with Daraja
+    // BEFORE persisting anything. Without this, a typo'd secret saves silently and
+    // the tenant only discovers it at their first real STK push — a much worse place
+    // to find out. Throws BadGatewayException on rejection, which the controller lets
+    // through as-is (same pattern as the payment paths).
+    await this.daraja.verifyCredentials({
+      mpesaConsumerKey: dto.consumerKey,
+      mpesaConsumerSecretEncrypted: dto.consumerSecret,
+    });
 
     await this.rejectingShortcodeConflict(
       this.prisma.tenant.update({
@@ -69,17 +81,40 @@ export class TenantsService {
       }),
     );
 
+    // Best-effort: tells Safaricom where to deliver C2B confirmations for direct
+    // till/paybill payments (ones that skip STK Push). Credentials are already
+    // verified and saved above, so a failure here must not undo that or fail the
+    // whole request — it only means manual payments on this shortcode stay
+    // untracked until this is retried (e.g. by re-submitting the same credentials).
+    let c2bUrlRegistered = true;
+    try {
+      await this.daraja.registerC2bUrl({
+        mpesaConsumerKey: dto.consumerKey,
+        mpesaConsumerSecretEncrypted: dto.consumerSecret,
+        shortcode: dto.businessShortcode,
+      });
+    } catch (error) {
+      c2bUrlRegistered = false;
+      this.logger.warn(`C2B URL registration failed for tenant ${tenantId}: ${String(error)}`);
+      await this.auditLog.record({
+        tenantId,
+        actorType: "system",
+        action: "daraja.c2b_url_registration_failed",
+        metadata: { error: String(error) },
+      });
+    }
+
     await this.auditLog.record({
       tenantId,
       actorType: "user",
       actorId: actor.id,
       action: "tenant.mpesa_credentials_configured",
       // Records WHETHER payout access was configured, never the credential itself.
-      metadata: { payoutCredentialsConfigured: Boolean(dto.initiatorName && dto.securityCredential) },
+      metadata: { payoutCredentialsConfigured: Boolean(dto.initiatorName && dto.securityCredential), c2bUrlRegistered },
     });
 
     // Never echo the secret/passkey back, even to the tenant that just set it.
-    return { configured: true };
+    return { configured: true, c2bUrlRegistered };
   }
 
   /**

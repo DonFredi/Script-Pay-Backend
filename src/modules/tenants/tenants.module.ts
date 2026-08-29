@@ -5,10 +5,12 @@ import { TenantsService } from "./tenants.service";
 import { AuthModule } from "../auth/auth.module";
 import { ApiKeysModule } from "../api-keys/api-keys.module";
 import { CredentialsEncryptionService } from "./credentials-encryption.service";
+import { DarajaModule } from "../../infrastructure/daraja/daraja.module";
 @Module({
   // ApiKeysModule for auto-provisioning a tenant's first key on activation —
-  // ApiKeysModule only depends on AuthModule itself, so no import cycle.
-  imports: [AuthModule, ApiKeysModule],
+  // ApiKeysModule only depends on AuthModule itself, so no import cycle. DarajaModule
+  // for verifying credentials and auto-registering the C2B URL on submission.
+  imports: [AuthModule, ApiKeysModule, DarajaModule],
   controllers: [TenantsController, TenantWebhookConfigController],
   providers: [TenantsService, CredentialsEncryptionService],
   // CredentialsEncryptionService is also exported for TenantWebhookPollerService
