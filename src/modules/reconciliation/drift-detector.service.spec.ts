@@ -175,7 +175,7 @@ describe("DriftDetectorService", () => {
 
     it("escalates a stuck payout with a critical alert and an audit entry", async () => {
       jest.spyOn(prisma.transaction, "findMany").mockResolvedValueOnce([stuckPayout] as any);
-      jest.spyOn(prisma.reconciliationRecord, "findUnique").mockResolvedValueOnce(null as any);
+      jest.spyOn(prisma.reconciliationRecord, "findUnique").mockResolvedValueOnce(null);
 
       await service.detectStuckPayouts();
 
@@ -206,7 +206,7 @@ describe("DriftDetectorService", () => {
     // asynchronously, so auto-recovery needs its own callback route and correlation.
     it("never transitions the payout — escalation only", async () => {
       jest.spyOn(prisma.transaction, "findMany").mockResolvedValueOnce([stuckPayout] as any);
-      jest.spyOn(prisma.reconciliationRecord, "findUnique").mockResolvedValueOnce(null as any);
+      jest.spyOn(prisma.reconciliationRecord, "findUnique").mockResolvedValueOnce(null);
 
       await service.detectStuckPayouts();
 
@@ -221,7 +221,7 @@ describe("DriftDetectorService", () => {
       jest
         .spyOn(prisma.reconciliationRecord, "findUnique")
         .mockRejectedValueOnce(new Error("db blip"))
-        .mockResolvedValueOnce(null as any);
+        .mockResolvedValueOnce(null);
 
       await service.detectStuckPayouts();
 

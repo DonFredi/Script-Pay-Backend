@@ -23,14 +23,14 @@ describe("LedgerService", () => {
     // transaction client looks like, and what assertInsideTransaction checks for.
     tx = {
       ledgerEntry: {
-        groupBy: jest.fn(async () => {
+        groupBy: jest.fn(() => {
           callOrder.push("balance");
-          return [];
+          return Promise.resolve([]);
         }),
       },
-      $queryRaw: jest.fn(async () => {
+      $queryRaw: jest.fn(() => {
         callOrder.push("lock");
-        return [{ id: TENANT_ID }];
+        return Promise.resolve([{ id: TENANT_ID }]);
       }),
     };
 
@@ -134,9 +134,9 @@ describe("LedgerService", () => {
     // The ordering IS the safety property: reading the balance before taking the
     // lock leaves the exact race this method exists to close.
     it("takes the row lock before reading the balance", async () => {
-      tx.ledgerEntry.groupBy.mockImplementation(async () => {
+      tx.ledgerEntry.groupBy.mockImplementation(() => {
         callOrder.push("balance");
-        return [group("credit", 1_000_00)];
+        return Promise.resolve([group("credit", 1_000_00)]);
       });
 
       await service.assertSufficientBalance(tx, TENANT_ID, 100_00);

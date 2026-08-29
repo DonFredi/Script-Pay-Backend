@@ -225,7 +225,7 @@ describe("WebhookPollerService — B2C payout callbacks", () => {
 
     it("records an unmatched callback without transitioning anything", async () => {
       jest.spyOn(prisma.webhookEvent, "findMany").mockResolvedValueOnce([b2cEvent("daraja_b2c_result")] as any);
-      jest.spyOn(prisma.transaction, "findUnique").mockResolvedValueOnce(null as any);
+      jest.spyOn(prisma.transaction, "findUnique").mockResolvedValueOnce(null);
 
       await service.pollUnprocessedEvents();
 

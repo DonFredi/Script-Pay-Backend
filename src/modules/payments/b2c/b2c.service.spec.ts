@@ -36,25 +36,25 @@ describe("B2cService", () => {
 
     prisma = {
       transaction: {
-        create: jest.fn(async () => {
+        create: jest.fn(() => {
           callOrder.push("create-transaction");
-          return { id: "payout-1", amountMinorUnits: dto.amountMinorUnits };
+          return Promise.resolve({ id: "payout-1", amountMinorUnits: dto.amountMinorUnits });
         }),
-        update: jest.fn(async () => ({ id: "payout-1", amountMinorUnits: dto.amountMinorUnits })),
+        update: jest.fn(() => Promise.resolve({ id: "payout-1", amountMinorUnits: dto.amountMinorUnits })),
       },
       ledgerEntry: {
-        createMany: jest.fn(async () => {
+        createMany: jest.fn(() => {
           callOrder.push("ledger-write");
-          return { count: 2 };
+          return Promise.resolve({ count: 2 });
         }),
         // 1,000 collected, nothing spent.
-        groupBy: jest.fn(async () => [{ direction: "credit", _sum: { amountMinorUnits: 1_000_00 } }]),
+        groupBy: jest.fn(() => Promise.resolve([{ direction: "credit", _sum: { amountMinorUnits: 1_000_00 } }])),
       },
       // No $transaction key: this stands in for an interactive transaction client,
       // which is what LedgerService.assertSufficientBalance insists on.
-      $queryRaw: jest.fn(async () => {
+      $queryRaw: jest.fn(() => {
         callOrder.push("lock");
-        return [{ id: TENANT_ID }];
+        return Promise.resolve([{ id: TENANT_ID }]);
       }),
     };
     prisma.withTenantContext = jest.fn((_tenantId: string, fn: (tx: unknown) => unknown) => fn(prisma));
@@ -69,9 +69,9 @@ describe("B2cService", () => {
         {
           provide: DarajaClient,
           useValue: {
-            initiateB2C: jest.fn(async () => {
+            initiateB2C: jest.fn(() => {
               callOrder.push("daraja");
-              return { ConversationID: "AG_1", OriginatorConversationID: "oc-1", ResponseCode: "0" };
+              return Promise.resolve({ ConversationID: "AG_1", OriginatorConversationID: "oc-1", ResponseCode: "0" });
             }),
           },
         },
@@ -80,13 +80,15 @@ describe("B2cService", () => {
         {
           provide: TenantsService,
           useValue: {
-            getMpesaCredentialsForPayout: jest.fn(async () => ({
-              mpesaConsumerKey: "ck",
-              mpesaConsumerSecretEncrypted: "cs",
-              shortcode: "600000",
-              initiatorName: "testapi",
-              securityCredential: "rsa-blob",
-            })),
+            getMpesaCredentialsForPayout: jest.fn(() =>
+              Promise.resolve({
+                mpesaConsumerKey: "ck",
+                mpesaConsumerSecretEncrypted: "cs",
+                shortcode: "600000",
+                initiatorName: "testapi",
+                securityCredential: "rsa-blob",
+              }),
+            ),
           },
         },
       ],

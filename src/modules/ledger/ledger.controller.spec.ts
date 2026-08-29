@@ -15,7 +15,7 @@ describe("LedgerController", () => {
   const superAdmin = { id: "user-2", tenantId: null, role: "SUPER_ADMIN" } as any;
 
   beforeEach(() => {
-    prisma = { withTenantContext: jest.fn((_tenantId: string, fn: any) => fn({} as any)) } as any;
+    prisma = { withTenantContext: jest.fn((_tenantId: string, fn: (tx: unknown) => unknown) => fn({})) } as any;
     ledger = { availableBalance: jest.fn() } as any;
     controller = new LedgerController(prisma, ledger);
   });
