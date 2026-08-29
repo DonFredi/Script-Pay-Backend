@@ -6,8 +6,9 @@ Guidance for Claude Code (or any AI assistant) working in this repository.
 
 A NestJS + Prisma + PostgreSQL backend for **ScriptPay**, a multi-tenant M-Pesa
 (Safaricom Daraja) payment platform for the Kenyan market. Tenants (merchants)
-integrate against this API to initiate STK Push payments, receive Daraja
-callbacks, and reconcile/report on transactions.
+integrate against this API to initiate STK Push payments, send B2C payouts,
+receive Daraja callbacks, and reconcile/report on transactions. Money moves in
+**both** directions as of 2026-08-29 — this was collect-only before that.
 
 This repo is standalone — not a monorepo. Its counterpart is a sibling
 repository, `Script Pay Frontend` (Next.js 16, App Router), which is the only
@@ -36,9 +37,10 @@ src/
 │   │                         AccessTokenGuard, TokenService, RefreshTokenService, EmailService
 │   ├── tenants/               tenant CRUD/onboarding, encrypted Daraja credential storage
 │   ├── api-keys/              issue/list/revoke scoped, argon2-hashed API keys
-│   ├── payments/               STK Push (tenant + dashboard variants), transaction reads, TransactionStateMachine
+│   ├── ledger/                 LedgerService — tenant balance computed from LedgerEntry; guards the payout spend path
+│   ├── payments/               STK Push + B2C payouts (tenant + dashboard variants each), transaction reads, TransactionStateMachine
 │   ├── callbacks/               inbound Daraja webhook ingestion (WebhookIngestService) + Postgres-polling processor (WebhookPollerService)
-│   ├── reconciliation/          DriftDetectorService — active recovery for stuck transactions
+│   ├── reconciliation/          DriftDetectorService — active recovery for stuck collections, escalation for stuck payouts
 │   ├── reporting/                GET /v1/reporting/summary
 │   ├── audit-log/                 AuditLogService — every sensitive action + Daraja interaction
 │   └── alerts/                     Slack webhook alerts on failures
@@ -61,10 +63,13 @@ There is no `apps/`, no `packages/`, no `k8s/`, no `docker-compose.yml`.
 | POST/GET/DELETE | `/v1/api-keys*` | AccessTokenGuard, CsrfGuard, RolesGuard | |
 | POST | `/v1/payments/stk-push` | ApiKeyGuard, TenantAwareThrottlerGuard | tenant-to-platform, scope `PAYMENTS_INITIATE` |
 | POST | `/v1/dashboard/payments/stk-push` | AccessTokenGuard | dashboard-initiated STK push |
-| GET | `/v1/transactions`, `/v1/transactions/:id` | AccessTokenGuard | |
-| GET | `/v1/reporting/summary` | AccessTokenGuard | success rate, per-status counts, drift count |
+| POST | `/v1/payments/b2c` | ApiKeyGuard, TenantAwareThrottlerGuard | tenant-to-platform payout, scope `PAYMENTS_DISBURSE` (NOT `PAYMENTS_INITIATE`) |
+| POST | `/v1/dashboard/payments/b2c` | AccessTokenGuard, CsrfGuard, RolesGuard | dashboard-initiated payout, `@Roles("TENANT_ADMIN")` only |
+| GET | `/v1/transactions`, `/v1/transactions/:id` | AccessTokenGuard | `?direction=` filters collections vs payouts; unfiltered returns both |
+| GET | `/v1/reporting/summary` | AccessTokenGuard | success rate, per-status counts, drift count — collections only at top level, payouts under `payouts` |
 | GET | `/v1/audit-logs` | AccessTokenGuard, RolesGuard | |
 | POST | `/v1/webhooks/daraja/stk-callback`, `/v1/webhooks/daraja/c2b-confirmation` | Throttler only | inbound from Safaricom; always returns 200, `@SkipResponseTransform` |
+| POST | `/v1/webhooks/daraja/b2c-result`, `/v1/webhooks/daraja/b2c-timeout` | Throttler only | payout outcome / queue timeout. The timeout is NOT a failure — it releases nothing (decisions.md entry 18) |
 
 Controllers are the source of truth for exact guard order and scopes — verify against the file before repeating a route/guard claim.
 
@@ -81,6 +86,8 @@ Controllers are the source of truth for exact guard order and scopes — verify 
 ## Data model highlights (`prisma/schema.prisma` is the source of truth)
 
 - Money is **integer minor units** (`amountMinorUnits`), never float/Decimal-as-JS-number.
+- `Transaction.direction` (`INBOUND`/`OUTBOUND`) is what separates a collection from a payout — they share one table, because `LedgerEntry`, `ReconciliationRecord` and `TenantWebhookDelivery` all hold required FKs to `Transaction`. Any query meaning "money in" must filter on it; `msisdn` is the payer on `INBOUND` and the payee on `OUTBOUND`.
+- Tenant balance is **computed** by summing `LedgerEntry` (`LedgerService`), never stored. A payout's balance check runs behind a `FOR UPDATE` lock on the tenant row, inside the same transaction as the debit it authorizes — see `docs/decisions.md` entry 15 before touching that path.
 - `WebhookEvent` is the idempotency guard — every inbound Daraja callback is inserted (unique on `(source, naturalKey)`) *before* processing; a Safaricom retry fails the insert, not the business logic.
 - `RefreshToken` stores only a SHA-256 hash, tracks a rotation chain (`replacedByTokenId`) — a revoked token presented again is a theft signal.
 - `AuditLog` is append-only by convention — never updated/deleted by application code.
