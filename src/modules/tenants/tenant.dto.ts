@@ -15,13 +15,16 @@ export type InviteTenantUserDto = z.infer<typeof inviteTenantUserSchema>;
 
 
 /**
- * "pending_kyc" is deliberately not settable via this DTO's own validation — it's
- * accepted here because SUPER_ADMIN legitimately needs it (e.g. reverting a tenant
- * back into review), but TenantsService.updateStatus enforces that a TENANT_ADMIN
- * may only ever move their own tenant between "active" and "suspended". Same
- * "authorization lives in the service, not just the DTO" pattern as findOne().
+ * "pending_kyc" and "removed" are deliberately not settable via this DTO's own
+ * validation — both are accepted here because SUPER_ADMIN legitimately needs them
+ * (reverting a tenant back into review, or removing/reinstating one), but
+ * TenantsService.updateStatus enforces that a TENANT_ADMIN may only ever move their
+ * own tenant between "active" and "suspended". "removed" is a platform-only kill
+ * switch — a TENANT_ADMIN can neither set their own tenant to "removed" nor bring
+ * it back out of that state; only SUPER_ADMIN can do either. Same "authorization
+ * lives in the service, not just the DTO" pattern as findOne().
  */
 export const updateTenantStatusSchema = z.object({
-  status: z.enum(["active", "suspended", "pending_kyc"]),
+  status: z.enum(["active", "suspended", "pending_kyc", "removed"]),
 });
 export type UpdateTenantStatusDto = z.infer<typeof updateTenantStatusSchema>;

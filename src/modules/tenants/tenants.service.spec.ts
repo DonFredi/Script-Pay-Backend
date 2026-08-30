@@ -237,6 +237,19 @@ describe("TenantsService", () => {
       expect(encryption.decrypt).not.toHaveBeenCalled();
     });
 
+    it("refuses to hand out credentials for a removed tenant, same as a suspended one", async () => {
+      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({
+        status: "removed",
+        businessShortcode: "174379",
+        mpesaConsumerKey: "ck",
+        mpesaConsumerSecretEncrypted: "enc-cs",
+        mpesaPasskeyEncrypted: "enc-pk",
+      } as any);
+
+      await expect(service.getMpesaCredentialsForPayment("tenant-1")).rejects.toThrow(ForbiddenException);
+      expect(encryption.decrypt).not.toHaveBeenCalled();
+    });
+
     it("still allows a pending_kyc tenant to transact, so they can test against the sandbox", async () => {
       jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({
         status: "pending_kyc",
@@ -370,6 +383,48 @@ describe("TenantsService", () => {
       await expect(
         service.updateStatus("tenant-1", { status: "active" }, user({ role: "SUPER_ADMIN", tenantId: null })),
       ).rejects.toThrow(ConflictException);
+    });
+
+    it("lets SUPER_ADMIN remove a tenant", async () => {
+      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({ id: "tenant-1", status: "removed" } as any);
+
+      const result = await service.updateStatus(
+        "tenant-1",
+        { status: "removed" },
+        user({ role: "SUPER_ADMIN", tenantId: null }),
+      );
+
+      expect(result.status).toBe("removed");
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: "tenant.status_changed", metadata: { newStatus: "removed" } }),
+      );
+    });
+
+    it("forbids a TENANT_ADMIN from removing their own tenant", async () => {
+      await expect(
+        service.updateStatus("tenant-1", { status: "removed" }, user({ tenantId: "tenant-1" })),
+      ).rejects.toThrow("Only platform staff can remove or reinstate a tenant");
+    });
+
+    it("forbids a TENANT_ADMIN from reinstating their own tenant once removed", async () => {
+      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({ status: "removed" } as any);
+
+      await expect(
+        service.updateStatus("tenant-1", { status: "active" }, user({ tenantId: "tenant-1" })),
+      ).rejects.toThrow("Only platform staff can remove or reinstate a tenant");
+    });
+
+    it("lets SUPER_ADMIN reinstate a removed tenant back to active", async () => {
+      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({ status: "removed" } as any);
+      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({ id: "tenant-1", status: "active" } as any);
+
+      const result = await service.updateStatus(
+        "tenant-1",
+        { status: "active" },
+        user({ role: "SUPER_ADMIN", tenantId: null }),
+      );
+
+      expect(result.status).toBe("active");
     });
   });
 

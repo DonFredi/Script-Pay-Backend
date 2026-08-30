@@ -463,3 +463,37 @@ kind of guess this repo has already paid for once, so
 `DriftDetectorService.detectStuckPayouts` alerts a human exactly once per
 stuck payout instead. That is strictly better than the behaviour it replaced,
 which was to skip payouts silently and forever.
+
+## 19. Tenant removal is a status flag, not a hard delete
+
+**Problem**: There was no admin-facing way to remove a tenant at all —
+`PATCH /v1/tenants/:id/status` only accepted `active | suspended | pending_kyc`,
+and `suspended` is already self-service (a `TENANT_ADMIN` can toggle their own
+tenant into and out of it). A platform-initiated, harder-to-undo "remove this
+tenant" action needed a real path.
+
+**Rejected**: A hard `DELETE`. `Tenant` carries required FKs from
+`Transaction`, `LedgerEntry`, `ReconciliationRecord`, and
+`TenantWebhookDelivery` — cascading a delete through those would destroy
+financial and reconciliation history for a business that, by definition, has
+already moved real money. `AuditLog` is append-only by convention precisely
+because this platform treats its own history as something it cannot casually
+erase; a cascading tenant delete would contradict that on the very table
+(`Tenant`) everything else keys off. It would also collide with the Postgres
+RLS policies in `prisma/manual-sql/001_row_level_security.sql`, which assume
+tenant-scoped rows persist rather than disappear out from under a policy
+mid-query.
+
+**Chosen**: A fourth `status` value, `"removed"`, reusing the exact
+enforcement points `"suspended"` already has —
+`getMpesaCredentialsForPayment`/`Payout` block money movement in both
+directions for either status, and the inbound C2B path already scopes its
+shortcode lookup to `status: "active"`, so a removed tenant is excluded there
+for free. Unlike `suspended`, `"removed"` is platform-only in **both**
+directions: `TenantsService.updateStatus` forbids a `TENANT_ADMIN` from
+setting their own tenant to `removed` and from reinstating one already
+`removed` — only `SUPER_ADMIN` can do either. `status` is a plain Postgres
+`String` column rather than a DB enum, so adding this required no migration.
+Removed tenants stay visible via `GET /v1/tenants`/`GET /v1/tenants/:id`
+rather than being hidden, preserving audit visibility and avoiding an admin
+unknowingly re-onboarding a duplicate shortcode.

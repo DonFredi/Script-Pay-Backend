@@ -159,9 +159,10 @@ export class TenantsService {
     // customers. The inbound side already refuses to route money to a non-active
     // tenant (WebhookPollerService.processC2bConfirmation scopes its shortcode
     // lookup to status: "active"), so this closes the matching hole on the way out.
-    // pending_kyc is deliberately still allowed — that's the state a tenant tests
-    // from against Safaricom's sandbox before approval.
-    if (tenant.status === "suspended") {
+    // "removed" gets the same treatment as "suspended" — both are a full kill
+    // switch on money movement. pending_kyc is deliberately still allowed — that's
+    // the state a tenant tests from against Safaricom's sandbox before approval.
+    if (tenant.status === "suspended" || tenant.status === "removed") {
       throw new ForbiddenException("This tenant is suspended and cannot initiate payments");
     }
 
@@ -189,10 +190,11 @@ export class TenantsService {
   async getMpesaCredentialsForPayout(tenantId: string): Promise<TenantPayoutCredentials> {
     const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
 
-    // The same kill switch the collection path applies. A suspended tenant must not
-    // move money in EITHER direction, and outbound is the direction where it matters
-    // more — suspension often means exactly "we don't trust this account right now."
-    if (tenant.status === "suspended") {
+    // The same kill switch the collection path applies. A suspended (or removed)
+    // tenant must not move money in EITHER direction, and outbound is the direction
+    // where it matters more — suspension/removal often means exactly "we don't
+    // trust this account right now."
+    if (tenant.status === "suspended" || tenant.status === "removed") {
       throw new ForbiddenException("This tenant is suspended and cannot initiate payments");
     }
 
@@ -296,11 +298,18 @@ export class TenantsService {
 
   /**
    * SUPER_ADMIN may set any tenant to any status, including reverting one to
-   * "pending_kyc" for re-review. A TENANT_ADMIN may only toggle their OWN tenant
-   * between "active" and "suspended" — self-service deactivation, not a path to
-   * self-approve out of KYC review or touch another tenant's status.
+   * "pending_kyc" for re-review, or removing/reinstating a tenant via "removed".
+   * A TENANT_ADMIN may only toggle their OWN tenant between "active" and
+   * "suspended" — self-service deactivation, not a path to self-approve out of
+   * KYC review, remove/reinstate their own tenant, or touch another tenant's
+   * status. "removed" behaves like "suspended" everywhere money moves (see
+   * getMpesaCredentialsForPayment/Payout) but is platform-only in both
+   * directions — see docs/decisions.md entry 19 for why this is a status flag
+   * rather than a hard delete.
    */
   async updateStatus(tenantId: string, dto: UpdateTenantStatusDto, actor: AuthenticatedUser) {
+    const before = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId }, select: { status: true } });
+
     if (actor.role !== "SUPER_ADMIN") {
       if (actor.tenantId !== tenantId) {
         throw new ForbiddenException("Cannot change another tenant's status");
@@ -308,9 +317,12 @@ export class TenantsService {
       if (dto.status === "pending_kyc") {
         throw new ForbiddenException("Only platform staff can move a tenant into KYC review");
       }
+      // "removed" is a platform-only kill switch in both directions — a TENANT_ADMIN
+      // can neither remove their own tenant nor reinstate one already removed.
+      if (dto.status === "removed" || before.status === "removed") {
+        throw new ForbiddenException("Only platform staff can remove or reinstate a tenant");
+      }
     }
-
-    const before = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId }, select: { status: true } });
 
     const tenant = await this.rejectingShortcodeConflict(
       this.prisma.tenant.update({
