@@ -36,7 +36,12 @@ describe("DarajaClient", () => {
   const originalEnv = process.env;
 
   beforeEach(() => {
-    process.env = { ...originalEnv, MPESA_ENV: "sandbox", MPESA_CALLBACK_BASE_URL: "https://api.scriptpay.test" };
+    process.env = {
+      ...originalEnv,
+      MPESA_ENV: "sandbox",
+      MPESA_CALLBACK_BASE_URL: "https://api.scriptpay.test",
+      DARAJA_WEBHOOK_SECRET: "test-webhook-secret",
+    };
     fetchMock = jest.fn();
     global.fetch = fetchMock as any;
     client = new DarajaClient();
@@ -148,7 +153,9 @@ describe("DarajaClient", () => {
       });
 
       const body = JSON.parse(fetchMock.mock.calls[1][1].body);
-      expect(body.CallBackURL).toBe("https://api.scriptpay.test/v1/webhooks/daraja/stk-callback");
+      expect(body.CallBackURL).toBe(
+        "https://api.scriptpay.test/v1/webhooks/daraja/stk-callback?token=test-webhook-secret",
+      );
     });
   });
 
@@ -234,8 +241,10 @@ describe("DarajaClient", () => {
       await client.initiateB2C(payoutCreds, b2cParams);
 
       const body = JSON.parse(fetchMock.mock.calls[1][1].body);
-      expect(body.ResultURL).toBe("https://api.scriptpay.test/v1/webhooks/daraja/b2c-result");
-      expect(body.QueueTimeOutURL).toBe("https://api.scriptpay.test/v1/webhooks/daraja/b2c-timeout");
+      expect(body.ResultURL).toBe("https://api.scriptpay.test/v1/webhooks/daraja/b2c-result?token=test-webhook-secret");
+      expect(body.QueueTimeOutURL).toBe(
+        "https://api.scriptpay.test/v1/webhooks/daraja/b2c-timeout?token=test-webhook-secret",
+      );
     });
 
     it("uses the production host when MPESA_ENV=production", async () => {

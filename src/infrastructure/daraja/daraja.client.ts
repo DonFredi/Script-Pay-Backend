@@ -122,6 +122,18 @@ export class DarajaClient {
     return data.access_token;
   }
 
+  /**
+   * Builds a Daraja-facing callback URL with the shared webhook secret attached as
+   * `?token=` — checked by DarajaWebhookSecretGuard on receipt. Daraja doesn't sign
+   * its payloads, so this is what lets the webhook controller reject a forged
+   * callback from anyone who discovers the bare path.
+   */
+  private buildWebhookUrl(path: string): string {
+    const base = process.env.MPESA_CALLBACK_BASE_URL;
+    const token = encodeURIComponent(process.env.DARAJA_WEBHOOK_SECRET ?? "");
+    return `${base}/v1/webhooks/daraja/${path}?token=${token}`;
+  }
+
   private generatePassword(creds: TenantMpesaCredentials): { password: string; timestamp: string } {
     const timestamp = new Date()
       .toISOString()
@@ -134,7 +146,6 @@ export class DarajaClient {
   async initiateStkPush(creds: TenantMpesaCredentials, params: StkPushParams): Promise<StkPushResponse> {
     const accessToken = await this.getAccessToken(creds);
     const { password, timestamp } = this.generatePassword(creds);
-    const callbackBaseUrl = process.env.MPESA_CALLBACK_BASE_URL;
 
     const response = await fetch(`${this.baseUrl}/mpesa/stkpush/v1/processrequest`, {
       method: "POST",
@@ -148,7 +159,7 @@ export class DarajaClient {
         PartyA: params.msisdn,
         PartyB: creds.shortcode,
         PhoneNumber: params.msisdn,
-        CallBackURL: `${callbackBaseUrl}/v1/webhooks/daraja/stk-callback`,
+        CallBackURL: this.buildWebhookUrl("stk-callback"),
         AccountReference: params.accountReference,
         TransactionDesc: params.transactionDesc,
       }),
@@ -189,7 +200,6 @@ export class DarajaClient {
    */
   async initiateB2C(creds: TenantPayoutCredentials, params: B2cParams): Promise<B2cResponse> {
     const accessToken = await this.getAccessToken(creds);
-    const callbackBaseUrl = process.env.MPESA_CALLBACK_BASE_URL;
 
     const response = await fetch(`${this.baseUrl}/mpesa/b2c/v3/paymentrequest`, {
       method: "POST",
@@ -206,8 +216,8 @@ export class DarajaClient {
         PartyA: creds.shortcode,
         PartyB: params.msisdn,
         Remarks: params.remarks,
-        QueueTimeOutURL: `${callbackBaseUrl}/v1/webhooks/daraja/b2c-timeout`,
-        ResultURL: `${callbackBaseUrl}/v1/webhooks/daraja/b2c-result`,
+        QueueTimeOutURL: this.buildWebhookUrl("b2c-timeout"),
+        ResultURL: this.buildWebhookUrl("b2c-result"),
         Occasion: params.occasion ?? "",
       }),
     });
@@ -260,8 +270,7 @@ export class DarajaClient {
    */
   async registerC2bUrl(creds: C2bUrlRegistrationCredentials): Promise<void> {
     const accessToken = await this.getAccessToken(creds);
-    const callbackBaseUrl = process.env.MPESA_CALLBACK_BASE_URL;
-    const confirmationUrl = `${callbackBaseUrl}/v1/webhooks/daraja/c2b-confirmation`;
+    const confirmationUrl = this.buildWebhookUrl("c2b-confirmation");
 
     const response = await fetch(`${this.baseUrl}/mpesa/c2b/v2/registerurl`, {
       method: "POST",

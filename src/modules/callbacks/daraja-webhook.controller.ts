@@ -2,6 +2,7 @@ import { Body, Controller, HttpCode, Post, UseGuards, Logger, BadRequestExceptio
 import { ThrottlerGuard } from "@nestjs/throttler";
 import { WebhookThrottle } from "../../common/throttle-tiers";
 import { SkipResponseTransform } from "../../common/decorators/skip-response-transform.decorator";
+import { DarajaWebhookSecretGuard } from "../../common/guards/daraja-webhook-secret.guard";
 import { WebhookIngestService } from "./webhook-ingest.service";
 
 /**
@@ -18,9 +19,14 @@ import { WebhookIngestService } from "./webhook-ingest.service";
  *
  * @SkipResponseTransform: Safaricom expects exactly { ResultCode, ResultDesc }
  * not our {success, message, statusCode, payload} envelope
+ *
+ * DarajaWebhookSecretGuard: Daraja doesn't sign its payloads, so every route here
+ * requires a `?token=` query param matching DARAJA_WEBHOOK_SECRET — see that
+ * guard's own doc comment. Without it, this controller would accept a forged
+ * callback from anyone who discovered the path.
  */
 @Controller("v1/webhooks/daraja")
-@UseGuards(ThrottlerGuard)
+@UseGuards(ThrottlerGuard, DarajaWebhookSecretGuard)
 @WebhookThrottle()
 @SkipResponseTransform()
 export class DarajaWebhookController {
