@@ -2,6 +2,7 @@ import "reflect-metadata";
 import { NestFactory } from "@nestjs/core";
 import * as Sentry from "@sentry/node";
 import cookieParser from "cookie-parser";
+import helmet from "helmet";
 import { AppModule } from "./app.module";
 import { validateEnv } from "./config/env.schema";
 
@@ -26,6 +27,19 @@ async function bootstrap() {
   // (argon2 password hashing, its own access/refresh JWTs). See auth.service.ts.
 
   const app = await NestFactory.create(AppModule);
+  app.use(
+    helmet({
+      // Pure JSON API — no HTML/script/style ever served from here, so a CSP
+      // designed for a page-serving app has nothing meaningful to restrict and
+      // only risks surprising a future addition (e.g. Swagger docs) that would
+      // need its own directives anyway.
+      contentSecurityPolicy: false,
+      // This API is deliberately consumed cross-origin (see enableCors below, with
+      // credentials) — helmet's default same-origin CORP would have browsers block
+      // those legitimate cross-origin fetches regardless of the CORS headers.
+      crossOriginResourcePolicy: { policy: "cross-origin" },
+    }),
+  );
   app.use(cookieParser()); // required to read the httpOnly refresh_token cookie in AuthController/ProfileController
   app.enableCors({
     origin: env.FRONTEND_ORIGIN,
