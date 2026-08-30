@@ -7,7 +7,7 @@ import { CurrentUser, type AuthenticatedUser } from "../../common/decorators/cur
 import { ZodValidationPipe } from "../../common/pipes/zod-validation.pipe";
 import { createTenantSchema, updateTenantStatusSchema, type CreateTenantDto, type UpdateTenantStatusDto } from "./tenant.dto";
 import { TenantsService } from "./tenants.service";
-import { mpesaCredentialsSchema, type MpesaCredentialsDto } from "./tenants.schema";
+import { setAppCredentialsSchema, type SetAppCredentialsDto } from "./tenants.schema";
 
 /**
  * CsrfGuard applies to every mutating route here, including setMpesaCredentials —
@@ -59,13 +59,18 @@ export class TenantsController {
   findOne(@Param("id") id: string, @CurrentUser() user: AuthenticatedUser) {
     return this.tenants.findOne(id, user);
   }
-  @Post(":id/mpesa-credentials")
-  setMpesaCredentials(
+  /**
+   * Shared, org-level Consumer Key/Secret only — shortcode-specific credentials
+   * (passkey, B2C initiator/security credential) go through
+   * TenantShortcodesController instead, one call per shortcode.
+   */
+  @Post(":id/app-credentials")
+  setAppCredentials(
     @Param("id") id: string,
-    @Body(new ZodValidationPipe(mpesaCredentialsSchema)) dto: MpesaCredentialsDto,
+    @Body(new ZodValidationPipe(setAppCredentialsSchema)) dto: SetAppCredentialsDto,
     @CurrentUser() user: AuthenticatedUser,
   ) {
-    return this.tenants.setMpesaCredentials(id, dto, user);
+    return this.tenants.setAppCredentials(id, dto, user);
   }
 
   /**

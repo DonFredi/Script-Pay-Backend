@@ -19,6 +19,11 @@ import { z } from "zod";
 const B2C_MAX_MINOR_UNITS = 250_000_00;
 
 export const initiateB2cSchema = z.object({
+  // Which of the tenant's B2C-enabled shortcodes pays out. Required, never defaulted
+  // — unlike collections (which fall back to a tenant's default PAYBILL/TILL
+  // shortcode), the shortcode a payout draws from is never an implicit choice, since
+  // it's the one draining the tenant's balance. See TenantsService.getMpesaCredentialsForPayout.
+  shortcodeId: z.string().uuid("shortcodeId must be a valid TenantShortcode id"),
   // The payee, not the payer — the same format as a collection, the opposite role.
   msisdn: z.string().regex(/^254(7|1)\d{8}$/, "msisdn must be in 2547XXXXXXXX or 2541XXXXXXXX format"),
   amountMinorUnits: z

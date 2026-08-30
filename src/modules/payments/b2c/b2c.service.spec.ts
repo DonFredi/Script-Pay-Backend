@@ -12,6 +12,7 @@ const TENANT_ID = "11111111-2222-3333-4444-555555555555";
 const API_KEY_ACTOR = { type: "api_key" as const, id: "key-1" };
 
 const dto = {
+  shortcodeId: "66666666-7777-8888-9999-000000000000",
   msisdn: "254712345678",
   amountMinorUnits: 500_00,
   remarks: "Refund for order 42",

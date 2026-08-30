@@ -133,7 +133,7 @@ export class B2cService {
 
     try {
       // Step 2: call Daraja, outside the transaction above.
-      const credentials = await this.tenantsService.getMpesaCredentialsForPayout(tenantId);
+      const credentials = await this.tenantsService.getMpesaCredentialsForPayout(tenantId, dto.shortcodeId);
 
       const darajaResponse = await this.daraja.initiateB2C(credentials, {
         originatorConversationId,

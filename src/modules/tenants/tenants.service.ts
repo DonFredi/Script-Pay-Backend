@@ -7,7 +7,7 @@ import { ApiKeysService } from "../api-keys/api-keys.service";
 import { EmailService } from "../auth/email.service";
 import type { AuthenticatedUser } from "../../common/decorators/current-user.decorator";
 import type { CreateTenantDto, UpdateTenantStatusDto } from "./tenant.dto";
-import type { MpesaCredentialsDto } from "./tenants.schema";
+import type { SetAppCredentialsDto } from "./tenants.schema";
 import type { TenantMpesaCredentials, TenantPayoutCredentials } from "../../infrastructure/daraja/daraja.client";
 import { CredentialsEncryptionService } from "./credentials-encryption.service";
 import { DarajaClient } from "../../infrastructure/daraja/daraja.client";
@@ -28,7 +28,8 @@ export class TenantsService {
   /** SUPER_ADMIN only — enforced at the controller via @Roles(), not re-checked here on purpose:
    *  authorization is the guard's job, this service trusts it already ran. */
   async create(dto: CreateTenantDto, actor: AuthenticatedUser) {
-    const tenant = await this.prisma.tenant.create({ data: { ...dto, status: "pending_kyc" } });
+    const tenant = await this.prisma.tenant.create({ data: { name: dto.name, status: "pending_kyc" } });
+    await this.createInitialShortcode(tenant.id, dto.businessShortcode);
 
     await this.auditLog.record({
       tenantId: tenant.id,
@@ -37,19 +38,44 @@ export class TenantsService {
       action: "tenant.created",
       targetType: "Tenant",
       targetId: tenant.id,
-      metadata: { name: tenant.name, businessShortcode: tenant.businessShortcode },
+      metadata: { name: tenant.name, businessShortcode: dto.businessShortcode },
     });
 
     return tenant;
   }
-  async setMpesaCredentials(tenantId: string, dto: MpesaCredentialsDto, actor: AuthenticatedUser) {
+
+  /**
+   * Onboarding's shortcode is created as a plain PAYBILL row with no credentials
+   * yet — mirrors the pre-shortcode-split flow exactly, where `create`/`onboardSelf`
+   * only ever recorded the number itself and a separate step (now
+   * TenantShortcodesService.create/update) supplied the passkey and app
+   * credentials. Deliberately a step AFTER the tenant row exists, not inside the
+   * same transaction: TenantShortcode is RLS-scoped and needs `app.current_tenant_id`
+   * set to this tenant's own (brand new) id, which withTenantContext can only do
+   * once that id exists.
+   */
+  private async createInitialShortcode(tenantId: string, shortcode: string) {
+    await this.prisma.withTenantContext(tenantId, (tx) =>
+      tx.tenantShortcode.create({
+        data: { tenantId, type: "PAYBILL", shortcode, isDefault: true },
+      }),
+    );
+  }
+
+  /**
+   * Sets the shared, org-level Daraja app credentials (Consumer Key/Secret) —
+   * the counterpart to TenantShortcodesService managing everything shortcode-
+   * specific. Split out of what used to be one setMpesaCredentials call because
+   * these two now save to different tables (Tenant vs TenantShortcode).
+   */
+  async setAppCredentials(tenantId: string, dto: SetAppCredentialsDto, actor: AuthenticatedUser) {
     if (actor.tenantId !== tenantId && actor.role !== "SUPER_ADMIN") {
       throw new ForbiddenException("Cannot configure another tenant's credentials");
     }
 
     // Fail fast: confirm this consumer key/secret actually authenticate with Daraja
     // BEFORE persisting anything. Without this, a typo'd secret saves silently and
-    // the tenant only discovers it at their first real STK push — a much worse place
+    // the tenant only discovers it at their first real payment — a much worse place
     // to find out. Throws BadGatewayException on rejection, which the controller lets
     // through as-is (same pattern as the payment paths).
     await this.daraja.verifyCredentials({
@@ -57,64 +83,23 @@ export class TenantsService {
       mpesaConsumerSecretEncrypted: dto.consumerSecret,
     });
 
-    await this.rejectingShortcodeConflict(
-      this.prisma.tenant.update({
-        where: { id: tenantId },
-        data: {
-          businessShortcode: dto.businessShortcode,
-          mpesaConsumerKey: dto.consumerKey,
-          mpesaConsumerSecretEncrypted: this.encryption.encrypt(dto.consumerSecret),
-          mpesaPasskeyEncrypted: this.encryption.encrypt(dto.passkey),
-          mpesaCredentialsConfiguredAt: new Date(),
-          // Spread rather than set unconditionally: a tenant re-submitting only their
-          // collection credentials must not silently wipe payout credentials they
-          // configured earlier. The zod schema guarantees these two arrive together
-          // or not at all, so one being present implies the other.
-          ...(dto.initiatorName && dto.securityCredential
-            ? {
-                mpesaInitiatorName: dto.initiatorName,
-                mpesaSecurityCredentialEncrypted: this.encryption.encrypt(dto.securityCredential),
-                mpesaPayoutConfiguredAt: new Date(),
-              }
-            : {}),
-        },
-      }),
-    );
-
-    // Best-effort: tells Safaricom where to deliver C2B confirmations for direct
-    // till/paybill payments (ones that skip STK Push). Credentials are already
-    // verified and saved above, so a failure here must not undo that or fail the
-    // whole request — it only means manual payments on this shortcode stay
-    // untracked until this is retried (e.g. by re-submitting the same credentials).
-    let c2bUrlRegistered = true;
-    try {
-      await this.daraja.registerC2bUrl({
+    await this.prisma.tenant.update({
+      where: { id: tenantId },
+      data: {
         mpesaConsumerKey: dto.consumerKey,
-        mpesaConsumerSecretEncrypted: dto.consumerSecret,
-        shortcode: dto.businessShortcode,
-      });
-    } catch (error) {
-      c2bUrlRegistered = false;
-      this.logger.warn(`C2B URL registration failed for tenant ${tenantId}: ${String(error)}`);
-      await this.auditLog.record({
-        tenantId,
-        actorType: "system",
-        action: "daraja.c2b_url_registration_failed",
-        metadata: { error: String(error) },
-      });
-    }
+        mpesaConsumerSecretEncrypted: this.encryption.encrypt(dto.consumerSecret),
+        mpesaCredentialsConfiguredAt: new Date(),
+      },
+    });
 
     await this.auditLog.record({
       tenantId,
       actorType: "user",
       actorId: actor.id,
-      action: "tenant.mpesa_credentials_configured",
-      // Records WHETHER payout access was configured, never the credential itself.
-      metadata: { payoutCredentialsConfigured: Boolean(dto.initiatorName && dto.securityCredential), c2bUrlRegistered },
+      action: "tenant.app_credentials_configured",
     });
 
-    // Never echo the secret/passkey back, even to the tenant that just set it.
-    return { configured: true, c2bUrlRegistered };
+    return { configured: true };
   }
 
   /**
@@ -150,7 +135,16 @@ export class TenantsService {
     return { webhookUrl, webhookSecret };
   }
 
-  async getMpesaCredentialsForPayment(tenantId: string): Promise<TenantMpesaCredentials> {
+  /**
+   * `type` picks which of the tenant's collection shortcodes to use, mirroring
+   * InitiateStkPushDto.channel ("PAYBILL"/"TILL", default PAYBILL) — a tenant with
+   * exactly one shortcode of that type never has to think about this; StkPushService
+   * just passes dto.channel straight through.
+   */
+  async getMpesaCredentialsForPayment(
+    tenantId: string,
+    type: "PAYBILL" | "TILL" = "PAYBILL",
+  ): Promise<TenantMpesaCredentials> {
     const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
 
     // Suspension is the platform's kill switch, and it was previously a no-op for
@@ -166,28 +160,36 @@ export class TenantsService {
       throw new ForbiddenException("This tenant is suspended and cannot initiate payments");
     }
 
-    if (!tenant.mpesaConsumerKey || !tenant.mpesaConsumerSecretEncrypted || !tenant.mpesaPasskeyEncrypted) {
+    if (!tenant.mpesaConsumerKey || !tenant.mpesaConsumerSecretEncrypted) {
       throw new ForbiddenException(
         "M-Pesa credentials aren't configured for this tenant yet — set them up before initiating payments",
       );
     }
+
+    const shortcode = await this.prisma.withTenantContext(tenantId, (tx) =>
+      tx.tenantShortcode.findFirst({ where: { tenantId, type, isDefault: true } }),
+    );
+    if (!shortcode || !shortcode.mpesaPasskeyEncrypted) {
+      throw new ForbiddenException(
+        `No default ${type} shortcode with a passkey is configured for this tenant yet — set one up before initiating payments`,
+      );
+    }
+
     return {
-      shortcode: tenant.businessShortcode,
+      shortcode: shortcode.shortcode,
       mpesaConsumerKey: tenant.mpesaConsumerKey,
       mpesaConsumerSecretEncrypted: this.encryption.decrypt(tenant.mpesaConsumerSecretEncrypted),
-      mpesaPasskeyEncrypted: this.encryption.decrypt(tenant.mpesaPasskeyEncrypted),
+      mpesaPasskeyEncrypted: this.encryption.decrypt(shortcode.mpesaPasskeyEncrypted),
     };
   }
 
   /**
-   * Payout counterpart to getMpesaCredentialsForPayment. A separate method rather
-   * than an optional-fields variant of that one, because the two need genuinely
-   * different secrets: collections need the passkey and no initiator, payouts the
-   * exact reverse. One union-shaped return would leave every caller re-checking
-   * which half it actually received — and would decrypt a passkey the payout path
-   * has no use for.
+   * Payout counterpart to getMpesaCredentialsForPayment. shortcodeId is required,
+   * not defaulted — B2cService.initiate takes it straight from the caller
+   * (InitiateB2cDto.shortcodeId): unlike collections, which shortcode pays out is
+   * never an implicit choice, since it's the one moving money OUT of the tenant.
    */
-  async getMpesaCredentialsForPayout(tenantId: string): Promise<TenantPayoutCredentials> {
+  async getMpesaCredentialsForPayout(tenantId: string, shortcodeId: string): Promise<TenantPayoutCredentials> {
     const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
 
     // The same kill switch the collection path applies. A suspended (or removed)
@@ -204,26 +206,33 @@ export class TenantsService {
       );
     }
 
+    const shortcode = await this.prisma.withTenantContext(tenantId, (tx) =>
+      tx.tenantShortcode.findFirst({ where: { id: shortcodeId, tenantId, type: "B2C" } }),
+    );
+    if (!shortcode) {
+      throw new NotFoundException("This B2C shortcode doesn't exist for this tenant");
+    }
+
     // Deliberately a different message from the one above. A tenant that has been
     // collecting successfully for months hits THIS branch the first time they try to
     // pay out, and telling them their "M-Pesa credentials aren't configured" would be
     // actively misleading — theirs plainly are. B2C initiator access is a separate
     // registration on Safaricom's side, not something the collection setup implies.
-    if (!tenant.mpesaInitiatorName || !tenant.mpesaSecurityCredentialEncrypted) {
+    if (!shortcode.mpesaInitiatorName || !shortcode.mpesaSecurityCredentialEncrypted) {
       throw new ForbiddenException(
-        "B2C payout credentials aren't configured for this tenant yet — an initiator name and security " +
+        "B2C payout credentials aren't configured for this shortcode yet — an initiator name and security " +
           "credential are required before sending payments",
       );
     }
 
     return {
-      shortcode: tenant.businessShortcode,
+      shortcode: shortcode.shortcode,
       mpesaConsumerKey: tenant.mpesaConsumerKey,
       mpesaConsumerSecretEncrypted: this.encryption.decrypt(tenant.mpesaConsumerSecretEncrypted),
-      initiatorName: tenant.mpesaInitiatorName,
+      initiatorName: shortcode.mpesaInitiatorName,
       // Decrypts the AES layer only. What comes out is still Safaricom's
       // RSA-encrypted blob, which is exactly what the B2C request expects.
-      securityCredential: this.encryption.decrypt(tenant.mpesaSecurityCredentialEncrypted),
+      securityCredential: this.encryption.decrypt(shortcode.mpesaSecurityCredentialEncrypted),
     };
   }
 
@@ -268,9 +277,11 @@ export class TenantsService {
     // transaction, and updateMany's WHERE re-checks tenantId: null at write time:
     // only one of two racing requests can actually claim the account, and the loser
     // throws inside the transaction, rolling its own tenant row back with it instead
-    // of leaving an orphaned Tenant nothing points to.
+    // of leaving an orphaned Tenant nothing points to. The initial shortcode is
+    // created just after, once the tenant id this race decided on is final — see
+    // createInitialShortcode's own comment for why it can't join this transaction.
     const tenant = await this.prisma.$transaction(async (tx) => {
-      const created = await tx.tenant.create({ data: { ...dto, status: "pending_kyc" } });
+      const created = await tx.tenant.create({ data: { name: dto.name, status: "pending_kyc" } });
 
       const linked = await tx.user.updateMany({
         where: { id: actor.id, tenantId: null },
@@ -282,6 +293,7 @@ export class TenantsService {
 
       return created;
     });
+    await this.createInitialShortcode(tenant.id, dto.businessShortcode);
 
     await this.auditLog.record({
       tenantId: tenant.id,
@@ -290,7 +302,7 @@ export class TenantsService {
       action: "tenant.onboarded_self",
       targetType: "Tenant",
       targetId: tenant.id,
-      metadata: { name: tenant.name, businessShortcode: tenant.businessShortcode },
+      metadata: { name: tenant.name, businessShortcode: dto.businessShortcode },
     });
 
     return tenant;
@@ -376,20 +388,20 @@ export class TenantsService {
   }
 
   /**
-   * The only unique constraint that can fire on a tenants.update is the partial
-   * index on businessShortcode scoped to status = 'active' (see
-   * prisma/manual-sql/002_tenant_shortcode_unique_active.sql) — pending_kyc tenants
-   * may share Safaricom's sandbox shortcode freely, so this only ever surfaces once
-   * a shortcode collides with another tenant that's actually live.
+   * The unique constraint that can fire here now comes from the
+   * tenants_activation_shortcode_uniqueness trigger (manual-sql/003_tenant_shortcodes.sql),
+   * raised with ERRCODE unique_violation the same way a real index would be — fired
+   * specifically by THIS update, when moving a tenant to "active" collides with
+   * another active tenant already holding one of its shortcodes. pending_kyc tenants
+   * may still share Safaricom's sandbox shortcode freely; this only ever surfaces
+   * once a shortcode collides with another tenant that's actually live.
    */
   private async rejectingShortcodeConflict<T>(op: Promise<T>): Promise<T> {
     try {
       return await op;
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
-        throw new ConflictException(
-          "This Paybill/Till shortcode is already in use by another active tenant",
-        );
+        throw new ConflictException("A shortcode on this tenant is already in use by another active tenant");
       }
       throw error;
     }

@@ -41,8 +41,10 @@ export class StkPushService {
     );
 
     try {
-      // Step 2: Get credentials and call Daraja ONCE
-      const credentials = await this.tenantsService.getMpesaCredentialsForPayment(tenantId);
+      // Step 2: Get credentials and call Daraja ONCE. dto.channel picks which of the
+      // tenant's collection-type shortcodes (PAYBILL/TILL) this collects on — see
+      // TenantsService.getMpesaCredentialsForPayment.
+      const credentials = await this.tenantsService.getMpesaCredentialsForPayment(tenantId, dto.channel);
 
       const darajaResponse = await this.daraja.initiateStkPush(credentials, {
         amount: dto.amountMinorUnits / 100,

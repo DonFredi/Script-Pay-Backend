@@ -31,6 +31,16 @@ enum TransactionChannel {
   B2C // outbound: tenant -> customer (Daraja Business-to-Customer)
 }
 
+// A tenant can hold more than one Safaricom shortcode at once — a Till for
+// walk-in Buy Goods, a Paybill for online/STK collections, and a shortcode
+// enabled for B2C payouts are three separate Safaricom registrations, not
+// three names for the same number. See TenantShortcode.
+enum ShortcodeType {
+  TILL
+  PAYBILL
+  B2C
+}
+
 // Which way the money moved. Collections were the only direction that existed
 // before payouts, so INBOUND is the default — every pre-existing row is a
 // collection by definition and needs no backfill.
@@ -93,36 +103,25 @@ model AuditLog {
 model Tenant {
   id                String        @id @default(uuid())
   name              String
-  businessShortcode String        // Paybill/Till number
   status            String        @default("active") // active | suspended | pending_kyc | removed
   createdAt         DateTime      @default(now())
   updatedAt         DateTime      @updatedAt
 
-
-// Encrypted at rest — never stored in plaintext. Format: "iv:authTag:ciphertext"
+  // Shared, org-level Daraja app credentials — one production app is issued per
+  // organization at Safaricom go-live, and every shortcode the org holds (see
+  // TenantShortcode) is linked to that same app. Product-specific secrets (the STK
+  // passkey, the B2C initiator/security credential) live on TenantShortcode instead,
+  // since those genuinely differ per shortcode.
+  //
+  // Encrypted at rest — never stored in plaintext. Format: "iv:authTag:ciphertext"
   // (all hex), self-contained in one column. Consumer Key isn't secret enough to
   // need encryption (Safaricom docs treat it like a client ID), but Consumer
-  // Secret and Passkey genuinely are.
+  // Secret genuinely is.
   mpesaConsumerKey           String?
   mpesaConsumerSecretEncrypted String?
-  mpesaPasskeyEncrypted        String?
   mpesaCredentialsConfiguredAt DateTime?
 
-  // B2C payout credentials — kept separate from the collection credentials above
-  // because a tenant can accept payments long before, or without ever, sending any.
-  // Both sets come from Safaricom's Daraja portal.
-  //
-  // mpesaSecurityCredential is stored exactly as that portal emits it: ALREADY
-  // RSA-encrypted against Safaricom's public certificate. ScriptPay never sees the
-  // initiator password itself and ships no Safaricom certificate. Doing the RSA step
-  // ourselves would mean holding that password in plaintext at some point, bundling
-  // the cert, and tracking both its rotation and the sandbox/production split — all
-  // to arrive at the same string the portal already hands the tenant. The AES-256-GCM
-  // layer here is the same at-rest protection the fields above get (decision log
-  // entry 8); the value it protects just happens to be encrypted already.
-  mpesaInitiatorName               String?
-  mpesaSecurityCredentialEncrypted String?
-  mpesaPayoutConfiguredAt          DateTime?
+  shortcodes TenantShortcode[]
 
   // Outbound settlement-notification config — set by the tenant itself via
   // POST /v1/tenants/webhook-config (WEBHOOKS_MANAGE scope), not by platform staff.
@@ -142,6 +141,46 @@ model Tenant {
   webhookDeliveries TenantWebhookDelivery[]
 
   @@map("tenants")
+}
+
+// One row per Safaricom shortcode a tenant holds. A tenant onboards with exactly
+// one (see TenantsService.create/onboardSelf) but can add more later — a Till and
+// a Paybill both routing to the same business, or a shortcode registered
+// specifically for B2C. Uniqueness across ACTIVE tenants ("no two live tenants
+// share a real shortcode") can't be a partial index here the way
+// tenants_business_shortcode_active_unique used to be, because the status it
+// depends on lives on the parent Tenant, not this table — see the triggers added
+// in manual-sql/003_tenant_shortcodes.sql instead.
+model TenantShortcode {
+  id        String        @id @default(uuid())
+  tenantId  String
+  tenant    Tenant        @relation(fields: [tenantId], references: [id])
+  type      ShortcodeType
+  shortcode String
+  // Which shortcode of this type a caller gets when it doesn't name one explicitly
+  // (StkPushService's default PAYBILL/TILL collection shortcode). B2C has no such
+  // default — see initiate-b2c.dto.ts's shortcodeId being required, not optional;
+  // sending money out is deliberately never an implicit choice.
+  isDefault Boolean       @default(false)
+
+  // STK/C2B credentials — PAYBILL and TILL only.
+  mpesaPasskeyEncrypted String?
+
+  // B2C payout credentials — B2C only. mpesaSecurityCredential is stored exactly as
+  // Safaricom's portal emits it: ALREADY RSA-encrypted against Safaricom's public
+  // certificate (see the old Tenant.mpesaSecurityCredentialEncrypted comment this
+  // was moved from for the full reasoning). The AES-256-GCM layer here is the same
+  // at-rest protection every other secret on this model gets; the value it protects
+  // just happens to be encrypted twice.
+  mpesaInitiatorName               String?
+  mpesaSecurityCredentialEncrypted String?
+  mpesaPayoutConfiguredAt          DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId])
+  @@map("tenant_shortcodes")
 }
 
 model User {

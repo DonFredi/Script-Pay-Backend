@@ -22,7 +22,7 @@ describe("TenantsController", () => {
       onboardSelf: jest.fn(),
       listAll: jest.fn(),
       findOne: jest.fn(),
-      setMpesaCredentials: jest.fn(),
+      setAppCredentials: jest.fn(),
       updateStatus: jest.fn(),
     } as any;
     controller = new TenantsController(tenants);
@@ -67,13 +67,13 @@ describe("TenantsController", () => {
     expect(tenants.findOne).toHaveBeenCalledWith("tenant-1", actor);
   });
 
-  it("setMpesaCredentials() passes id, DTO, and actor through to TenantsService.setMpesaCredentials", async () => {
-    const dto = { consumerKey: "k", consumerSecret: "s", passkey: "p" } as any;
+  it("setAppCredentials() passes id, DTO, and actor through to TenantsService.setAppCredentials", async () => {
+    const dto = { consumerKey: "k", consumerSecret: "s" } as any;
     const actor = user();
 
-    await controller.setMpesaCredentials("tenant-1", dto, actor);
+    await controller.setAppCredentials("tenant-1", dto, actor);
 
-    expect(tenants.setMpesaCredentials).toHaveBeenCalledWith("tenant-1", dto, actor);
+    expect(tenants.setAppCredentials).toHaveBeenCalledWith("tenant-1", dto, actor);
   });
 
   it("updateStatus() passes id, DTO, and actor through to TenantsService.updateStatus", async () => {
