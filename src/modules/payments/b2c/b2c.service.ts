@@ -54,6 +54,21 @@ export class B2cService {
    * only the CALLBACK-driven transitions go through the state machine.
    */
   async initiate(tenantId: string, dto: InitiateB2cDto, actor: PayoutActor) {
+    // Idempotency: a caller that retries (network timeout, double-click before the
+    // throttle catches it) with the same key gets back the payout already created
+    // for it instead of a second real disbursement. Checked up front as a fast path;
+    // the create below is still the actual source of truth (see the P2002 catch),
+    // since two concurrent requests with the same key can both pass this check.
+    if (dto.idempotencyKey) {
+      const existing = await this.findByIdempotencyKey(tenantId, dto.idempotencyKey);
+      if (existing) {
+        this.logger.log(
+          `Idempotent replay for payout key=${dto.idempotencyKey} -> existing transaction ${existing.id}`,
+        );
+        return { transactionId: existing.id, status: existing.status };
+      }
+    }
+
     // Generated before anything else so it exists even if every step below fails.
     // This is the id the result callback will correlate on — unlike STK Push, where
     // the correlation key only arrives in Daraja's response and a timed-out request
@@ -63,39 +78,58 @@ export class B2cService {
     // Step 1: reserve. Lock, check, create and debit in ONE transaction — a balance
     // verified in a different transaction than the debit it authorizes verifies
     // nothing, since a concurrent payout can commit in between.
-    const transaction = await this.prisma.withTenantContext(tenantId, async (tx) => {
-      const availableBefore = await this.ledger.assertSufficientBalance(tx, tenantId, dto.amountMinorUnits);
+    let transaction;
+    try {
+      transaction = await this.prisma.withTenantContext(tenantId, async (tx) => {
+        const availableBefore = await this.ledger.assertSufficientBalance(tx, tenantId, dto.amountMinorUnits);
 
-      const created = await tx.transaction.create({
-        data: {
-          tenantId,
-          channel: "B2C",
-          direction: "OUTBOUND",
-          status: "PENDING",
-          amountMinorUnits: dto.amountMinorUnits,
-          msisdn: dto.msisdn,
-          originatorConversationId,
-          payoutRemarks: dto.remarks,
-          payoutOccasion: dto.occasion,
-          metadata: dto.metadata as any,
-        },
+        const created = await tx.transaction.create({
+          data: {
+            tenantId,
+            channel: "B2C",
+            direction: "OUTBOUND",
+            status: "PENDING",
+            amountMinorUnits: dto.amountMinorUnits,
+            msisdn: dto.msisdn,
+            originatorConversationId,
+            idempotencyKey: dto.idempotencyKey,
+            payoutRemarks: dto.remarks,
+            payoutOccasion: dto.occasion,
+            metadata: dto.metadata as any,
+          },
+        });
+
+        await tx.ledgerEntry.createMany({
+          data: this.ledger.reservationEntries({
+            tenantId,
+            transactionId: created.id,
+            amountMinorUnits: dto.amountMinorUnits,
+          }),
+        });
+
+        this.logger.log(
+          `Reserved ${dto.amountMinorUnits} minor units for payout ${created.id} ` +
+            `(tenant ${tenantId}, balance before: ${availableBefore})`,
+        );
+
+        return created;
       });
-
-      await tx.ledgerEntry.createMany({
-        data: this.ledger.reservationEntries({
-          tenantId,
-          transactionId: created.id,
-          amountMinorUnits: dto.amountMinorUnits,
-        }),
-      });
-
-      this.logger.log(
-        `Reserved ${dto.amountMinorUnits} minor units for payout ${created.id} ` +
-          `(tenant ${tenantId}, balance before: ${availableBefore})`,
-      );
-
-      return created;
-    });
+    } catch (error: unknown) {
+      // Two concurrent requests can both pass the pre-check above and race into this
+      // create — the loser hits the unique constraint on (tenantId, idempotencyKey)
+      // rather than creating a genuine duplicate payout. Only treat it as a replay
+      // when a key was actually sent; otherwise this is a real, unrelated failure.
+      if (dto.idempotencyKey && isUniqueConstraintViolation(error)) {
+        const existing = await this.findByIdempotencyKey(tenantId, dto.idempotencyKey);
+        if (existing) {
+          this.logger.log(
+            `Idempotent replay (race) for payout key=${dto.idempotencyKey} -> existing transaction ${existing.id}`,
+          );
+          return { transactionId: existing.id, status: existing.status };
+        }
+      }
+      throw error;
+    }
 
     try {
       // Step 2: call Daraja, outside the transaction above.
@@ -193,4 +227,18 @@ export class B2cService {
       });
     });
   }
+
+  private async findByIdempotencyKey(tenantId: string, idempotencyKey: string) {
+    return this.prisma.withTenantContext(tenantId, (tx) =>
+      tx.transaction.findUnique({
+        where: { tenantId_idempotencyKey: { tenantId, idempotencyKey } },
+      }),
+    );
+  }
+}
+
+// Same duck-typed check as WebhookIngestService — Prisma's unique-constraint
+// violation code, without depending on importing the Prisma error class.
+function isUniqueConstraintViolation(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && (error as { code?: string }).code === "P2002";
 }

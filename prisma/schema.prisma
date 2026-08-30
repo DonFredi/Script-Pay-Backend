@@ -270,6 +270,12 @@ model Transaction {
   failureReason       String?
   payoutRemarks       String?             // Daraja B2C "Remarks" — OUTBOUND only
   payoutOccasion      String?             // Daraja B2C "Occasion" — OUTBOUND only
+  // Caller-supplied dedupe token (currently only B2C payout initiation sends one) —
+  // a retried/double-clicked request with the same key returns the existing row
+  // instead of creating a second real payout. NULL doesn't collide with other NULLs
+  // under Postgres's unique-index semantics, so callers that don't send a key are
+  // unaffected.
+  idempotencyKey      String?
   metadata            Json?               // arbitrary tenant-supplied reference data
   createdAt           DateTime            @default(now())
   updatedAt           DateTime            @updatedAt
@@ -278,6 +284,7 @@ model Transaction {
   reconciliation      ReconciliationRecord?
   webhookDeliveries   TenantWebhookDelivery[]
 
+  @@unique([tenantId, idempotencyKey])
   @@index([tenantId, createdAt])
   @@index([tenantId, status])
   @@map("transactions")
