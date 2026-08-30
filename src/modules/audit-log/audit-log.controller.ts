@@ -1,4 +1,4 @@
-import { Controller, Get, Query, UseGuards } from "@nestjs/common";
+import { Controller, Get, Param, Query, UseGuards } from "@nestjs/common";
 import { AccessTokenGuard } from "../auth/access-token.guard";
 import { RolesGuard } from "../../common/guards/roles.guard";
 import { Roles } from "../../common/decorators/roles.decorator";
@@ -26,5 +26,10 @@ export class AuditLogController {
     @Query("action") action?: string,
   ) {
     return this.auditLog.list({ tenantId, action }, user);
+  }
+
+  @Get(":id")
+  findOne(@Param("id") id: string, @CurrentUser() user: AuthenticatedUser) {
+    return this.auditLog.findOne(id, user);
   }
 }

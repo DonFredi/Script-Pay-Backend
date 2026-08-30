@@ -1,5 +1,5 @@
 import { Test, TestingModule } from "@nestjs/testing";
-import { ForbiddenException } from "@nestjs/common";
+import { ForbiddenException, NotFoundException } from "@nestjs/common";
 import { AuditLogService } from "./audit-log.service";
 import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 import type { AuthenticatedUser } from "../../common/decorators/current-user.decorator";
@@ -16,7 +16,10 @@ describe("AuditLogService", () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         AuditLogService,
-        { provide: PrismaPrivilegedService, useValue: { auditLog: { create: jest.fn(), findMany: jest.fn() } } },
+        {
+          provide: PrismaPrivilegedService,
+          useValue: { auditLog: { create: jest.fn(), findMany: jest.fn(), findUnique: jest.fn() } },
+        },
       ],
     }).compile();
 
@@ -75,6 +78,38 @@ describe("AuditLogService", () => {
       expect(prisma.auditLog.findMany).toHaveBeenCalledWith(
         expect.objectContaining({ where: expect.objectContaining({ tenantId: "tenant-1" }) }),
       );
+    });
+  });
+
+  describe("findOne", () => {
+    it("throws NotFoundException when the entry does not exist", async () => {
+      jest.spyOn(prisma.auditLog, "findUnique").mockResolvedValueOnce(null);
+
+      await expect(service.findOne("missing", user({ role: "SUPER_ADMIN", tenantId: null }))).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+
+    it("lets a SUPER_ADMIN read any tenant's entry", async () => {
+      jest.spyOn(prisma.auditLog, "findUnique").mockResolvedValueOnce({ id: "log-1", tenantId: "other-tenant" } as any);
+
+      const result = await service.findOne("log-1", user({ role: "SUPER_ADMIN", tenantId: null }));
+
+      expect(result).toEqual({ id: "log-1", tenantId: "other-tenant" });
+    });
+
+    it("lets a TENANT_ADMIN read their own tenant's entry", async () => {
+      jest.spyOn(prisma.auditLog, "findUnique").mockResolvedValueOnce({ id: "log-1", tenantId: "tenant-1" } as any);
+
+      const result = await service.findOne("log-1", user({ tenantId: "tenant-1" }));
+
+      expect(result).toEqual({ id: "log-1", tenantId: "tenant-1" });
+    });
+
+    it("forbids a TENANT_ADMIN from reading another tenant's entry", async () => {
+      jest.spyOn(prisma.auditLog, "findUnique").mockResolvedValueOnce({ id: "log-1", tenantId: "other-tenant" } as any);
+
+      await expect(service.findOne("log-1", user({ tenantId: "tenant-1" }))).rejects.toThrow(ForbiddenException);
     });
   });
 });

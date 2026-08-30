@@ -1,4 +1,4 @@
-import { ForbiddenException, Injectable, Logger } from "@nestjs/common";
+import { ForbiddenException, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 import type { AuthenticatedUser } from "../../common/decorators/current-user.decorator";
 
@@ -68,5 +68,22 @@ export class AuditLogService {
       orderBy: { createdAt: "desc" },
       take: params.take ?? 100,
     });
+  }
+
+  /**
+   * Ownership isn't knowable from `id` alone (unlike TenantsService.findOne, where
+   * the id param IS the tenant) — an entry's tenantId is only known once fetched,
+   * so this fetches first and authorizes against the row, same order as
+   * TransactionsController.findOne.
+   */
+  async findOne(id: string, caller: AuthenticatedUser) {
+    const entry = await this.prisma.auditLog.findUnique({ where: { id } });
+    if (!entry) throw new NotFoundException("Audit log entry not found");
+
+    if (caller.role !== "SUPER_ADMIN" && entry.tenantId !== caller.tenantId) {
+      throw new ForbiddenException("Cannot view another tenant's audit log entry");
+    }
+
+    return entry;
   }
 }
