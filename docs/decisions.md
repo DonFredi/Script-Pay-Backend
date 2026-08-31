@@ -497,3 +497,52 @@ setting their own tenant to `removed` and from reinstating one already
 Removed tenants stay visible via `GET /v1/tenants`/`GET /v1/tenants/:id`
 rather than being hidden, preserving audit visibility and avoiding an admin
 unknowingly re-onboarding a duplicate shortcode.
+
+## 20. One default shortcode per (tenant, type), enforced by unsetting the previous one in the same transaction
+
+**Problem**: A tenant can hold multiple `TenantShortcode` rows of the same
+`type` (e.g. two `PAYBILL` shortcodes), but
+`getMpesaCredentialsForPayment` picks one via `findFirst({ tenantId, type,
+isDefault: true })`. Nothing stopped two rows of the same type from both
+having `isDefault: true`, which makes that lookup pick whichever `findFirst`
+happens to return first — a real payment could start using different
+credentials than the merchant intended, silently.
+
+**Rejected**: A unique partial index (`@@unique([tenantId, type], where:
+isDefault: true)`-style constraint) enforced at the database level. Prisma
+doesn't support partial unique indexes, and a manual SQL constraint would need
+its own migration plus an `ON CONFLICT` story in `create`/`update` — more
+moving parts than the actual invariant needs, given there are only two write
+paths that ever set `isDefault: true`.
+
+**Chosen**: `TenantShortcodesService.create`/`update` unset any existing
+`{ tenantId, type, isDefault: true }` row before writing the new default,
+inside the same `withTenantContext` transaction as the create/update itself
+— so no query can ever observe two defaults of the same type, even
+momentarily. `update` additionally excludes the row being updated (`id: {
+not: shortcodeId }`) and falls back to the shortcode's existing `type` when
+the patch doesn't change it, since "make this one default" is the more common
+call than "make this one default and also change its type."
+
+## 21. Daraja responses parsed as text first, not `response.json()` directly
+
+**Problem**: Every `DarajaClient` method assumed a Daraja API response body is
+always JSON. A request that never reaches Daraja's own application layer —
+blocked by Safaricom's API gateway (rate limiting, a locked initiator, an
+outage) — comes back as an HTML fault page instead. `response.json()` throws
+a raw `SyntaxError` on that, which bypasses every `BadGatewayException` this
+file already raises for a genuine Daraja rejection and reaches
+`HttpExceptionFilter` as an unhandled 500 — the caller (and the merchant,
+via `transaction.failureReason`) learns nothing about what actually happened,
+and it doesn't get logged as a Daraja-specific failure either.
+
+**Chosen**: `parseDarajaJson` reads the response as text first and parses it
+itself, logging the raw (truncated) body and raising the same
+`BadGatewayException` shape every other rejection in this file already
+produces when parsing fails. Applied to every Daraja call
+(`getAccessToken`, `initiateStkPush`, `initiateB2c`, C2B URL registration,
+STK status query). At the same time, `B2cService`/`StkPushService` now store
+the real Daraja rejection message (or this gateway message) as
+`transaction.failureReason` instead of a generic `"daraja_initiation_error"`
+bucket label — the frontend polls onto that exact field to show the merchant
+what went wrong, and the bucket label was never actionable for them.
