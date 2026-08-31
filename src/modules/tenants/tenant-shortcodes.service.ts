@@ -54,8 +54,21 @@ export class TenantShortcodesService {
     });
 
     const created = await this.rejectingShortcodeConflict(
-      this.prisma.withTenantContext(tenantId, (tx) =>
-        tx.tenantShortcode.create({
+      this.prisma.withTenantContext(tenantId, async (tx) => {
+        // At most one default per (tenant, type) — getMpesaCredentialsForPayment
+        // does findFirst({ type, isDefault: true }), so two defaults of the same
+        // type makes that lookup nondeterministic. Unsetting the old one runs in
+        // the same transaction as the insert below (withTenantContext already
+        // wraps its callback in $transaction), so nothing can observe two
+        // defaults for this type even momentarily.
+        if (dto.isDefault) {
+          await tx.tenantShortcode.updateMany({
+            where: { tenantId, type: dto.type, isDefault: true },
+            data: { isDefault: false },
+          });
+        }
+
+        return tx.tenantShortcode.create({
           data: {
             tenantId,
             type: dto.type,
@@ -70,8 +83,8 @@ export class TenantShortcodesService {
                 }
               : {}),
           },
-        }),
-      ),
+        });
+      }),
     );
 
     // Best-effort, same as before the shortcode split: tells Safaricom where to
@@ -137,6 +150,16 @@ export class TenantShortcodesService {
       this.prisma.withTenantContext(tenantId, async (tx) => {
         const existing = await tx.tenantShortcode.findFirst({ where: { id: shortcodeId, tenantId } });
         if (!existing) throw new NotFoundException("Shortcode not found");
+
+        // Same one-default-per-type rule as create(), enforced here too since this
+        // is the route "Make default" on an existing shortcode actually hits.
+        // dto.type covers the (rare) case type is being changed in the same patch.
+        if (dto.isDefault) {
+          await tx.tenantShortcode.updateMany({
+            where: { tenantId, type: dto.type ?? existing.type, isDefault: true, id: { not: shortcodeId } },
+            data: { isDefault: false },
+          });
+        }
 
         return tx.tenantShortcode.update({
           where: { id: shortcodeId },
