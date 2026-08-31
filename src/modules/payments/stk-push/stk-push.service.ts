@@ -84,10 +84,13 @@ export class StkPushService {
     } catch (error) {
       this.logger.error(`STK push initiation failed for transaction ${transaction.id}`, error as Error);
 
+      // Same reasoning as B2cService.releaseReservation: StkPushSection polls onto
+      // this exact field to show the merchant what went wrong, so it needs the real
+      // Daraja rejection reason, not a generic bucket label.
       await this.prisma.withTenantContext(tenantId, (tx) =>
         tx.transaction.update({
           where: { id: transaction.id },
-          data: { status: "FAILED", failureReason: "daraja_initiation_error" },
+          data: { status: "FAILED", failureReason: (error as Error).message ?? "daraja_initiation_error" },
         }),
       );
 

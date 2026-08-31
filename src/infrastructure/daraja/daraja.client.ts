@@ -93,6 +93,29 @@ export class DarajaClient {
     return process.env.MPESA_ENV === "production" ? "https://api.safaricom.co.ke" : "https://sandbox.safaricom.co.ke";
   }
 
+  /**
+   * Every Daraja call below expects a JSON body, but a request that never actually
+   * reaches Daraja's own application layer — blocked by Safaricom's API gateway
+   * (rate limiting, a locked initiator, an outage) — comes back as an HTML fault
+   * page instead. Calling response.json() directly on that throws a raw
+   * SyntaxError that bypasses every BadGatewayException below and reaches
+   * HttpExceptionFilter as an unhandled 500, telling the caller nothing about
+   * what actually happened. Reading as text first and parsing ourselves turns
+   * that into the same clean, logged BadGatewayException every other rejection
+   * here already produces.
+   */
+  private async parseDarajaJson(response: Response, context: string): Promise<any> {
+    const raw = await response.text();
+    try {
+      return JSON.parse(raw);
+    } catch {
+      this.logger.error(`Daraja ${context} returned a non-JSON response (status ${response.status}): ${raw.slice(0, 500)}`);
+      throw new BadGatewayException(
+        `Daraja's ${context} endpoint returned an unexpected response — the request may have been blocked before reaching Daraja (rate limiting, a locked initiator, or an outage)`,
+      );
+    }
+  }
+
   private async getAccessToken(creds: DarajaAuthCredentials): Promise<string> {
     const now = Date.now();
     const cached = this.tokenCache.get(creds.mpesaConsumerKey);
@@ -112,11 +135,17 @@ export class DarajaClient {
       // A BadGatewayException (not a plain Error) so this reaches the caller as a real
       // HTTP error the frontend can display, instead of being swallowed into the global
       // filter's generic "Internal server error" — see docs/decisions.md if this pattern
-      // gets extended further.
-      throw new BadGatewayException("Failed to authenticate with Daraja using this tenant's credentials");
+      // gets extended further. Safaricom's own reason is appended (truncated) rather than
+      // left server-log-only, same as every other rejection in this file — this exact
+      // message is what StkPushSection/B2cPayoutSection show the merchant via
+      // transaction.failureReason, so a bare "failed to authenticate" told them nothing
+      // about whether it was a wrong key, an expired app, or a rate limit.
+      throw new BadGatewayException(
+        `Failed to authenticate with Daraja using this tenant's credentials (Safaricom returned ${response.status}: ${body.slice(0, 300)})`,
+      );
     }
 
-    const data = (await response.json()) as { access_token: string; expires_in: string };
+    const data = (await this.parseDarajaJson(response, "OAuth token")) as { access_token: string; expires_in: string };
     const ttlMs = (Number(data.expires_in) - 60) * 1000;
     this.tokenCache.set(creds.mpesaConsumerKey, { token: data.access_token, expiresAt: now + ttlMs });
     return data.access_token;
@@ -165,7 +194,7 @@ export class DarajaClient {
       }),
     });
 
-    const body = await response.json();
+    const body = await this.parseDarajaJson(response, "STK push");
     if (!response.ok || body.ResponseCode !== "0") {
       this.logger.error(`Daraja STK push rejected: ${JSON.stringify(body)}`);
       // Safaricom's own rejection reason (e.g. "Invalid TransactionType", "Invalid
@@ -222,7 +251,7 @@ export class DarajaClient {
       }),
     });
 
-    const body = await response.json();
+    const body = await this.parseDarajaJson(response, "B2C payment");
     if (!response.ok || body.ResponseCode !== "0") {
       this.logger.error(`Daraja B2C request rejected: ${JSON.stringify(body)}`);
       // Same reasoning as initiateStkPush: Safaricom's rejection describes this
@@ -283,7 +312,7 @@ export class DarajaClient {
       }),
     });
 
-    const body = await response.json();
+    const body = await this.parseDarajaJson(response, "C2B URL registration");
     if (!response.ok || body.ResponseCode !== "0") {
       this.logger.error(`Daraja C2B URL registration rejected: ${JSON.stringify(body)}`);
       throw new BadGatewayException(
@@ -310,7 +339,7 @@ export class DarajaClient {
       }),
     });
 
-    const body = await response.json();
+    const body = await this.parseDarajaJson(response, "STK push status query");
     return { resultCode: Number(body.ResultCode ?? -1), resultDesc: body.ResultDesc };
   }
 }

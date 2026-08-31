@@ -178,7 +178,11 @@ export class B2cService {
       // permanently. Release it here, using the SAME balanced pair the callback path
       // uses (LedgerService.releaseEntries) so the two can never disagree about what
       // releasing a reservation means.
-      await this.releaseReservation(tenantId, transaction.id, "daraja_initiation_error");
+      // The frontend polls onto this exact field to show the merchant what went
+      // wrong (B2cPayoutSection reads transaction.failureReason) — the real Daraja
+      // rejection reason belongs here, not a generic bucket label; that would only
+      // ever be visible in server logs and the audit trail below.
+      await this.releaseReservation(tenantId, transaction.id, (error as Error).message ?? "daraja_initiation_error");
 
       await this.auditLog.record({
         tenantId,

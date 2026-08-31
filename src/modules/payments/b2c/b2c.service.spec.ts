@@ -199,12 +199,12 @@ describe("B2cService", () => {
         ]);
       });
 
-      it("marks the payout FAILED", async () => {
+      it("marks the payout FAILED with Daraja's own rejection reason", async () => {
         await expect(service.initiate(TENANT_ID, dto, API_KEY_ACTOR)).rejects.toThrow();
 
         expect(prisma.transaction.update).toHaveBeenCalledWith(
           expect.objectContaining({
-            data: { status: "FAILED", failureReason: "daraja_initiation_error" },
+            data: { status: "FAILED", failureReason: "Invalid Initiator Information" },
           }),
         );
       });
