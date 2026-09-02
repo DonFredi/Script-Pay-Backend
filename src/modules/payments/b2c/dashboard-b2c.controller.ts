@@ -1,4 +1,4 @@
-import { Body, Controller, ForbiddenException, Post, UseGuards } from "@nestjs/common";
+import { Body, Controller, ForbiddenException, Headers, Post, UseGuards } from "@nestjs/common";
 import { AccessTokenGuard } from "../../auth/access-token.guard";
 import { CsrfGuard } from "../../../common/guards/csrf.guard";
 import { RolesGuard } from "../../../common/guards/roles.guard";
@@ -38,9 +38,17 @@ export class DashboardB2cController {
   async initiate(
     @Body(new ZodValidationPipe(initiateB2cSchema)) body: InitiateB2cDto,
     @CurrentUser() user: AuthenticatedUser,
+    // Standard REST idempotency-key convention, in addition to the body field — a
+    // double-click on the dashboard's "send money" button retries with the same
+    // header automatically if the frontend sets one; either source works.
+    @Headers("idempotency-key") idempotencyKeyHeader?: string,
   ) {
     if (!user.tenantId) throw new ForbiddenException("Account has no associated tenant");
 
-    return this.b2cService.initiate(user.tenantId, body, { type: "user", id: user.id });
+    return this.b2cService.initiate(
+      user.tenantId,
+      { ...body, idempotencyKey: body.idempotencyKey ?? idempotencyKeyHeader },
+      { type: "user", id: user.id },
+    );
   }
 }

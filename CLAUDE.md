@@ -93,6 +93,7 @@ Controllers are the source of truth for exact guard order and scopes — verify 
 - `RefreshToken` stores only a SHA-256 hash, tracks a rotation chain (`replacedByTokenId`) — a revoked token presented again is a theft signal.
 - `AuditLog` is append-only by convention — never updated/deleted by application code.
 - Tenant-scoped tables carry `tenantId` and are meant to be protected by Postgres RLS; the policy SQL lives in `prisma/manual-sql/001_row_level_security.sql` and must be applied manually (Prisma doesn't manage RLS).
+- A tenant can hold multiple `TenantShortcode` rows of the same `type` (e.g. two `PAYBILL`s); at most one per `(tenantId, type)` may have `isDefault: true` — `TenantShortcodesService.create`/`update` enforce this by unsetting the previous default in the same transaction as the write, since `getMpesaCredentialsForPayment`'s `findFirst({ isDefault: true })` lookup is otherwise nondeterministic with two. See `docs/decisions.md` entry 20.
 
 ## Environment
 
@@ -138,6 +139,21 @@ model) — reach for these before adding a route or table from scratch.
 ## Known stale spots
 
 - Inline comments in a few files (e.g. `dashboard-stk-push.controller.ts`) still say "Firebase-verified user" — functionally that's now the JWT-verified user from `AccessTokenGuard`. The comment wording is stale; the guard itself is correct. Fix the wording if you're already editing that file; don't go out of your way otherwise.
+
+## Daraja error handling (2026-08-31)
+
+`DarajaClient` no longer calls `response.json()` directly on any Safaricom
+response — a request blocked before reaching Daraja's application layer
+(rate limiting, a locked initiator, an outage) comes back as an HTML fault
+page, and `response.json()` on that threw a raw `SyntaxError` that bypassed
+every `BadGatewayException` this file raises and reached the global filter
+as an unhandled 500. `parseDarajaJson` reads the body as text first and
+parses it itself, raising the same clean `BadGatewayException` shape on a
+parse failure. `B2cService`/`StkPushService` also now persist the real
+Daraja rejection message as `transaction.failureReason` instead of the
+generic `"daraja_initiation_error"` bucket label, since the frontend polls
+onto that exact field to show the merchant what went wrong. See
+`docs/decisions.md` entry 21.
 
 ## What to avoid
 

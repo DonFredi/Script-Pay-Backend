@@ -82,6 +82,16 @@ export const envSchema = z.object({
   MPESA_SHORTCODE: z.string().min(1).default("174379"),
   API_KEY_HASH_PEPPER: z.string().min(32, "must be a long random secret, not a guessable phrase"),
 
+  // Daraja never signs its webhook payloads, so this is the only thing that tells a
+  // real Safaricom callback apart from anyone who discovers the URL and POSTs a
+  // forged one. Embedded as a `?token=` query param in the CallBackURL/ResultURL/
+  // QueueTimeOutURL/ConfirmationURL registered with Safaricom (see DarajaClient's
+  // buildWebhookUrl) and checked by DarajaWebhookSecretGuard on every inbound
+  // callback. IP-allowlisting Safaricom's published ranges at the load balancer is
+  // still recommended as defense in depth — this guard doesn't replace that.
+  // Generate with: openssl rand -hex 32
+  DARAJA_WEBHOOK_SECRET: z.string().min(32),
+
   // Signs/verifies the backend's OWN access tokens. This exact value must also be
   // set in the frontend's middleware environment (Edge runtime) — it's a shared
   // secret between the two codebases, used with HS256. Generate with: openssl rand -hex 32

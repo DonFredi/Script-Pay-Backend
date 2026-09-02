@@ -4,9 +4,10 @@
  * Run this BEFORE deploying the CREDENTIALS_ENCRYPTION_KEY fix, to see which
  * tenants (if any) already have Daraja credentials saved under the old,
  * unvalidated key. Those tenants will need to re-submit their credentials
- * via POST /v1/tenants/:id/mpesa-credentials after the new key goes live,
- * because ciphertext encrypted under one AES-256-GCM key cannot be decrypted
- * with a different key — it will throw, not silently return wrong data.
+ * (POST /v1/tenants/:id/app-credentials for the shared consumer key/secret,
+ * POST /v1/tenant-shortcodes for each shortcode's passkey) after the new key
+ * goes live, because ciphertext encrypted under one AES-256-GCM key cannot be
+ * decrypted with a different key — it will throw, not silently return wrong data.
  *
  * Usage:
  *   npx ts-node scripts/check-tenant-credentials.ts
@@ -22,16 +23,15 @@ async function main() {
     select: {
       id: true,
       name: true,
-      businessShortcode: true,
       status: true,
       mpesaConsumerKey: true,
       mpesaConsumerSecretEncrypted: true,
-      mpesaPasskeyEncrypted: true,
+      shortcodes: { select: { shortcode: true, mpesaPasskeyEncrypted: true } },
     },
   });
 
   const withCredentials = tenants.filter(
-    (t) => t.mpesaConsumerKey && t.mpesaConsumerSecretEncrypted && t.mpesaPasskeyEncrypted,
+    (t) => t.mpesaConsumerKey && t.mpesaConsumerSecretEncrypted && t.shortcodes.some((s) => s.mpesaPasskeyEncrypted),
   );
   const withoutCredentials = tenants.filter((t) => !t.mpesaConsumerKey);
 
@@ -46,12 +46,14 @@ async function main() {
 
   console.log("⚠️  These tenants have credentials saved and MUST re-submit them after the key fix deploys:\n");
   for (const t of withCredentials) {
-    console.log(`  - ${t.name} (id: ${t.id}, shortcode: ${t.businessShortcode}, status: ${t.status})`);
+    const shortcodes = t.shortcodes.map((s) => s.shortcode).join(", ") || "(none)";
+    console.log(`  - ${t.name} (id: ${t.id}, shortcodes: ${shortcodes}, status: ${t.status})`);
   }
   console.log(
     "\nNext step: notify these tenants (or their assigned admin) to re-call\n" +
-      "POST /v1/tenants/:id/mpesa-credentials with their real Daraja consumer\n" +
-      "secret + passkey once CREDENTIALS_ENCRYPTION_KEY is set correctly in production.\n",
+      "POST /v1/tenants/:id/app-credentials with their real Daraja consumer\n" +
+      "secret, and POST /v1/tenant-shortcodes with each shortcode's passkey,\n" +
+      "once CREDENTIALS_ENCRYPTION_KEY is set correctly in production.\n",
   );
 }
 

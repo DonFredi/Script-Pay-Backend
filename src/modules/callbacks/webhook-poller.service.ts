@@ -267,12 +267,16 @@ export class WebhookPollerService {
     const msisdn = payload?.MSISDN;
     const channel = payload?.TransactionType === "Buy Goods" ? "TILL" : "PAYBILL";
 
-    // Scoped to status: 'active' to match the partial unique index on
-    // businessShortcode (prisma/manual-sql/002_tenant_shortcode_unique_active.sql) —
-    // pending_kyc tenants may share Safaricom's sandbox shortcode while testing, so
-    // only an active tenant can be the unambiguous real target for a live payment.
-    const matches = await this.prisma.tenant.findMany({
-      where: { businessShortcode: businessShortCode, status: "active" },
+    // Scoped to the owning tenant's status: 'active' — the same guarantee
+    // tenants_business_shortcode_active_unique used to enforce directly on
+    // tenants.businessShortcode, now enforced by the triggers in
+    // manual-sql/003_tenant_shortcodes.sql instead, since the shortcode and the
+    // status it's conditioned on now live on two different tables. pending_kyc
+    // tenants may still share Safaricom's sandbox shortcode while testing, so only
+    // an active tenant can be the unambiguous real target for a live payment.
+    const matches = await this.prisma.tenantShortcode.findMany({
+      where: { shortcode: businessShortCode, tenant: { status: "active" } },
+      include: { tenant: true },
     });
 
     if (matches.length === 0) {
@@ -286,8 +290,8 @@ export class WebhookPollerService {
     }
 
     if (matches.length > 1) {
-      // Should be unreachable given the partial unique index — if this ever fires,
-      // something bypassed it (a manual DB edit, the index missing in this
+      // Should be unreachable given the uniqueness triggers — if this ever fires,
+      // something bypassed them (a manual DB edit, a trigger missing in this
       // environment). Refuse to guess which tenant a real customer payment belongs
       // to; fail loudly instead of silently misrouting money.
       this.logger.error(
@@ -296,18 +300,18 @@ export class WebhookPollerService {
       await this.auditLog.record({
         actorType: "system",
         action: "daraja.c2b_ambiguous_shortcode",
-        metadata: { businessShortCode, transId, matchedTenantIds: matches.map((t) => t.id) },
+        metadata: { businessShortCode, transId, matchedTenantIds: matches.map((m) => m.tenant.id) },
       });
       await this.alerts.send({
         title: "Ambiguous C2B shortcode match — payment not processed",
         detail: `${matches.length} active tenants share shortcode ${businessShortCode}. A real customer payment (${transId}) could not be safely routed.`,
         severity: "critical",
-        context: { businessShortCode, transId, matchedTenantIds: matches.map((t) => t.id) },
+        context: { businessShortCode, transId, matchedTenantIds: matches.map((m) => m.tenant.id) },
       });
       return;
     }
 
-    const tenant = matches[0];
+    const tenant = matches[0].tenant;
 
     const amountMinorUnits = Math.round(Number(amount) * 100);
 

@@ -93,6 +93,29 @@ export class DarajaClient {
     return process.env.MPESA_ENV === "production" ? "https://api.safaricom.co.ke" : "https://sandbox.safaricom.co.ke";
   }
 
+  /**
+   * Every Daraja call below expects a JSON body, but a request that never actually
+   * reaches Daraja's own application layer — blocked by Safaricom's API gateway
+   * (rate limiting, a locked initiator, an outage) — comes back as an HTML fault
+   * page instead. Calling response.json() directly on that throws a raw
+   * SyntaxError that bypasses every BadGatewayException below and reaches
+   * HttpExceptionFilter as an unhandled 500, telling the caller nothing about
+   * what actually happened. Reading as text first and parsing ourselves turns
+   * that into the same clean, logged BadGatewayException every other rejection
+   * here already produces.
+   */
+  private async parseDarajaJson(response: Response, context: string): Promise<any> {
+    const raw = await response.text();
+    try {
+      return JSON.parse(raw);
+    } catch {
+      this.logger.error(`Daraja ${context} returned a non-JSON response (status ${response.status}): ${raw.slice(0, 500)}`);
+      throw new BadGatewayException(
+        `Daraja's ${context} endpoint returned an unexpected response — the request may have been blocked before reaching Daraja (rate limiting, a locked initiator, or an outage)`,
+      );
+    }
+  }
+
   private async getAccessToken(creds: DarajaAuthCredentials): Promise<string> {
     const now = Date.now();
     const cached = this.tokenCache.get(creds.mpesaConsumerKey);
@@ -112,14 +135,32 @@ export class DarajaClient {
       // A BadGatewayException (not a plain Error) so this reaches the caller as a real
       // HTTP error the frontend can display, instead of being swallowed into the global
       // filter's generic "Internal server error" — see docs/decisions.md if this pattern
-      // gets extended further.
-      throw new BadGatewayException("Failed to authenticate with Daraja using this tenant's credentials");
+      // gets extended further. Safaricom's own reason is appended (truncated) rather than
+      // left server-log-only, same as every other rejection in this file — this exact
+      // message is what StkPushSection/B2cPayoutSection show the merchant via
+      // transaction.failureReason, so a bare "failed to authenticate" told them nothing
+      // about whether it was a wrong key, an expired app, or a rate limit.
+      throw new BadGatewayException(
+        `Failed to authenticate with Daraja using this tenant's credentials (Safaricom returned ${response.status}: ${body.slice(0, 300)})`,
+      );
     }
 
-    const data = (await response.json()) as { access_token: string; expires_in: string };
+    const data = (await this.parseDarajaJson(response, "OAuth token")) as { access_token: string; expires_in: string };
     const ttlMs = (Number(data.expires_in) - 60) * 1000;
     this.tokenCache.set(creds.mpesaConsumerKey, { token: data.access_token, expiresAt: now + ttlMs });
     return data.access_token;
+  }
+
+  /**
+   * Builds a Daraja-facing callback URL with the shared webhook secret attached as
+   * `?token=` — checked by DarajaWebhookSecretGuard on receipt. Daraja doesn't sign
+   * its payloads, so this is what lets the webhook controller reject a forged
+   * callback from anyone who discovers the bare path.
+   */
+  private buildWebhookUrl(path: string): string {
+    const base = process.env.MPESA_CALLBACK_BASE_URL;
+    const token = encodeURIComponent(process.env.DARAJA_WEBHOOK_SECRET ?? "");
+    return `${base}/v1/webhooks/daraja/${path}?token=${token}`;
   }
 
   private generatePassword(creds: TenantMpesaCredentials): { password: string; timestamp: string } {
@@ -134,7 +175,6 @@ export class DarajaClient {
   async initiateStkPush(creds: TenantMpesaCredentials, params: StkPushParams): Promise<StkPushResponse> {
     const accessToken = await this.getAccessToken(creds);
     const { password, timestamp } = this.generatePassword(creds);
-    const callbackBaseUrl = process.env.MPESA_CALLBACK_BASE_URL;
 
     const response = await fetch(`${this.baseUrl}/mpesa/stkpush/v1/processrequest`, {
       method: "POST",
@@ -148,13 +188,13 @@ export class DarajaClient {
         PartyA: params.msisdn,
         PartyB: creds.shortcode,
         PhoneNumber: params.msisdn,
-        CallBackURL: `${callbackBaseUrl}/v1/webhooks/daraja/stk-callback`,
+        CallBackURL: this.buildWebhookUrl("stk-callback"),
         AccountReference: params.accountReference,
         TransactionDesc: params.transactionDesc,
       }),
     });
 
-    const body = await response.json();
+    const body = await this.parseDarajaJson(response, "STK push");
     if (!response.ok || body.ResponseCode !== "0") {
       this.logger.error(`Daraja STK push rejected: ${JSON.stringify(body)}`);
       // Safaricom's own rejection reason (e.g. "Invalid TransactionType", "Invalid
@@ -189,7 +229,6 @@ export class DarajaClient {
    */
   async initiateB2C(creds: TenantPayoutCredentials, params: B2cParams): Promise<B2cResponse> {
     const accessToken = await this.getAccessToken(creds);
-    const callbackBaseUrl = process.env.MPESA_CALLBACK_BASE_URL;
 
     const response = await fetch(`${this.baseUrl}/mpesa/b2c/v3/paymentrequest`, {
       method: "POST",
@@ -206,13 +245,13 @@ export class DarajaClient {
         PartyA: creds.shortcode,
         PartyB: params.msisdn,
         Remarks: params.remarks,
-        QueueTimeOutURL: `${callbackBaseUrl}/v1/webhooks/daraja/b2c-timeout`,
-        ResultURL: `${callbackBaseUrl}/v1/webhooks/daraja/b2c-result`,
+        QueueTimeOutURL: this.buildWebhookUrl("b2c-timeout"),
+        ResultURL: this.buildWebhookUrl("b2c-result"),
         Occasion: params.occasion ?? "",
       }),
     });
 
-    const body = await response.json();
+    const body = await this.parseDarajaJson(response, "B2C payment");
     if (!response.ok || body.ResponseCode !== "0") {
       this.logger.error(`Daraja B2C request rejected: ${JSON.stringify(body)}`);
       // Same reasoning as initiateStkPush: Safaricom's rejection describes this
@@ -260,8 +299,7 @@ export class DarajaClient {
    */
   async registerC2bUrl(creds: C2bUrlRegistrationCredentials): Promise<void> {
     const accessToken = await this.getAccessToken(creds);
-    const callbackBaseUrl = process.env.MPESA_CALLBACK_BASE_URL;
-    const confirmationUrl = `${callbackBaseUrl}/v1/webhooks/daraja/c2b-confirmation`;
+    const confirmationUrl = this.buildWebhookUrl("c2b-confirmation");
 
     const response = await fetch(`${this.baseUrl}/mpesa/c2b/v2/registerurl`, {
       method: "POST",
@@ -274,7 +312,7 @@ export class DarajaClient {
       }),
     });
 
-    const body = await response.json();
+    const body = await this.parseDarajaJson(response, "C2B URL registration");
     if (!response.ok || body.ResponseCode !== "0") {
       this.logger.error(`Daraja C2B URL registration rejected: ${JSON.stringify(body)}`);
       throw new BadGatewayException(
@@ -301,7 +339,7 @@ export class DarajaClient {
       }),
     });
 
-    const body = await response.json();
+    const body = await this.parseDarajaJson(response, "STK push status query");
     return { resultCode: Number(body.ResultCode ?? -1), resultDesc: body.ResultDesc };
   }
 }

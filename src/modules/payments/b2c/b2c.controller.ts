@@ -1,4 +1,4 @@
-import { Body, Controller, Post, Req, UseGuards } from "@nestjs/common";
+import { Body, Controller, Headers, Post, Req, UseGuards } from "@nestjs/common";
 import type { Request } from "express";
 import { ApiKeyGuard } from "../../../common/guards/api-key.guard";
 import { TenantAwareThrottlerGuard } from "../../../common/guards/tenant-aware-throttler.guard";
@@ -34,12 +34,16 @@ export class B2cController {
   async initiate(
     @Body(new ZodValidationPipe(initiateB2cSchema)) body: InitiateB2cDto,
     @Req() request: Request & { tenantId: string; apiKeyId?: string },
+    // Standard REST idempotency-key convention, in addition to the body field — the
+    // usual way an external integration dedupes its own retried HTTP calls.
+    @Headers("idempotency-key") idempotencyKeyHeader?: string,
   ) {
     // tenantId comes from the guard, never the body — a caller must not be able to
     // name the account a payout is drawn from.
-    return this.b2cService.initiate(request.tenantId, body, {
-      type: "api_key",
-      id: request.apiKeyId ?? null,
-    });
+    return this.b2cService.initiate(
+      request.tenantId,
+      { ...body, idempotencyKey: body.idempotencyKey ?? idempotencyKeyHeader },
+      { type: "api_key", id: request.apiKeyId ?? null },
+    );
   }
 }

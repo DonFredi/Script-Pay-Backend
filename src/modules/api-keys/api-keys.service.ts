@@ -1,8 +1,9 @@
-import { Injectable } from "@nestjs/common";
+import { Injectable, Logger } from "@nestjs/common";
 import * as argon2 from "argon2";
 // import { customAlphabet } from "nanoid";
 import { PrismaService } from "../prisma/prisma.service";
 import { AuditLogService } from "../audit-log/audit-log.service";
+import { EmailService } from "../auth/email.service";
 import type { ApiKeyScope } from "@prisma/client";
 import { randomBytes } from "crypto";
 
@@ -14,9 +15,12 @@ const PEPPER = process.env.API_KEY_HASH_PEPPER ?? "";
 
 @Injectable()
 export class ApiKeysService {
+  private readonly logger = new Logger(ApiKeysService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly auditLog: AuditLogService,
+    private readonly emailService: EmailService,
   ) {}
 
   /**
@@ -43,7 +47,48 @@ export class ApiKeysService {
       metadata: { scopes, keyPrefix: record.keyPrefix }, // never log the raw key or hash
     });
 
+    await this.notifyKeyIssued(tenantId, actorId, rawKey, record.keyPrefix, scopes);
+
     return { id: record.id, rawKey, keyPrefix: record.keyPrefix, scopes: record.scopes };
+  }
+
+  /**
+   * Tenant admins get the raw key (same one-time-reveal channel as activation
+   * auto-provisioning); platform staff get a metadata-only notice — never the
+   * raw key, since they aren't the party it authenticates as. Best-effort:
+   * a lookup/delivery failure here must never fail the key creation itself,
+   * same reasoning as TenantsService.provisionApiKeyOnActivation.
+   */
+  private async notifyKeyIssued(
+    tenantId: string,
+    actorId: string,
+    rawKey: string,
+    keyPrefix: string,
+    scopes: ApiKeyScope[],
+  ) {
+    try {
+      const [tenant, actor, admins, staff] = await Promise.all([
+        this.prisma.tenant.findUnique({ where: { id: tenantId }, select: { name: true } }),
+        this.prisma.user.findUnique({ where: { id: actorId }, select: { email: true } }),
+        this.prisma.user.findMany({ where: { tenantId, role: "TENANT_ADMIN" }, select: { email: true } }),
+        this.prisma.user.findMany({ where: { role: "SUPER_ADMIN" }, select: { email: true } }),
+      ]);
+
+      await Promise.all([
+        ...admins.map((admin) => this.emailService.sendApiKeyRotatedEmail(admin.email, rawKey)),
+        ...staff.map((member) =>
+          this.emailService.sendApiKeyStaffNotice(
+            member.email,
+            tenant?.name ?? tenantId,
+            keyPrefix,
+            scopes,
+            actor?.email ?? actorId,
+          ),
+        ),
+      ]);
+    } catch (error) {
+      this.logger.error(`Failed to notify of API key issuance for tenant ${tenantId}`, error as Error);
+    }
   }
 
   /**

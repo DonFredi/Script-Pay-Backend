@@ -463,3 +463,86 @@ kind of guess this repo has already paid for once, so
 `DriftDetectorService.detectStuckPayouts` alerts a human exactly once per
 stuck payout instead. That is strictly better than the behaviour it replaced,
 which was to skip payouts silently and forever.
+
+## 19. Tenant removal is a status flag, not a hard delete
+
+**Problem**: There was no admin-facing way to remove a tenant at all —
+`PATCH /v1/tenants/:id/status` only accepted `active | suspended | pending_kyc`,
+and `suspended` is already self-service (a `TENANT_ADMIN` can toggle their own
+tenant into and out of it). A platform-initiated, harder-to-undo "remove this
+tenant" action needed a real path.
+
+**Rejected**: A hard `DELETE`. `Tenant` carries required FKs from
+`Transaction`, `LedgerEntry`, `ReconciliationRecord`, and
+`TenantWebhookDelivery` — cascading a delete through those would destroy
+financial and reconciliation history for a business that, by definition, has
+already moved real money. `AuditLog` is append-only by convention precisely
+because this platform treats its own history as something it cannot casually
+erase; a cascading tenant delete would contradict that on the very table
+(`Tenant`) everything else keys off. It would also collide with the Postgres
+RLS policies in `prisma/manual-sql/001_row_level_security.sql`, which assume
+tenant-scoped rows persist rather than disappear out from under a policy
+mid-query.
+
+**Chosen**: A fourth `status` value, `"removed"`, reusing the exact
+enforcement points `"suspended"` already has —
+`getMpesaCredentialsForPayment`/`Payout` block money movement in both
+directions for either status, and the inbound C2B path already scopes its
+shortcode lookup to `status: "active"`, so a removed tenant is excluded there
+for free. Unlike `suspended`, `"removed"` is platform-only in **both**
+directions: `TenantsService.updateStatus` forbids a `TENANT_ADMIN` from
+setting their own tenant to `removed` and from reinstating one already
+`removed` — only `SUPER_ADMIN` can do either. `status` is a plain Postgres
+`String` column rather than a DB enum, so adding this required no migration.
+Removed tenants stay visible via `GET /v1/tenants`/`GET /v1/tenants/:id`
+rather than being hidden, preserving audit visibility and avoiding an admin
+unknowingly re-onboarding a duplicate shortcode.
+
+## 20. One default shortcode per (tenant, type), enforced by unsetting the previous one in the same transaction
+
+**Problem**: A tenant can hold multiple `TenantShortcode` rows of the same
+`type` (e.g. two `PAYBILL` shortcodes), but
+`getMpesaCredentialsForPayment` picks one via `findFirst({ tenantId, type,
+isDefault: true })`. Nothing stopped two rows of the same type from both
+having `isDefault: true`, which makes that lookup pick whichever `findFirst`
+happens to return first — a real payment could start using different
+credentials than the merchant intended, silently.
+
+**Rejected**: A unique partial index (`@@unique([tenantId, type], where:
+isDefault: true)`-style constraint) enforced at the database level. Prisma
+doesn't support partial unique indexes, and a manual SQL constraint would need
+its own migration plus an `ON CONFLICT` story in `create`/`update` — more
+moving parts than the actual invariant needs, given there are only two write
+paths that ever set `isDefault: true`.
+
+**Chosen**: `TenantShortcodesService.create`/`update` unset any existing
+`{ tenantId, type, isDefault: true }` row before writing the new default,
+inside the same `withTenantContext` transaction as the create/update itself
+— so no query can ever observe two defaults of the same type, even
+momentarily. `update` additionally excludes the row being updated (`id: {
+not: shortcodeId }`) and falls back to the shortcode's existing `type` when
+the patch doesn't change it, since "make this one default" is the more common
+call than "make this one default and also change its type."
+
+## 21. Daraja responses parsed as text first, not `response.json()` directly
+
+**Problem**: Every `DarajaClient` method assumed a Daraja API response body is
+always JSON. A request that never reaches Daraja's own application layer —
+blocked by Safaricom's API gateway (rate limiting, a locked initiator, an
+outage) — comes back as an HTML fault page instead. `response.json()` throws
+a raw `SyntaxError` on that, which bypasses every `BadGatewayException` this
+file already raises for a genuine Daraja rejection and reaches
+`HttpExceptionFilter` as an unhandled 500 — the caller (and the merchant,
+via `transaction.failureReason`) learns nothing about what actually happened,
+and it doesn't get logged as a Daraja-specific failure either.
+
+**Chosen**: `parseDarajaJson` reads the response as text first and parses it
+itself, logging the raw (truncated) body and raising the same
+`BadGatewayException` shape every other rejection in this file already
+produces when parsing fails. Applied to every Daraja call
+(`getAccessToken`, `initiateStkPush`, `initiateB2c`, C2B URL registration,
+STK status query). At the same time, `B2cService`/`StkPushService` now store
+the real Daraja rejection message (or this gateway message) as
+`transaction.failureReason` instead of a generic `"daraja_initiation_error"`
+bucket label — the frontend polls onto that exact field to show the merchant
+what went wrong, and the bucket label was never actionable for them.

@@ -12,6 +12,7 @@ const TENANT_ID = "11111111-2222-3333-4444-555555555555";
 const API_KEY_ACTOR = { type: "api_key" as const, id: "key-1" };
 
 const dto = {
+  shortcodeId: "66666666-7777-8888-9999-000000000000",
   msisdn: "254712345678",
   amountMinorUnits: 500_00,
   remarks: "Refund for order 42",
@@ -198,12 +199,12 @@ describe("B2cService", () => {
         ]);
       });
 
-      it("marks the payout FAILED", async () => {
+      it("marks the payout FAILED with Daraja's own rejection reason", async () => {
         await expect(service.initiate(TENANT_ID, dto, API_KEY_ACTOR)).rejects.toThrow();
 
         expect(prisma.transaction.update).toHaveBeenCalledWith(
           expect.objectContaining({
-            data: { status: "FAILED", failureReason: "daraja_initiation_error" },
+            data: { status: "FAILED", failureReason: "Invalid Initiator Information" },
           }),
         );
       });

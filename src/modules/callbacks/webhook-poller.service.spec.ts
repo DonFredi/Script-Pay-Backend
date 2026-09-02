@@ -36,7 +36,7 @@ describe("WebhookPollerService — C2B shortcode resolution", () => {
           provide: PrismaPrivilegedService,
           useValue: {
             webhookEvent: { findMany: jest.fn(), update: jest.fn() },
-            tenant: { findMany: jest.fn() },
+            tenantShortcode: { findMany: jest.fn() },
             transaction: { findUnique: jest.fn() },
           },
         },
@@ -55,13 +55,16 @@ describe("WebhookPollerService — C2B shortcode resolution", () => {
 
   it("settles against the single active tenant matching the shortcode", async () => {
     jest.spyOn(prisma.webhookEvent, "findMany").mockResolvedValueOnce([c2bEvent()] as any);
-    jest.spyOn(prisma.tenant, "findMany").mockResolvedValueOnce([{ id: "tenant-active" }] as any);
+    jest
+      .spyOn(prisma.tenantShortcode, "findMany")
+      .mockResolvedValueOnce([{ tenant: { id: "tenant-active" } }] as any);
     jest.spyOn(stateMachine, "recordInboundSettlement").mockResolvedValueOnce({ id: "tx-1" } as any);
 
     await service.pollUnprocessedEvents();
 
-    expect(prisma.tenant.findMany).toHaveBeenCalledWith({
-      where: { businessShortcode: "174379", status: "active" },
+    expect(prisma.tenantShortcode.findMany).toHaveBeenCalledWith({
+      where: { shortcode: "174379", tenant: { status: "active" } },
+      include: { tenant: true },
     });
     expect(stateMachine.recordInboundSettlement).toHaveBeenCalledWith(
       expect.objectContaining({ tenantId: "tenant-active" }),
@@ -71,7 +74,7 @@ describe("WebhookPollerService — C2B shortcode resolution", () => {
 
   it("ignores a shortcode with no active tenant (e.g. two pending_kyc tenants sharing the sandbox shortcode)", async () => {
     jest.spyOn(prisma.webhookEvent, "findMany").mockResolvedValueOnce([c2bEvent()] as any);
-    jest.spyOn(prisma.tenant, "findMany").mockResolvedValueOnce([]);
+    jest.spyOn(prisma.tenantShortcode, "findMany").mockResolvedValueOnce([]);
 
     await service.pollUnprocessedEvents();
 
@@ -82,8 +85,8 @@ describe("WebhookPollerService — C2B shortcode resolution", () => {
   it("refuses to guess and alerts critically when a shortcode somehow matches more than one active tenant", async () => {
     jest.spyOn(prisma.webhookEvent, "findMany").mockResolvedValueOnce([c2bEvent()] as any);
     jest
-      .spyOn(prisma.tenant, "findMany")
-      .mockResolvedValueOnce([{ id: "tenant-a" }, { id: "tenant-b" }] as any);
+      .spyOn(prisma.tenantShortcode, "findMany")
+      .mockResolvedValueOnce([{ tenant: { id: "tenant-a" } }, { tenant: { id: "tenant-b" } }] as any);
 
     await service.pollUnprocessedEvents();
 
@@ -139,7 +142,7 @@ describe("WebhookPollerService — B2C payout callbacks", () => {
           provide: PrismaPrivilegedService,
           useValue: {
             webhookEvent: { findMany: jest.fn(), update: jest.fn() },
-            tenant: { findMany: jest.fn() },
+            tenantShortcode: { findMany: jest.fn() },
             transaction: { findUnique: jest.fn() },
           },
         },

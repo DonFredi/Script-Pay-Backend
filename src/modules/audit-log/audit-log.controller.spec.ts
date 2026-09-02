@@ -7,7 +7,7 @@ describe("AuditLogController", () => {
   let auditLog: AuditLogService;
 
   beforeEach(() => {
-    auditLog = { list: jest.fn() } as any;
+    auditLog = { list: jest.fn(), findOne: jest.fn() } as any;
     controller = new AuditLogController(auditLog);
   });
 
@@ -27,5 +27,14 @@ describe("AuditLogController", () => {
     await controller.list(actor);
 
     expect(auditLog.list).toHaveBeenCalledWith({ tenantId: undefined, action: undefined }, actor);
+  });
+
+  it("passes the id and caller through to AuditLogService.findOne unchanged", async () => {
+    const actor = { id: "u-1", role: "SUPER_ADMIN", tenantId: null } as AuthenticatedUser;
+    jest.spyOn(auditLog, "findOne").mockResolvedValueOnce({ id: "log-1" } as any);
+
+    await controller.findOne("log-1", actor);
+
+    expect(auditLog.findOne).toHaveBeenCalledWith("log-1", actor);
   });
 });

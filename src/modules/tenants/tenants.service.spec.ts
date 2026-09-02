@@ -11,7 +11,7 @@ import { DarajaClient } from "../../infrastructure/daraja/daraja.client";
 import type { AuthenticatedUser } from "../../common/decorators/current-user.decorator";
 
 function uniqueConstraintError(): Prisma.PrismaClientKnownRequestError {
-  return new Prisma.PrismaClientKnownRequestError("Unique constraint failed on the fields: (`businessShortcode`)", {
+  return new Prisma.PrismaClientKnownRequestError("Unique constraint failed", {
     code: "P2002",
     clientVersion: "test",
   });
@@ -42,12 +42,23 @@ describe("TenantsService", () => {
         findUniqueOrThrow: jest.fn().mockResolvedValue({ status: "pending_kyc" }),
         findMany: jest.fn(),
       },
-      user: { update: jest.fn(), updateMany: jest.fn(), findMany: jest.fn() },
+      tenantShortcode: {
+        create: jest.fn().mockResolvedValue({ id: "shortcode-1" }),
+        findFirst: jest.fn(),
+      },
+      // Defaulted empty so tests that don't care about webhook/API-key notification
+      // content (most of them) don't have to stub every lookup individually — only
+      // the notification-focused tests below override this per-call.
+      user: { update: jest.fn(), updateMany: jest.fn(), findMany: jest.fn().mockResolvedValue([]) },
     };
     // onboardSelf runs tenant.create + user.updateMany inside $transaction — mirror
     // that by running the callback against this same mock instead of a real transaction,
     // so tests can drive tenant.create/user.updateMany exactly as before.
     prismaMock.$transaction = jest.fn((fn: (tx: unknown) => unknown) => fn(prismaMock));
+    // withTenantContext is used for every TenantShortcode read/write (RLS-scoped) —
+    // mirrors the real PrismaService signature but runs the callback against this
+    // same mock instead of a real transaction.
+    prismaMock.withTenantContext = jest.fn((_tenantId: string, fn: (tx: unknown) => unknown) => fn(prismaMock));
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -56,7 +67,14 @@ describe("TenantsService", () => {
         { provide: AuditLogService, useValue: { record: jest.fn() } },
         { provide: CredentialsEncryptionService, useValue: { encrypt: jest.fn(), decrypt: jest.fn() } },
         { provide: ApiKeysService, useValue: { provisionDefaultKeyIfNeeded: jest.fn() } },
-        { provide: EmailService, useValue: { sendApiKeyProvisionedEmail: jest.fn() } },
+        {
+          provide: EmailService,
+          useValue: {
+            sendApiKeyProvisionedEmail: jest.fn(),
+            sendWebhookSecretRotatedEmail: jest.fn(),
+            sendWebhookSecretStaffNotice: jest.fn(),
+          },
+        },
         {
           provide: DarajaClient,
           useValue: {
@@ -76,12 +94,12 @@ describe("TenantsService", () => {
     daraja = module.get(DarajaClient);
   });
 
-  describe("setMpesaCredentials", () => {
-    const dto = { businessShortcode: "174379", consumerKey: "ck", consumerSecret: "cs", passkey: "pk" };
+  describe("setAppCredentials", () => {
+    const dto = { consumerKey: "ck", consumerSecret: "cs" };
 
     it("forbids a TENANT_ADMIN from configuring another tenant's credentials", async () => {
       await expect(
-        service.setMpesaCredentials("other-tenant", dto, user({ tenantId: "tenant-1" })),
+        service.setAppCredentials("other-tenant", dto, user({ tenantId: "tenant-1" })),
       ).rejects.toThrow(ForbiddenException);
       expect(prisma.tenant.update).not.toHaveBeenCalled();
     });
@@ -90,67 +108,31 @@ describe("TenantsService", () => {
       jest.spyOn(encryption, "encrypt").mockReturnValue("enc-value");
       jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({} as any);
 
-      await service.setMpesaCredentials("other-tenant", dto, user({ role: "SUPER_ADMIN", tenantId: null }));
+      await service.setAppCredentials("other-tenant", dto, user({ role: "SUPER_ADMIN", tenantId: null }));
 
       expect(prisma.tenant.update).toHaveBeenCalled();
     });
 
-    it("encrypts consumerSecret and passkey before persisting, and never returns them", async () => {
+    it("encrypts consumerSecret before persisting, and never returns it", async () => {
       jest.spyOn(encryption, "encrypt").mockImplementation((v) => `encrypted(${v})`);
       jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({} as any);
 
-      const result = await service.setMpesaCredentials("tenant-1", dto, user());
+      const result = await service.setAppCredentials("tenant-1", dto, user());
 
       expect(prisma.tenant.update).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: expect.objectContaining({
-            mpesaConsumerSecretEncrypted: "encrypted(cs)",
-            mpesaPasskeyEncrypted: "encrypted(pk)",
-          }),
+          data: expect.objectContaining({ mpesaConsumerSecretEncrypted: "encrypted(cs)" }),
         }),
       );
-      expect(result).toEqual({ configured: true, c2bUrlRegistered: true });
+      expect(result).toEqual({ configured: true });
       expect(JSON.stringify(result)).not.toContain("cs");
-      expect(JSON.stringify(result)).not.toContain("pk");
     });
 
     it("verifies the consumer key/secret against Daraja before persisting anything", async () => {
       jest.spyOn(daraja, "verifyCredentials").mockRejectedValueOnce(new Error("bad credentials"));
 
-      await expect(service.setMpesaCredentials("tenant-1", dto, user())).rejects.toThrow("bad credentials");
+      await expect(service.setAppCredentials("tenant-1", dto, user())).rejects.toThrow("bad credentials");
       expect(prisma.tenant.update).not.toHaveBeenCalled();
-    });
-
-    it("auto-registers the C2B confirmation URL for the shortcode after saving", async () => {
-      jest.spyOn(encryption, "encrypt").mockReturnValue("enc-value");
-      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({} as any);
-
-      await service.setMpesaCredentials("tenant-1", dto, user());
-
-      expect(daraja.registerC2bUrl).toHaveBeenCalledWith({
-        mpesaConsumerKey: "ck",
-        mpesaConsumerSecretEncrypted: "cs",
-        shortcode: "174379",
-      });
-    });
-
-    it("saves credentials successfully even when C2B URL registration fails, and reports it in the result", async () => {
-      jest.spyOn(encryption, "encrypt").mockReturnValue("enc-value");
-      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({} as any);
-      jest.spyOn(daraja, "registerC2bUrl").mockRejectedValueOnce(new Error("Daraja rejected C2B URL registration"));
-
-      const result = await service.setMpesaCredentials("tenant-1", dto, user());
-
-      expect(result).toEqual({ configured: true, c2bUrlRegistered: false });
-      expect(auditLog.record).toHaveBeenCalledWith(
-        expect.objectContaining({ action: "daraja.c2b_url_registration_failed" }),
-      );
-    });
-
-    it("turns a shortcode collision with another active tenant into a clear 409, not a raw DB error", async () => {
-      jest.spyOn(prisma.tenant, "update").mockRejectedValueOnce(uniqueConstraintError());
-
-      await expect(service.setMpesaCredentials("tenant-1", dto, user())).rejects.toThrow(ConflictException);
     });
   });
 
@@ -188,31 +170,83 @@ describe("TenantsService", () => {
         }),
       );
     });
+
+    it("emails the raw secret to every TENANT_ADMIN and a metadata-only notice to every SUPER_ADMIN", async () => {
+      jest.spyOn(encryption, "encrypt").mockReturnValue("enc-value");
+      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({} as any);
+      jest.spyOn(prisma.tenant, "findUnique").mockResolvedValueOnce({ name: "ScriptTagg" } as any);
+      jest
+        .spyOn(prisma.user, "findMany")
+        .mockResolvedValueOnce([{ email: "admin@scripttagg.test" }] as any) // TENANT_ADMIN
+        .mockResolvedValueOnce([{ email: "staff@scriptpay.test" }] as any); // SUPER_ADMIN
+
+      const result = await service.configureWebhook(
+        "tenant-1",
+        "https://example.com/webhooks/scriptpay",
+        "key-1",
+      );
+
+      expect(emailService.sendWebhookSecretRotatedEmail).toHaveBeenCalledWith(
+        "admin@scripttagg.test",
+        result.webhookSecret,
+        "https://example.com/webhooks/scriptpay",
+      );
+      expect(emailService.sendWebhookSecretStaffNotice).toHaveBeenCalledWith(
+        "staff@scriptpay.test",
+        "ScriptTagg",
+        "https://example.com/webhooks/scriptpay",
+      );
+      const staffCallArgs = (emailService.sendWebhookSecretStaffNotice as jest.Mock).mock.calls[0];
+      expect(JSON.stringify(staffCallArgs)).not.toContain(result.webhookSecret);
+    });
+
+    it("does not let a notification failure surface as a webhook-configuration failure", async () => {
+      jest.spyOn(encryption, "encrypt").mockReturnValue("enc-value");
+      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({} as any);
+      jest.spyOn(prisma.user, "findMany").mockRejectedValueOnce(new Error("db down"));
+
+      await expect(
+        service.configureWebhook("tenant-1", "https://example.com/webhooks/scriptpay", "key-1"),
+      ).resolves.toEqual(expect.objectContaining({ webhookUrl: "https://example.com/webhooks/scriptpay" }));
+    });
   });
 
   describe("getMpesaCredentialsForPayment", () => {
-    it("throws when credentials are not yet configured", async () => {
+    function mockTenant(overrides: Record<string, unknown> = {}) {
       jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({
-        businessShortcode: "174379",
-        mpesaConsumerKey: null,
-        mpesaConsumerSecretEncrypted: null,
-        mpesaPasskeyEncrypted: null,
+        status: "active",
+        mpesaConsumerKey: "ck",
+        mpesaConsumerSecretEncrypted: "enc-cs",
+        ...overrides,
       } as any);
+    }
+
+    it("throws when app credentials are not yet configured", async () => {
+      mockTenant({ mpesaConsumerKey: null, mpesaConsumerSecretEncrypted: null });
 
       await expect(service.getMpesaCredentialsForPayment("tenant-1")).rejects.toThrow(ForbiddenException);
     });
 
-    it("decrypts and returns credentials when configured", async () => {
-      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({
-        businessShortcode: "174379",
-        mpesaConsumerKey: "ck",
-        mpesaConsumerSecretEncrypted: "enc-cs",
+    it("throws when the tenant has no default shortcode of the requested type", async () => {
+      mockTenant();
+      jest.spyOn(prisma.tenantShortcode, "findFirst").mockResolvedValueOnce(null);
+
+      await expect(service.getMpesaCredentialsForPayment("tenant-1", "PAYBILL")).rejects.toThrow(ForbiddenException);
+    });
+
+    it("looks up the default shortcode of the given type, decrypts, and returns credentials", async () => {
+      mockTenant();
+      jest.spyOn(prisma.tenantShortcode, "findFirst").mockResolvedValueOnce({
+        shortcode: "174379",
         mpesaPasskeyEncrypted: "enc-pk",
       } as any);
       jest.spyOn(encryption, "decrypt").mockImplementation((v) => v.replace("enc-", "plain-"));
 
-      const result = await service.getMpesaCredentialsForPayment("tenant-1");
+      const result = await service.getMpesaCredentialsForPayment("tenant-1", "PAYBILL");
 
+      expect(prisma.tenantShortcode.findFirst).toHaveBeenCalledWith({
+        where: { tenantId: "tenant-1", type: "PAYBILL", isDefault: true },
+      });
       expect(result).toEqual({
         shortcode: "174379",
         mpesaConsumerKey: "ck",
@@ -221,35 +255,105 @@ describe("TenantsService", () => {
       });
     });
 
+    it("defaults to PAYBILL when no type is given", async () => {
+      mockTenant();
+      jest
+        .spyOn(prisma.tenantShortcode, "findFirst")
+        .mockResolvedValueOnce({ shortcode: "174379", mpesaPasskeyEncrypted: "enc-pk" } as any);
+
+      await service.getMpesaCredentialsForPayment("tenant-1");
+
+      expect(prisma.tenantShortcode.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ type: "PAYBILL" }) }),
+      );
+    });
+
     it("refuses to hand out credentials for a suspended tenant, even with everything configured", async () => {
       // Suspending a tenant does not revoke their API keys, so without this check
       // nothing between ApiKeyGuard and Daraja stopped a suspended merchant from
       // continuing to charge customers.
-      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({
-        status: "suspended",
-        businessShortcode: "174379",
-        mpesaConsumerKey: "ck",
-        mpesaConsumerSecretEncrypted: "enc-cs",
-        mpesaPasskeyEncrypted: "enc-pk",
-      } as any);
+      mockTenant({ status: "suspended" });
 
       await expect(service.getMpesaCredentialsForPayment("tenant-1")).rejects.toThrow(ForbiddenException);
-      expect(encryption.decrypt).not.toHaveBeenCalled();
+      expect(prisma.tenantShortcode.findFirst).not.toHaveBeenCalled();
+    });
+
+    it("refuses to hand out credentials for a removed tenant, same as a suspended one", async () => {
+      mockTenant({ status: "removed" });
+
+      await expect(service.getMpesaCredentialsForPayment("tenant-1")).rejects.toThrow(ForbiddenException);
+      expect(prisma.tenantShortcode.findFirst).not.toHaveBeenCalled();
     });
 
     it("still allows a pending_kyc tenant to transact, so they can test against the sandbox", async () => {
-      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({
-        status: "pending_kyc",
-        businessShortcode: "174379",
-        mpesaConsumerKey: "ck",
-        mpesaConsumerSecretEncrypted: "enc-cs",
-        mpesaPasskeyEncrypted: "enc-pk",
-      } as any);
+      mockTenant({ status: "pending_kyc" });
+      jest
+        .spyOn(prisma.tenantShortcode, "findFirst")
+        .mockResolvedValueOnce({ shortcode: "174379", mpesaPasskeyEncrypted: "enc-pk" } as any);
       jest.spyOn(encryption, "decrypt").mockImplementation((v) => v.replace("enc-", "plain-"));
 
       await expect(service.getMpesaCredentialsForPayment("tenant-1")).resolves.toMatchObject({
         mpesaConsumerKey: "ck",
       });
+    });
+  });
+
+  describe("getMpesaCredentialsForPayout", () => {
+    function mockTenant(overrides: Record<string, unknown> = {}) {
+      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({
+        status: "active",
+        mpesaConsumerKey: "ck",
+        mpesaConsumerSecretEncrypted: "enc-cs",
+        ...overrides,
+      } as any);
+    }
+
+    it("throws NotFoundException when the shortcode doesn't belong to this tenant or isn't type B2C", async () => {
+      mockTenant();
+      jest.spyOn(prisma.tenantShortcode, "findFirst").mockResolvedValueOnce(null);
+
+      await expect(service.getMpesaCredentialsForPayout("tenant-1", "sc-1")).rejects.toThrow(NotFoundException);
+    });
+
+    it("throws when the B2C shortcode has no initiator/security credential configured", async () => {
+      mockTenant();
+      jest.spyOn(prisma.tenantShortcode, "findFirst").mockResolvedValueOnce({
+        shortcode: "600000",
+        mpesaInitiatorName: null,
+        mpesaSecurityCredentialEncrypted: null,
+      } as any);
+
+      await expect(service.getMpesaCredentialsForPayout("tenant-1", "sc-1")).rejects.toThrow(ForbiddenException);
+    });
+
+    it("decrypts and returns payout credentials for the named B2C shortcode", async () => {
+      mockTenant();
+      jest.spyOn(prisma.tenantShortcode, "findFirst").mockResolvedValueOnce({
+        shortcode: "600000",
+        mpesaInitiatorName: "testapi",
+        mpesaSecurityCredentialEncrypted: "enc-sec",
+      } as any);
+      jest.spyOn(encryption, "decrypt").mockImplementation((v) => v.replace("enc-", "plain-"));
+
+      const result = await service.getMpesaCredentialsForPayout("tenant-1", "sc-1");
+
+      expect(prisma.tenantShortcode.findFirst).toHaveBeenCalledWith({
+        where: { id: "sc-1", tenantId: "tenant-1", type: "B2C" },
+      });
+      expect(result).toEqual({
+        shortcode: "600000",
+        mpesaConsumerKey: "ck",
+        mpesaConsumerSecretEncrypted: "plain-cs",
+        initiatorName: "testapi",
+        securityCredential: "plain-sec",
+      });
+    });
+
+    it("refuses to hand out payout credentials for a suspended tenant", async () => {
+      mockTenant({ status: "suspended" });
+
+      await expect(service.getMpesaCredentialsForPayout("tenant-1", "sc-1")).rejects.toThrow(ForbiddenException);
+      expect(prisma.tenantShortcode.findFirst).not.toHaveBeenCalled();
     });
   });
 
@@ -283,6 +387,23 @@ describe("TenantsService", () => {
     });
   });
 
+  describe("create", () => {
+    const dto = { name: "Acme", businessShortcode: "174379" };
+
+    it("creates the tenant and an initial default PAYBILL shortcode", async () => {
+      jest.spyOn(prisma.tenant, "create").mockResolvedValueOnce({ id: "tenant-new", name: "Acme" } as any);
+
+      const result = await service.create(dto, user({ role: "SUPER_ADMIN", tenantId: null }));
+
+      expect(prisma.tenant.create).toHaveBeenCalledWith({ data: { name: "Acme", status: "pending_kyc" } });
+      expect(prisma.withTenantContext).toHaveBeenCalledWith("tenant-new", expect.any(Function));
+      expect(prisma.tenantShortcode.create).toHaveBeenCalledWith({
+        data: { tenantId: "tenant-new", type: "PAYBILL", shortcode: "174379", isDefault: true },
+      });
+      expect(result.id).toBe("tenant-new");
+    });
+  });
+
   describe("onboardSelf", () => {
     const dto = { name: "Acme", businessShortcode: "174379" };
 
@@ -297,8 +418,8 @@ describe("TenantsService", () => {
       ).rejects.toThrow(ForbiddenException);
     });
 
-    it("creates the tenant and attaches it to the caller's own account", async () => {
-      jest.spyOn(prisma.tenant, "create").mockResolvedValueOnce({ id: "tenant-new", ...dto } as any);
+    it("creates the tenant, attaches it to the caller's own account, and creates the initial shortcode", async () => {
+      jest.spyOn(prisma.tenant, "create").mockResolvedValueOnce({ id: "tenant-new", name: "Acme" } as any);
       jest.spyOn(prisma.user, "updateMany").mockResolvedValueOnce({ count: 1 });
 
       const result = await service.onboardSelf(dto, user({ tenantId: null, role: "TENANT_ADMIN" }));
@@ -306,6 +427,9 @@ describe("TenantsService", () => {
       expect(prisma.user.updateMany).toHaveBeenCalledWith({
         where: { id: "u-1", tenantId: null },
         data: { tenantId: "tenant-new" },
+      });
+      expect(prisma.tenantShortcode.create).toHaveBeenCalledWith({
+        data: { tenantId: "tenant-new", type: "PAYBILL", shortcode: "174379", isDefault: true },
       });
       expect(auditLog.record).toHaveBeenCalledWith(expect.objectContaining({ action: "tenant.onboarded_self" }));
       expect(result.id).toBe("tenant-new");
@@ -316,7 +440,7 @@ describe("TenantsService", () => {
       // the forbidden-check above — this simulates the loser of that race: by the time
       // its user.updateMany runs, the winner has already claimed the account, so the
       // conditional WHERE tenantId: null matches nothing.
-      jest.spyOn(prisma.tenant, "create").mockResolvedValueOnce({ id: "tenant-orphan", ...dto } as any);
+      jest.spyOn(prisma.tenant, "create").mockResolvedValueOnce({ id: "tenant-orphan", name: "Acme" } as any);
       jest.spyOn(prisma.user, "updateMany").mockResolvedValueOnce({ count: 0 });
 
       await expect(service.onboardSelf(dto, user({ tenantId: null, role: "TENANT_ADMIN" }))).rejects.toThrow(
@@ -326,6 +450,7 @@ describe("TenantsService", () => {
       // Both writes happened inside the same $transaction — in a real database this
       // throw rolls the tenant.create back with it, rather than leaving it orphaned.
       expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(prisma.tenantShortcode.create).not.toHaveBeenCalled();
       expect(auditLog.record).not.toHaveBeenCalled();
     });
   });
@@ -365,11 +490,56 @@ describe("TenantsService", () => {
     });
 
     it("turns a shortcode collision into a clear 409 when activating a tenant onto an already-claimed shortcode", async () => {
+      // In a real database this comes from the tenants_activation_shortcode_uniqueness
+      // trigger (manual-sql/003_tenant_shortcodes.sql), surfaced by Prisma as the same
+      // P2002 a native unique index would raise.
       jest.spyOn(prisma.tenant, "update").mockRejectedValueOnce(uniqueConstraintError());
 
       await expect(
         service.updateStatus("tenant-1", { status: "active" }, user({ role: "SUPER_ADMIN", tenantId: null })),
       ).rejects.toThrow(ConflictException);
+    });
+
+    it("lets SUPER_ADMIN remove a tenant", async () => {
+      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({ id: "tenant-1", status: "removed" } as any);
+
+      const result = await service.updateStatus(
+        "tenant-1",
+        { status: "removed" },
+        user({ role: "SUPER_ADMIN", tenantId: null }),
+      );
+
+      expect(result.status).toBe("removed");
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: "tenant.status_changed", metadata: { newStatus: "removed" } }),
+      );
+    });
+
+    it("forbids a TENANT_ADMIN from removing their own tenant", async () => {
+      await expect(
+        service.updateStatus("tenant-1", { status: "removed" }, user({ tenantId: "tenant-1" })),
+      ).rejects.toThrow("Only platform staff can remove or reinstate a tenant");
+    });
+
+    it("forbids a TENANT_ADMIN from reinstating their own tenant once removed", async () => {
+      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({ status: "removed" } as any);
+
+      await expect(
+        service.updateStatus("tenant-1", { status: "active" }, user({ tenantId: "tenant-1" })),
+      ).rejects.toThrow("Only platform staff can remove or reinstate a tenant");
+    });
+
+    it("lets SUPER_ADMIN reinstate a removed tenant back to active", async () => {
+      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({ status: "removed" } as any);
+      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({ id: "tenant-1", status: "active" } as any);
+
+      const result = await service.updateStatus(
+        "tenant-1",
+        { status: "active" },
+        user({ role: "SUPER_ADMIN", tenantId: null }),
+      );
+
+      expect(result.status).toBe("active");
     });
   });
 
