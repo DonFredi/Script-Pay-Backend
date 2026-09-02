@@ -132,7 +132,37 @@ export class TenantsService {
       metadata: { webhookUrl },
     });
 
+    await this.notifyWebhookSecretRotated(tenantId, webhookUrl, webhookSecret);
+
     return { webhookUrl, webhookSecret };
+  }
+
+  /**
+   * Mirrors provisionApiKeyOnActivation's notification pattern: tenant admins
+   * get the raw secret (this endpoint is the only place a human on the tenant
+   * side ever sees it — the caller here is an API key, not a dashboard user),
+   * platform staff get a metadata-only notice. Best-effort — never fails the
+   * webhook configuration itself.
+   */
+  private async notifyWebhookSecretRotated(tenantId: string, webhookUrl: string, webhookSecret: string) {
+    try {
+      const [tenant, admins, staff] = await Promise.all([
+        this.prisma.tenant.findUnique({ where: { id: tenantId }, select: { name: true } }),
+        this.prisma.user.findMany({ where: { tenantId, role: "TENANT_ADMIN" }, select: { email: true } }),
+        this.prisma.user.findMany({ where: { role: "SUPER_ADMIN" }, select: { email: true } }),
+      ]);
+
+      await Promise.all([
+        ...admins.map((admin) =>
+          this.emailService.sendWebhookSecretRotatedEmail(admin.email, webhookSecret, webhookUrl),
+        ),
+        ...staff.map((member) =>
+          this.emailService.sendWebhookSecretStaffNotice(member.email, tenant?.name ?? tenantId, webhookUrl),
+        ),
+      ]);
+    } catch (error) {
+      this.logger.error(`Failed to notify tenant ${tenantId} of webhook secret rotation`, error as Error);
+    }
   }
 
   /**

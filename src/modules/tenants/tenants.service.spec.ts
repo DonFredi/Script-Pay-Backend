@@ -46,7 +46,10 @@ describe("TenantsService", () => {
         create: jest.fn().mockResolvedValue({ id: "shortcode-1" }),
         findFirst: jest.fn(),
       },
-      user: { update: jest.fn(), updateMany: jest.fn(), findMany: jest.fn() },
+      // Defaulted empty so tests that don't care about webhook/API-key notification
+      // content (most of them) don't have to stub every lookup individually — only
+      // the notification-focused tests below override this per-call.
+      user: { update: jest.fn(), updateMany: jest.fn(), findMany: jest.fn().mockResolvedValue([]) },
     };
     // onboardSelf runs tenant.create + user.updateMany inside $transaction — mirror
     // that by running the callback against this same mock instead of a real transaction,
@@ -64,7 +67,14 @@ describe("TenantsService", () => {
         { provide: AuditLogService, useValue: { record: jest.fn() } },
         { provide: CredentialsEncryptionService, useValue: { encrypt: jest.fn(), decrypt: jest.fn() } },
         { provide: ApiKeysService, useValue: { provisionDefaultKeyIfNeeded: jest.fn() } },
-        { provide: EmailService, useValue: { sendApiKeyProvisionedEmail: jest.fn() } },
+        {
+          provide: EmailService,
+          useValue: {
+            sendApiKeyProvisionedEmail: jest.fn(),
+            sendWebhookSecretRotatedEmail: jest.fn(),
+            sendWebhookSecretStaffNotice: jest.fn(),
+          },
+        },
         {
           provide: DarajaClient,
           useValue: {
@@ -159,6 +169,45 @@ describe("TenantsService", () => {
           action: "tenant.webhook_configured",
         }),
       );
+    });
+
+    it("emails the raw secret to every TENANT_ADMIN and a metadata-only notice to every SUPER_ADMIN", async () => {
+      jest.spyOn(encryption, "encrypt").mockReturnValue("enc-value");
+      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({} as any);
+      jest.spyOn(prisma.tenant, "findUnique").mockResolvedValueOnce({ name: "ScriptTagg" } as any);
+      jest
+        .spyOn(prisma.user, "findMany")
+        .mockResolvedValueOnce([{ email: "admin@scripttagg.test" }] as any) // TENANT_ADMIN
+        .mockResolvedValueOnce([{ email: "staff@scriptpay.test" }] as any); // SUPER_ADMIN
+
+      const result = await service.configureWebhook(
+        "tenant-1",
+        "https://example.com/webhooks/scriptpay",
+        "key-1",
+      );
+
+      expect(emailService.sendWebhookSecretRotatedEmail).toHaveBeenCalledWith(
+        "admin@scripttagg.test",
+        result.webhookSecret,
+        "https://example.com/webhooks/scriptpay",
+      );
+      expect(emailService.sendWebhookSecretStaffNotice).toHaveBeenCalledWith(
+        "staff@scriptpay.test",
+        "ScriptTagg",
+        "https://example.com/webhooks/scriptpay",
+      );
+      const staffCallArgs = (emailService.sendWebhookSecretStaffNotice as jest.Mock).mock.calls[0];
+      expect(JSON.stringify(staffCallArgs)).not.toContain(result.webhookSecret);
+    });
+
+    it("does not let a notification failure surface as a webhook-configuration failure", async () => {
+      jest.spyOn(encryption, "encrypt").mockReturnValue("enc-value");
+      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({} as any);
+      jest.spyOn(prisma.user, "findMany").mockRejectedValueOnce(new Error("db down"));
+
+      await expect(
+        service.configureWebhook("tenant-1", "https://example.com/webhooks/scriptpay", "key-1"),
+      ).resolves.toEqual(expect.objectContaining({ webhookUrl: "https://example.com/webhooks/scriptpay" }));
     });
   });
 

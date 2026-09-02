@@ -2,15 +2,25 @@ import { Test, TestingModule } from "@nestjs/testing";
 import { ApiKeysService } from "./api-keys.service";
 import { PrismaService } from "../prisma/prisma.service";
 import { AuditLogService } from "../audit-log/audit-log.service";
+import { EmailService } from "../auth/email.service";
 
 describe("ApiKeysService", () => {
   let service: ApiKeysService;
   let prisma: PrismaService;
   let auditLog: AuditLogService;
+  let emailService: EmailService;
 
   beforeEach(async () => {
     const prismaMock: any = {
       apiKey: { create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), updateMany: jest.fn() },
+      // Backs notifyKeyIssued's lookups (tenant name, acting user, tenant admins,
+      // platform staff) — defaulted empty/null so tests that don't care about
+      // notification content don't have to stub every call individually.
+      tenant: { findUnique: jest.fn().mockResolvedValue(null) },
+      user: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        findMany: jest.fn().mockResolvedValue([]),
+      },
     };
     // Mirrors the real PrismaService.withTenantContext signature but runs the callback
     // against this same mock instead of a real transaction — lets tests assert both
@@ -22,12 +32,17 @@ describe("ApiKeysService", () => {
         ApiKeysService,
         { provide: PrismaService, useValue: prismaMock },
         { provide: AuditLogService, useValue: { record: jest.fn() } },
+        {
+          provide: EmailService,
+          useValue: { sendApiKeyRotatedEmail: jest.fn(), sendApiKeyStaffNotice: jest.fn() },
+        },
       ],
     }).compile();
 
     service = module.get(ApiKeysService);
     prisma = module.get(PrismaService);
     auditLog = module.get(AuditLogService);
+    emailService = module.get(EmailService);
   });
 
   describe("create", () => {
@@ -75,6 +90,43 @@ describe("ApiKeysService", () => {
       await service.create("tenant-1", [], "actor-1");
 
       expect(prisma.withTenantContext).toHaveBeenCalledWith("tenant-1", expect.any(Function));
+    });
+
+    it("emails the raw key to every TENANT_ADMIN and a metadata-only notice to every SUPER_ADMIN", async () => {
+      jest
+        .spyOn(prisma.apiKey, "create")
+        .mockImplementation((({ data }: any) => Promise.resolve({ id: "key-1", ...data })) as any);
+      jest.spyOn(prisma.tenant, "findUnique").mockResolvedValueOnce({ name: "ScriptTagg" } as any);
+      jest.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({ email: "actor@scriptpay.test" } as any);
+      jest
+        .spyOn(prisma.user, "findMany")
+        .mockResolvedValueOnce([{ email: "admin@scripttagg.test" }] as any) // TENANT_ADMIN
+        .mockResolvedValueOnce([{ email: "staff@scriptpay.test" }] as any); // SUPER_ADMIN
+
+      const result = await service.create("tenant-1", ["PAYMENTS_INITIATE"], "actor-1");
+
+      expect(emailService.sendApiKeyRotatedEmail).toHaveBeenCalledWith("admin@scripttagg.test", result.rawKey);
+      expect(emailService.sendApiKeyStaffNotice).toHaveBeenCalledWith(
+        "staff@scriptpay.test",
+        "ScriptTagg",
+        result.keyPrefix,
+        ["PAYMENTS_INITIATE"],
+        "actor@scriptpay.test",
+      );
+      // The staff notice must never carry the raw key.
+      const staffCallArgs = (emailService.sendApiKeyStaffNotice as jest.Mock).mock.calls[0];
+      expect(JSON.stringify(staffCallArgs)).not.toContain(result.rawKey);
+    });
+
+    it("does not let a notification failure surface as a key-creation failure", async () => {
+      jest
+        .spyOn(prisma.apiKey, "create")
+        .mockImplementation((({ data }: any) => Promise.resolve({ id: "key-1", ...data })) as any);
+      jest.spyOn(prisma.user, "findMany").mockRejectedValueOnce(new Error("db down"));
+
+      await expect(service.create("tenant-1", [], "actor-1")).resolves.toEqual(
+        expect.objectContaining({ id: "key-1" }),
+      );
     });
   });
 
