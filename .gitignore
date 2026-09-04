@@ -6,3 +6,10 @@ dist/
 .DS_Store
 .vercel
 .env*
+
+# TypeScript incremental build caches. Never commit these: tsc trusts the
+# cache over reality, so a checked-in one makes a clean build SKIP emitting
+# files it believes are already written — producing a partial dist/ that only
+# fails at runtime. This exact file, committed by accident, caused
+# "Cannot find module ./prisma-privileged.service" in production.
+*.tsbuildinfo
