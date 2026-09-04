@@ -43,6 +43,11 @@ export class TransactionStateMachine {
    */
   async transitionToSettled(transactionId: string, data: { mpesaReceiptNumber?: string }) {
     await this.prisma.$transaction(async (tx) => {
+      // Lock BEFORE the read, not after: the point is that the status this method
+      // decides on is the status at write time. A lock taken after the read leaves
+      // the read itself unprotected, which is the race it exists to close.
+      await this.lockTransaction(tx, transactionId);
+
       const transaction = await tx.transaction.findUniqueOrThrow({
         where: { id: transactionId },
         include: { tenant: { select: { webhookUrl: true } } },
@@ -118,6 +123,8 @@ export class TransactionStateMachine {
 
   async transitionToFailed(transactionId: string, data: { failureReason: string }) {
     await this.prisma.$transaction(async (tx) => {
+      await this.lockTransaction(tx, transactionId);
+
       const transaction = await tx.transaction.findUniqueOrThrow({
         where: { id: transactionId },
         include: { tenant: { select: { webhookUrl: true } } },
@@ -152,6 +159,8 @@ export class TransactionStateMachine {
    */
   async transitionPayoutToSettled(transactionId: string, data: { mpesaReceiptNumber?: string }) {
     await this.prisma.$transaction(async (tx) => {
+      await this.lockTransaction(tx, transactionId);
+
       const transaction = await tx.transaction.findUniqueOrThrow({
         where: { id: transactionId },
         include: { tenant: { select: { webhookUrl: true } } },
@@ -223,6 +232,8 @@ export class TransactionStateMachine {
    */
   async transitionPayoutToFailed(transactionId: string, data: { failureReason: string }) {
     await this.prisma.$transaction(async (tx) => {
+      await this.lockTransaction(tx, transactionId);
+
       const transaction = await tx.transaction.findUniqueOrThrow({
         where: { id: transactionId },
         include: { tenant: { select: { webhookUrl: true } } },
@@ -387,6 +398,28 @@ export class TransactionStateMachine {
           `payout transitions must not be applied to a collection`,
       );
     }
+  }
+
+  /**
+   * Serializes concurrent transitions of the SAME transaction against each other for
+   * the rest of the caller's transaction. Every method below reads the row, decides
+   * whether the transition is legal, and then writes ledger entries off that
+   * decision — a read-decide-write sequence that is only safe if nothing else can
+   * interleave between the read and the write.
+   *
+   * Under READ COMMITTED nothing stopped that interleaving: two callers could both
+   * read status PROCESSING, both pass assertTransitionAllowed, and both write the
+   * credit pair, crediting the tenant twice for one payment. Today that is prevented
+   * only by there being a single poller process holding an in-memory `isPolling`
+   * flag — an accident of deployment shape, not a property of this code. This makes
+   * it a property of the code.
+   *
+   * Same instrument, and same reasoning, as LedgerService.lockTenantBalance: the
+   * tagged template parameterizes transactionId over the wire, so there is nothing
+   * to validate by hand here.
+   */
+  private async lockTransaction(tx: Prisma.TransactionClient, transactionId: string): Promise<void> {
+    await tx.$queryRaw`SELECT id FROM transactions WHERE id = ${transactionId} FOR UPDATE`;
   }
 
   private assertTransitionAllowed(from: TransactionStatus, to: TransactionStatus) {

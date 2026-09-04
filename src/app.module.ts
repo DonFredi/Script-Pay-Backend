@@ -14,6 +14,8 @@ import { PaymentsModule } from "./modules/payments/payments.module";
 import { CallbacksModule } from "./modules/callbacks/callbacks.module";
 import { ReconciliationModule } from "./modules/reconciliation/reconciliation.module";
 import { ReportingModule } from "./modules/reporting/reporting.module";
+import { HealthModule } from "./modules/health/health.module";
+import { JobsModule } from "./modules/jobs/jobs.module";
 import { HttpExceptionFilter } from "./common/filters/http-exception.filter";
 import { LoggingInterceptor } from "./common/interceptors/logging.interceptor";
 import { ResponseTransformInterceptor } from "./common/interceptors/response-transform.interceptor";
@@ -40,6 +42,8 @@ import { ResponseTransformInterceptor } from "./common/interceptors/response-tra
     CallbacksModule,
     ReconciliationModule,
     ReportingModule,
+    HealthModule,
+    JobsModule,
   ],
   providers: [
     // RolesGuard is intentionally NOT global here. It depends on request.user, which

@@ -82,6 +82,29 @@ interface CachedToken {
   expiresAt: number;
 }
 
+/**
+ * The answer to "what happened to this STK push?", which has THREE outcomes, not two.
+ *
+ * `resultCode: null` is the third: Safaricom was asked and did not give a verdict.
+ * That happens routinely — a push still awaiting the customer's PIN comes back as
+ * HTTP 500 with `errorCode: "500.001.1001"` ("The transaction is being processed")
+ * and no `ResultCode` field at all — and it is emphatically NOT a failure.
+ *
+ * This type exists because the previous shape (`resultCode: number`, defaulted via
+ * `Number(body.ResultCode ?? -1)`) could not express it: every unknown collapsed to
+ * -1, DriftDetectorService read "not zero" as "failed", and marked a push FAILED
+ * while the customer was still holding their phone. FAILED is terminal in
+ * ALLOWED_TRANSITIONS, so the genuine success callback arriving moments later could
+ * never settle the row — the customer paid and the tenant was never credited.
+ */
+export interface StkPushStatusResult {
+  /** Safaricom's terminal ResultCode, or null when they have not given a verdict. */
+  resultCode: number | null;
+  resultDesc?: string;
+  /** Daraja's own errorCode when the QUERY was rejected or deferred, e.g. 500.001.1001. */
+  errorCode?: string;
+}
+
 @Injectable()
 export class DarajaClient {
   private readonly logger = new Logger(DarajaClient.name);
@@ -163,6 +186,30 @@ export class DarajaClient {
     return `${base}/v1/webhooks/daraja/${path}?token=${token}`;
   }
 
+  /**
+   * Daraja's `Amount` is in whole shillings. Callers reach it by dividing
+   * `amountMinorUnits` by 100, so a minor-unit amount that isn't a multiple of 100
+   * arrives here as a fraction.
+   *
+   * This used to be `Math.round(params.amount)`, which quietly changed the figure:
+   * 150 minor units became `1.5` became a real KES 2 charge, while the transaction
+   * row and every ledger entry still said 150. The books and the money disagreed
+   * and nothing anywhere reported it. The DTOs now reject such an amount up front
+   * (`.multipleOf(100)`); this is the second line of defence, and it throws rather
+   * than rounds — the callers already treat a throw here correctly (StkPushService
+   * marks the transaction FAILED, B2cService additionally releases the reservation),
+   * so failing loudly costs nothing and mis-charging costs real money.
+   */
+  private assertWholeShillings(amount: number, context: string): number {
+    if (!Number.isInteger(amount)) {
+      throw new Error(
+        `Refusing to send a fractional amount to Daraja ${context}: ${amount} KES. ` +
+          `M-Pesa settles in whole shillings, so amountMinorUnits must be a multiple of 100.`,
+      );
+    }
+    return amount;
+  }
+
   private generatePassword(creds: TenantMpesaCredentials): { password: string; timestamp: string } {
     const timestamp = new Date()
       .toISOString()
@@ -184,7 +231,7 @@ export class DarajaClient {
         Password: password,
         Timestamp: timestamp,
         TransactionType: params.transactionType,
-        Amount: Math.round(params.amount),
+        Amount: this.assertWholeShillings(params.amount, "for an STK push"),
         PartyA: params.msisdn,
         PartyB: creds.shortcode,
         PhoneNumber: params.msisdn,
@@ -238,7 +285,7 @@ export class DarajaClient {
         InitiatorName: creds.initiatorName,
         SecurityCredential: creds.securityCredential,
         CommandID: params.commandId,
-        Amount: Math.round(params.amount),
+        Amount: this.assertWholeShillings(params.amount, "for a B2C payout"),
         // PartyA is the paying shortcode and PartyB the receiving handset — the exact
         // reverse of the STK push above, where the customer is PartyA. Getting these
         // backwards is the single easiest mistake to make when adapting one to the other.
@@ -321,10 +368,15 @@ export class DarajaClient {
     }
   }
 
+  /**
+   * Asks Safaricom for the outcome of an STK push. Returns `resultCode: null` when
+   * they decline to say yet — see StkPushStatusResult for why that distinction is
+   * load-bearing rather than pedantic.
+   */
   async queryStkPushStatus(
     creds: TenantMpesaCredentials,
     checkoutRequestId: string,
-  ): Promise<{ resultCode: number; resultDesc?: string }> {
+  ): Promise<StkPushStatusResult> {
     const accessToken = await this.getAccessToken(creds);
     const { password, timestamp } = this.generatePassword(creds);
 
@@ -340,6 +392,27 @@ export class DarajaClient {
     });
 
     const body = await this.parseDarajaJson(response, "STK push status query");
-    return { resultCode: Number(body.ResultCode ?? -1), resultDesc: body.ResultDesc };
+
+    // A verdict is a present, numeric ResultCode and nothing else. An in-flight push
+    // (errorCode 500.001.1001), a throttled query, an expired token — all come back
+    // without one, and every one of them means "ask again later", not "it failed".
+    const rawResultCode = body.ResultCode;
+    const parsed = rawResultCode === undefined || rawResultCode === null || rawResultCode === ""
+      ? Number.NaN
+      : Number(rawResultCode);
+
+    if (!Number.isFinite(parsed)) {
+      this.logger.log(
+        `Daraja gave no verdict for CheckoutRequestID ${checkoutRequestId} ` +
+          `(status ${response.status}, errorCode ${body.errorCode ?? "none"}): ${body.errorMessage ?? body.ResponseDescription ?? "no detail"}`,
+      );
+      return {
+        resultCode: null,
+        resultDesc: body.errorMessage ?? body.ResponseDescription,
+        errorCode: body.errorCode,
+      };
+    }
+
+    return { resultCode: parsed, resultDesc: body.ResultDesc };
   }
 }

@@ -67,12 +67,21 @@ export class ApiKeysService {
     scopes: ApiKeyScope[],
   ) {
     try {
-      const [tenant, actor, admins, staff] = await Promise.all([
-        this.prisma.tenant.findUnique({ where: { id: tenantId }, select: { name: true } }),
-        this.prisma.user.findUnique({ where: { id: actorId }, select: { email: true } }),
-        this.prisma.user.findMany({ where: { tenantId, role: "TENANT_ADMIN" }, select: { email: true } }),
-        this.prisma.user.findMany({ where: { role: "SUPER_ADMIN" }, select: { email: true } }),
-      ]);
+      // Scoped to this tenant's RLS context — see TenantsService.notifyWebhookSecretRotated
+      // for the full reasoning. Short version: these run on the RLS-enforced connection,
+      // and with no context set they return zero rows (not an error) once
+      // 004_force_row_level_security.sql is applied, so the raw key this function exists
+      // to deliver would silently reach nobody. The `tenantId IS NULL` branch of the
+      // users policy keeps SUPER_ADMIN visible from inside a tenant's context.
+      const { tenant, actor, admins, staff } = await this.prisma.withTenantContext(tenantId, async (tx) => {
+        const [tenant, actor, admins, staff] = await Promise.all([
+          tx.tenant.findUnique({ where: { id: tenantId }, select: { name: true } }),
+          tx.user.findUnique({ where: { id: actorId }, select: { email: true } }),
+          tx.user.findMany({ where: { tenantId, role: "TENANT_ADMIN" }, select: { email: true } }),
+          tx.user.findMany({ where: { role: "SUPER_ADMIN" }, select: { email: true } }),
+        ]);
+        return { tenant, actor, admins, staff };
+      });
 
       await Promise.all([
         ...admins.map((admin) => this.emailService.sendApiKeyRotatedEmail(admin.email, rawKey)),

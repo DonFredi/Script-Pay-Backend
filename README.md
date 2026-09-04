@@ -39,7 +39,13 @@ src/
 cp .env.example .env   # fill in real values, rotated credentials only
 npm install
 npx prisma migrate dev
+# Policies + RLS ENABLE + the app_runtime/app_privileged roles. Safe to run now:
+# the table owner is still exempt from RLS, so nothing changes for the running app.
 psql $DATABASE_URL -f prisma/manual-sql/001_row_level_security.sql
+# NOTE: do NOT also run 004_force_row_level_security.sql yet. FORCE removes the
+# owner's exemption, and until DATABASE_URL points at app_runtime rather than the
+# owner it makes every query outside withTenantContext return zero rows — including
+# login. That file lists its own prerequisites and a rollback.
 npm run start:dev
 ```
 

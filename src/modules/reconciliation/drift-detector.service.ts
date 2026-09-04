@@ -1,5 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { Cron, CronExpression } from "@nestjs/schedule";
+import { inProcessCronEnabled } from "../jobs/job-scheduling";
 import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 import { DarajaClient } from "../../infrastructure/daraja/daraja.client";
 import { TransactionStateMachine } from "../payments/transaction-state-machine";
@@ -40,7 +41,30 @@ export class DriftDetectorService {
     private readonly auditLog: AuditLogService,
   ) {}
 
+  /**
+   * Cron entry point for both detectors — see WebhookPollerService.scheduledPoll for
+   * why these are wrappers. Both run in one trigger so an external scheduler needs a
+   * single reconciliation call rather than two.
+   */
   @Cron(CronExpression.EVERY_5_MINUTES)
+  async scheduledDetection() {
+    if (!inProcessCronEnabled()) return;
+    await this.runDetection();
+  }
+
+  /**
+   * Collections first, then payouts. Ordering is not load-bearing, but the payout
+   * pass must still run if the collection pass throws — a stuck payout is holding a
+   * tenant's funds, which is the more expensive of the two to leave unreported.
+   */
+  async runDetection() {
+    try {
+      await this.detectStuckTransactions();
+    } finally {
+      await this.detectStuckPayouts();
+    }
+  }
+
   async detectStuckTransactions() {
     const cutoff = new Date(Date.now() - DriftDetectorService.STUCK_THRESHOLD_MINUTES * 60_000);
 
@@ -65,7 +89,13 @@ export class DriftDetectorService {
       if (!transaction.checkoutRequestId) continue;
 
       try {
-        const credentials = await this.tenantsService.getMpesaCredentialsForPayment(transaction.tenantId);
+        // The channel must be passed through, not defaulted. Omitting it made this
+        // fall back to "PAYBILL", so a stuck TILL collection was queried with the
+        // tenant's Paybill shortcode and passkey — the query failed, the catch below
+        // swallowed it, and the row stayed stuck permanently. The one failure mode
+        // this service exists to resolve was the one it could never resolve.
+        const channel = transaction.channel === "TILL" ? "TILL" : "PAYBILL";
+        const credentials = await this.tenantsService.getMpesaCredentialsForPayment(transaction.tenantId, channel);
         const status = await this.daraja.queryStkPushStatus(credentials, transaction.checkoutRequestId);
         // Re-inject the queried result through the SAME idempotent path a webhook would use,
         // rather than duplicating state-transition logic here.
@@ -95,7 +125,6 @@ export class DriftDetectorService {
    * than the previous behaviour, which was to silently skip them forever. Auto-recovery
    * is the follow-up, and this is the hook it will attach to.
    */
-  @Cron(CronExpression.EVERY_5_MINUTES)
   async detectStuckPayouts() {
     const cutoff = new Date(Date.now() - DriftDetectorService.PAYOUT_STUCK_THRESHOLD_MINUTES * 60_000);
 
@@ -168,8 +197,27 @@ export class DriftDetectorService {
 
   private async recordDriftAndReconcile(
     transactionId: string,
-    darajaStatus: { resultCode: number; mpesaReceiptNumber?: string; resultDesc?: string },
+    darajaStatus: { resultCode: number | null; mpesaReceiptNumber?: string; resultDesc?: string; errorCode?: string },
   ) {
+    // Safaricom was asked and gave no verdict — most often because the push is still
+    // in flight and the customer simply hasn't entered their PIN yet. Leave the
+    // transaction PROCESSING and ask again on the next pass.
+    //
+    // This branch is the fix for the worst defect on the collection path. Previously
+    // an absent ResultCode arrived here as -1, fell through to the else below, and
+    // marked the transaction FAILED. Because FAILED is terminal, the real success
+    // callback that landed minutes later could never settle it: the customer had
+    // paid, the row said FAILED, and the tenant was never credited. An unknown
+    // answer must never be recorded as a "no".
+    if (darajaStatus.resultCode === null) {
+      this.logger.log(
+        `Transaction ${transactionId} is still unresolved at Safaricom ` +
+          `(${darajaStatus.errorCode ?? "no error code"}: ${darajaStatus.resultDesc ?? "no detail"}) — ` +
+          `leaving it PROCESSING for the next pass`,
+      );
+      return;
+    }
+
     // Route through the SAME state-machine methods a webhook would call — this active
     // reconciliation path and the passive webhook path must never diverge in how they
     // apply a result, or you get two slightly-different definitions of "settled."

@@ -1,5 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { Cron, CronExpression } from "@nestjs/schedule";
+import { inProcessCronEnabled } from "../jobs/job-scheduling";
 import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 import { TransactionStateMachine } from "../payments/transaction-state-machine";
 import { AuditLogService } from "../audit-log/audit-log.service";
@@ -30,7 +31,19 @@ export class WebhookPollerService {
     private readonly alerts: AlertsService,
   ) {}
 
+  /**
+   * Cron entry point. Thin on purpose: the real work stays in
+   * pollUnprocessedEvents so InternalJobsController can drive the identical code
+   * path when an external scheduler owns the timing (JOB_SCHEDULER=external, which
+   * is how this runs on any host that suspends an idle instance). Two triggers, one
+   * implementation — they can never drift into behaving differently.
+   */
   @Cron(CronExpression.EVERY_10_SECONDS)
+  async scheduledPoll() {
+    if (!inProcessCronEnabled()) return;
+    await this.pollUnprocessedEvents();
+  }
+
   async pollUnprocessedEvents() {
     if (this.isPolling) return;
     this.isPolling = true;

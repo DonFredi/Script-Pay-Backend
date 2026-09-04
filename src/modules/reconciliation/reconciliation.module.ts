@@ -7,5 +7,7 @@ import { TenantsModule } from "../tenants/tenants.module";
 @Module({
   imports: [DarajaModule, PaymentsModule, TenantsModule],
   providers: [DriftDetectorService],
+  // Exported for JobsModule's InternalJobsController — same reasoning as CallbacksModule.
+  exports: [DriftDetectorService],
 })
 export class ReconciliationModule {}

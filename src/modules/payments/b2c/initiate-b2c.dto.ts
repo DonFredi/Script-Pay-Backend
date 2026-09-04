@@ -30,6 +30,11 @@ export const initiateB2cSchema = z.object({
     .number()
     .int()
     .positive()
+    // Same whole-shilling rule as the collection path, and it matters more here:
+    // a payout of 150 minor units reserved and debited KES 1.50 against the tenant
+    // while Safaricom actually sent the rounded KES 2, so the tenant was
+    // under-debited for money that genuinely left their shortcode.
+    .multipleOf(100, "amountMinorUnits must be a whole number of shillings (a multiple of 100)")
     .max(B2C_MAX_MINOR_UNITS, "single B2C payout cannot exceed KES 250,000 per Safaricom limits"),
   // Daraja's Remarks field. Required by the API; kept short because Safaricom
   // truncates long values silently rather than rejecting them.
@@ -50,6 +55,6 @@ export const initiateB2cSchema = z.object({
   // returns the already-created payout instead of sending a second real one. Optional:
   // omitting it preserves today's behavior exactly.
   idempotencyKey: z.string().trim().min(1).max(255).optional(),
-});
+}).strict();
 
 export type InitiateB2cDto = z.infer<typeof initiateB2cSchema>;

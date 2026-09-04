@@ -12,5 +12,8 @@ import { TenantsModule } from "../tenants/tenants.module";
   imports: [PaymentsModule, TenantsModule],
   controllers: [DarajaWebhookController],
   providers: [WebhookIngestService, WebhookPollerService, TenantWebhookPollerService],
+  // Exported for JobsModule's InternalJobsController, which triggers these same
+  // pollers over HTTP where nothing keeps a process alive to run their crons.
+  exports: [WebhookPollerService, TenantWebhookPollerService],
 })
 export class CallbacksModule {}

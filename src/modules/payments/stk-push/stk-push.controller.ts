@@ -10,7 +10,9 @@ import { StkPushService } from "./stk-push.service";
 
 /**
  * This endpoint is called by TENANTS via API key (merchant-to-platform), not by
- * dashboard users via Firebase session — hence ApiKeyGuard, not AccessTokenGuard.
+ * dashboard users via a logged-in session — hence ApiKeyGuard, not AccessTokenGuard.
+ * (This said "Firebase session"; Firebase was removed and dashboard sessions are now
+ * this backend's own JWTs. The guard was always correct — only the wording was stale.)
  *
  * Guard ORDER matters: ApiKeyGuard runs first and sets request.tenantId, which
  * TenantAwareThrottlerGuard then reads to rate-limit per-tenant rather than per-IP.

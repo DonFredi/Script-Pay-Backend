@@ -65,6 +65,15 @@ export const envSchema = z.object({
 
   DATABASE_URL: z.string().url(),
 
+  // Read by prisma/schema.prisma's `directUrl` for migrations — Prisma Migrate needs
+  // advisory locks, which Supabase's transaction-mode pooler (DATABASE_URL, port
+  // 6543) doesn't support. Declared here so it's covered by the same fail-fast boot
+  // check as everything else; it was previously the one connection string that
+  // wasn't, so a missing or malformed value only surfaced as a migration failure
+  // mid-deploy. Optional because the app itself never reads it — only the migrate
+  // step does — so a running instance without it is fine, but a malformed one is not.
+  DIRECT_URL: optionalUrl(),
+
   // Second connection, for PrismaPrivilegedService — code paths that can't resolve
   // to a single tenant before querying (see that file's own doc comment). Optional:
   // unset falls back to DATABASE_URL, which is the correct behavior before the RLS
@@ -121,6 +130,21 @@ export const envSchema = z.object({
   PUBLIC_APP_URL: z
     .string()
     .url("required — the canonical frontend URL used in email links, e.g. https://script-pay.vecel.app"),
+
+  // Which mechanism fires the background pollers — see modules/jobs/job-scheduling.ts.
+  // "in-process" (default) uses the @nestjs/schedule crons and needs a process that
+  // stays alive. "external" silences those crons and expects a scheduler to POST the
+  // /internal/jobs/* routes instead, which is what any host that suspends an idle
+  // instance (a Render free instance sleeps after 15 minutes) requires.
+  JOB_SCHEDULER: z.enum(["in-process", "external"]).default("in-process"),
+
+  // Shared secret for those /internal/jobs/* routes, sent as the
+  // x-internal-jobs-secret header. Optional here because a deployment on
+  // JOB_SCHEDULER=in-process never calls them — but InternalJobsSecretGuard fails
+  // CLOSED when it is unset, so leaving it blank disables the endpoints rather than
+  // exposing them. Required in practice whenever JOB_SCHEDULER=external.
+  // Generate with: openssl rand -hex 32
+  INTERNAL_JOBS_SECRET: optionalString(32),
 
   SENTRY_DSN: optionalUrl(),
   SLACK_WEBHOOK_URL: optionalUrl(),

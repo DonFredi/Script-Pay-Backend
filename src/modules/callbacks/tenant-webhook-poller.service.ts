@@ -1,5 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { Cron, CronExpression } from "@nestjs/schedule";
+import { inProcessCronEnabled } from "../jobs/job-scheduling";
 import { createHmac } from "node:crypto";
 import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 import { CredentialsEncryptionService } from "../tenants/credentials-encryption.service";
@@ -44,7 +45,13 @@ export class TenantWebhookPollerService {
     private readonly alerts: AlertsService,
   ) {}
 
+  /** Cron entry point — see WebhookPollerService.scheduledPoll for why it's a wrapper. */
   @Cron(CronExpression.EVERY_10_SECONDS)
+  async scheduledPoll() {
+    if (!inProcessCronEnabled()) return;
+    await this.pollPendingDeliveries();
+  }
+
   async pollPendingDeliveries() {
     if (this.isPolling) return;
     this.isPolling = true;

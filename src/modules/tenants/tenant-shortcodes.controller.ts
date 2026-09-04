@@ -2,6 +2,8 @@ import { BadRequestException, Body, Controller, Delete, ForbiddenException, Get,
 import { AccessTokenGuard } from "../auth/access-token.guard";
 import { CsrfGuard } from "../../common/guards/csrf.guard";
 import { RolesGuard } from "../../common/guards/roles.guard";
+import { TenantAwareThrottlerGuard } from "../../common/guards/tenant-aware-throttler.guard";
+import { ReadThrottle, StrictPaymentThrottle } from "../../common/throttle-tiers";
 import { Roles } from "../../common/decorators/roles.decorator";
 import { CurrentUser, type AuthenticatedUser } from "../../common/decorators/current-user.decorator";
 import { ZodValidationPipe } from "../../common/pipes/zod-validation.pipe";
@@ -15,12 +17,18 @@ import { TenantShortcodesService } from "./tenant-shortcodes.service";
  * remove the shortcode Daraja routes real payments to.
  */
 @Controller("v1/tenant-shortcodes")
-@UseGuards(AccessTokenGuard, CsrfGuard, RolesGuard)
+@UseGuards(AccessTokenGuard, CsrfGuard, RolesGuard, TenantAwareThrottlerGuard)
 @Roles("TENANT_ADMIN", "SUPER_ADMIN")
+@ReadThrottle()
 export class TenantShortcodesController {
   constructor(private readonly shortcodes: TenantShortcodesService) {}
 
   @Post()
+  // create() calls Daraja twice per request (verifyCredentials, then registerC2bUrl),
+  // and this controller had no throttler guard at all — an authenticated user could
+  // drive unbounded traffic at Safaricom using their own tenant's app credentials,
+  // which is a good way to get that tenant's Daraja app throttled or locked.
+  @StrictPaymentThrottle()
   create(
     @Body(new ZodValidationPipe(createShortcodeSchema)) dto: CreateShortcodeDto,
     @CurrentUser() user: AuthenticatedUser,

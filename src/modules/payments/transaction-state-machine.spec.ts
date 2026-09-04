@@ -10,6 +10,9 @@ describe("TransactionStateMachine", () => {
     ledgerEntry: { createMany: jest.Mock };
     reconciliationRecord: { create: jest.Mock; updateMany: jest.Mock };
     tenantWebhookDelivery: { create: jest.Mock };
+    // Backs lockTransaction's `SELECT ... FOR UPDATE`, which serializes concurrent
+    // transitions of the same transaction — see that method's comment.
+    $queryRaw: jest.Mock;
   };
 
   beforeEach(async () => {
@@ -18,6 +21,7 @@ describe("TransactionStateMachine", () => {
       ledgerEntry: { createMany: jest.fn() },
       reconciliationRecord: { create: jest.fn(), updateMany: jest.fn() },
       tenantWebhookDelivery: { create: jest.fn() },
+      $queryRaw: jest.fn().mockResolvedValue([{ id: "tx-1" }]),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -37,6 +41,42 @@ describe("TransactionStateMachine", () => {
     }).compile();
 
     service = module.get<TransactionStateMachine>(TransactionStateMachine);
+  });
+
+  // Without the lock, two callers processing the same Safaricom callback can both
+  // read status PROCESSING, both pass assertTransitionAllowed, and both write the
+  // credit pair — crediting the tenant twice for one payment. A single poller
+  // process makes that unreachable today, but that is a property of the deployment,
+  // not of this class, and it stops holding the moment a second instance exists.
+  describe("row locking", () => {
+    const lockedTransitions: Array<[string, () => Promise<unknown>]> = [
+      ["transitionToSettled", () => service.transitionToSettled("tx-1", {})],
+      ["transitionToFailed", () => service.transitionToFailed("tx-1", { failureReason: "nope" })],
+      ["transitionPayoutToSettled", () => service.transitionPayoutToSettled("tx-1", {})],
+      ["transitionPayoutToFailed", () => service.transitionPayoutToFailed("tx-1", { failureReason: "nope" })],
+    ];
+
+    it.each(lockedTransitions)("%s locks the row before reading it", async (name, run) => {
+      const isPayout = name.includes("Payout");
+      tx.transaction.findUniqueOrThrow.mockResolvedValueOnce({
+        id: "tx-1",
+        tenantId: "tenant-1",
+        status: "PROCESSING",
+        amountMinorUnits: 50_000,
+        direction: isPayout ? "OUTBOUND" : "INBOUND",
+        metadata: null,
+        tenant: { webhookUrl: null },
+      });
+
+      await run();
+
+      expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+      // Order matters as much as presence: a lock taken after the read leaves the
+      // read itself unprotected, which is the exact race being closed.
+      expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        tx.transaction.findUniqueOrThrow.mock.invocationCallOrder[0],
+      );
+    });
   });
 
   describe("transitionToSettled", () => {

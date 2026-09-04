@@ -1,4 +1,4 @@
-import { Injectable, OnModuleDestroy, OnModuleInit } from "@nestjs/common";
+import { BadRequestException, Injectable, OnModuleDestroy, OnModuleInit } from "@nestjs/common";
 import { PrismaClient } from "@prisma/client";
 
 @Injectable()
@@ -24,7 +24,12 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
     // Never pass unvalidated user input into this function.
     const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     if (!uuidPattern.test(tenantId)) {
-      throw new Error("withTenantContext: tenantId must be a valid UUID");
+      // BadRequestException, not a bare Error. Several routes let a SUPER_ADMIN name
+      // the tenant via ?tenantId= (transactions, ledger balance, reporting), so a
+      // mistyped parameter reaches here as ordinary client input — and a bare Error
+      // was collapsed by HttpExceptionFilter into an opaque "Internal server error"
+      // plus a Sentry event, for what is a 400 with an obvious cause.
+      throw new BadRequestException("tenantId must be a valid UUID");
     }
 
     return this.$transaction(async (tx) => {

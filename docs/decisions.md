@@ -546,3 +546,138 @@ the real Daraja rejection message (or this gateway message) as
 `transaction.failureReason` instead of a generic `"daraja_initiation_error"`
 bucket label — the frontend polls onto that exact field to show the merchant
 what went wrong, and the bucket label was never actionable for them.
+
+## 22. `.strict()` added to auth schemas to reject unknown fields, not applied repo-wide
+
+**Problem**: Every `*.schema.ts` file uses plain `z.object({...})`, and Zod 4
+does not treat that as strict by default — an unrecognized key in the
+request body is silently **stripped** rather than rejected. A request to
+`/auth/login` or `/auth/signup` carrying a field the schema doesn't declare
+(e.g. `role`, `tenantId`, `isAdmin`) parsed successfully with that field
+quietly dropped, instead of failing. No current auth handler spreads the raw
+DTO into a Prisma call — each destructures named fields off it — so this
+wasn't an active mass-assignment bug, but it's the exact shape of one, and
+gave no signal that a client (or an attacker probing the login/signup form)
+was sending fields it had no business sending.
+
+**Chosen**: `.strict()` added to all six schemas in `auth.schema.ts`
+(`signupSchema`, `loginSchema`, `forgotPasswordSchema`,
+`resetPasswordSchema`, `verifyEmailSchema`, `resendVerificationSchema`).
+It's chained onto the `z.object()` before `.refine()` on the two
+password-confirmation schemas, since `.refine()` returns a `ZodEffects`
+that doesn't carry a `.strict()` method itself. An unrecognized field now
+fails in `ZodValidationPipe` with the same structured `BadRequestException`
+shape as any other validation error, instead of disappearing. Verified
+against every frontend auth API call (`login.api.ts`, `register.api.ts`,
+`forgot-password.api.ts`, `reset-password.api.ts`, `verify-email.api.ts`,
+`resend-verification.api.ts`) before landing this — each sends exactly the
+fields its schema declares, so no legitimate request starts failing.
+
+**Not done**: the same treatment was not extended to the other
+`*.schema.ts` files (tenants, shortcodes, api-keys, stk-push, b2c) in this
+pass. Auth was the immediate priority as the highest-value target for
+tampering attempts against unauthenticated endpoints; extending `.strict()`
+repo-wide is a deliberate, separately-scoped follow-up, not an oversight.
+
+## 23. Unknown is not failure: STK status queries gained a third outcome
+
+**Problem**: `DarajaClient.queryStkPushStatus` returned
+`Number(body.ResultCode ?? -1)`. Safaricom answers a query about a push that is
+still in flight with HTTP 500, `errorCode: "500.001.1001"` ("The transaction is
+being processed") and **no `ResultCode` field at all** — so every such answer
+collapsed to `-1`. `DriftDetectorService.recordDriftAndReconcile` read "not
+zero" as "failed" and called `transitionToFailed`.
+
+`FAILED` is terminal in `ALLOWED_TRANSITIONS`, so when the genuine success
+callback arrived minutes later, `transitionToSettled` threw *Illegal transaction
+state transition: FAILED -> SETTLED*, burned all five webhook retries and gave
+up. Net effect: the customer paid, the transaction read `FAILED`, and the tenant
+was never credited. The type could not express "we asked and were told nothing",
+so the code had nowhere to put that answer except the failure branch.
+
+**Chosen**: `queryStkPushStatus` now returns `StkPushStatusResult`, whose
+`resultCode` is `number | null`. `null` means Safaricom gave no verdict — an
+absent, empty or unparseable `ResultCode` — and carries the `errorCode` alongside
+for logging. `recordDriftAndReconcile` returns early on `null`, leaving the
+transaction `PROCESSING` for the next pass and recording no drift, since nothing
+has been shown to have drifted.
+
+**Rejected**: making `FAILED -> SETTLED` a legal transition so a late callback
+could recover the row. That treats the symptom, keeps the wrong verdict in the
+audit trail, and weakens a terminal state that exists precisely so a failed
+transaction is retried as a new one rather than mutated.
+
+**Note**: this does not retroactively heal transactions already wrongly marked
+`FAILED`. Any such row has to be identified and settled by hand.
+
+## 24. A tenant admin's status self-service is gated on the CURRENT status, not just the target
+
+**Problem**: `PATCH /v1/tenants/:id/status` allows `TENANT_ADMIN`, and
+`updateStatus` checked only the *target* status — rejecting `pending_kyc` and
+`removed`. Nothing rejected `active`. A self-registered admin (whom
+`onboardSelf` creates as `pending_kyc`) could PATCH their own tenant straight to
+`active`, which additionally triggers `provisionApiKeyOnActivation` and emails
+them a live API key. The method's own doc comment claimed this was "not a path to
+self-approve out of KYC review"; it was exactly that path.
+
+The test named *"forbids a TENANT_ADMIN from self-approving out of KYC review"*
+asserted the opposite direction — it moved a tenant *into* `pending_kyc` — so the
+real escalation was never covered and the suite passed throughout.
+
+**Chosen**: a non-`SUPER_ADMIN` caller must find the tenant in `active` or
+`suspended` **and** be moving it to `active` or `suspended`. Gating on
+`before.status` as well as `dto.status` is the part that matters: rejecting only
+`pending_kyc -> active` would have left `pending_kyc -> suspended -> active`
+open, since the second hop starts from a status tenant admins may legitimately
+use. Two requests, same escalation.
+
+## 25. `FORCE ROW LEVEL SECURITY` split out of the documented setup step
+
+**Problem**: `001_row_level_security.sql` is named in `README.md` and
+`CLAUDE.md` as an ordinary setup command, and it unconditionally ran
+`ALTER TABLE ... FORCE ROW LEVEL SECURITY`. FORCE removes the table owner's
+exemption from its own policies — but `DATABASE_URL` is still the owner role,
+because the `app_runtime` / `app_privileged` cutover has not happened. Running
+the documented command would therefore have made every query outside
+`withTenantContext` return zero rows: login's user lookup, `ApiKeyGuard`,
+`listAll`, both pollers. They return empty rather than raising, so the app comes
+back up looking healthy and simply cannot find any users.
+
+The file's header had always warned about this. The executable SQL did not
+honour the warning, which made the warning worth nothing.
+
+**Chosen**: `ENABLE` and the policies stay in `001` (safe today, a no-op for the
+owner). The nine `FORCE` statements moved to `004_force_row_level_security.sql`,
+which states its five prerequisites, is explicitly not a setup step, and carries
+a `NO FORCE` rollback. README, CLAUDE.md and `docs/database.md` now say so.
+
+**Also fixed here**: three reads that would have broken silently at that cutover
+— `TenantsService.notifyWebhookSecretRotated`,
+`TenantsService.provisionApiKeyOnActivation` and
+`ApiKeysService.notifyKeyIssued` all queried `users` on the RLS-enforced
+connection with no tenant context. Post-FORCE they would return zero admins, and
+the one-time API key and webhook secret they exist to deliver would reach nobody
+— unrecoverable, since neither value is ever shown twice.
+
+## 26. Amounts are validated as whole shillings, and the Daraja boundary refuses to round
+
+**Problem**: `amountMinorUnits` was validated only as `.int().positive()`, and
+both payment services pass `amountMinorUnits / 100` to `DarajaClient`, which
+applied `Math.round`. An amount of `150` (KES 1.50) therefore became a real
+**KES 2** charge while the transaction row and every ledger entry still said
+`150`. On the payout side the tenant was debited KES 1.50 for KES 2 that
+genuinely left their shortcode. The books and the money disagreed, silently.
+
+Separately, the STK ceiling read `.max(15_000_00, "... cannot exceed KES
+150,000")` — `15_000_00` is KES **15,000**, a tenth of the limit the message
+claimed, so every legitimate collection between KES 15,000 and 150,000 was
+rejected by an error asserting a limit the code did not enforce. The frontend has
+always allowed up to 150,000, so the two repos disagreed. The B2C constant
+(`250_000_00`) was written correctly, which is what made the typo easy to miss.
+
+**Chosen**: `.multipleOf(100)` on both payment DTOs, the STK ceiling corrected to
+`150_000_00`, and `Math.round` at the Daraja boundary replaced with
+`assertWholeShillings`, which throws. Both callers already handle a throw here
+correctly — `StkPushService` marks the transaction `FAILED`, `B2cService` also
+releases the reservation — so failing loudly costs nothing, and mis-charging
+costs real money.

@@ -7,8 +7,10 @@ import z from "zod";
  * while the shortcode-specific fields (passkey, initiator/security credential) now
  * live on TenantShortcode — see tenant-shortcodes.schema.ts.
  */
-export const setAppCredentialsSchema = z.object({
-  consumerKey: z.string().trim().min(1, "Consumer key is required"),
-  consumerSecret: z.string().trim().min(1, "Consumer secret is required"),
-});
+export const setAppCredentialsSchema = z
+  .object({
+    consumerKey: z.string().trim().min(1, "Consumer key is required"),
+    consumerSecret: z.string().trim().min(1, "Consumer secret is required"),
+  })
+  .strict();
 export type SetAppCredentialsDto = z.infer<typeof setAppCredentialsSchema>;

@@ -122,6 +122,57 @@ describe("DriftDetectorService", () => {
     expect(stateMachine.transitionToSettled).not.toHaveBeenCalled();
   });
 
+  // The highest-cost bug on the collection path: an in-flight push (Safaricom
+  // answers with errorCode 500.001.1001 and no ResultCode) was coerced to -1, read
+  // as "not zero, therefore failed", and made terminal. The genuine success callback
+  // that arrived afterwards could then never settle it — customer charged, tenant
+  // never credited, transaction reading FAILED.
+  it("leaves a transaction PROCESSING when Daraja gives no verdict", async () => {
+    jest.spyOn(prisma.transaction, "findMany").mockResolvedValueOnce([
+      { id: "tx-1", tenantId: "tenant-1", checkoutRequestId: "cr-1", channel: "PAYBILL" },
+    ] as any);
+    jest.spyOn(tenantsService, "getMpesaCredentialsForPayment").mockResolvedValueOnce({} as any);
+    jest.spyOn(daraja, "queryStkPushStatus").mockResolvedValueOnce({
+      resultCode: null,
+      errorCode: "500.001.1001",
+      resultDesc: "The transaction is being processed",
+    });
+
+    await service.detectStuckTransactions();
+
+    expect(stateMachine.transitionToFailed).not.toHaveBeenCalled();
+    expect(stateMachine.transitionToSettled).not.toHaveBeenCalled();
+    // No drift is recorded either — nothing has been shown to have drifted yet.
+    expect(prisma.reconciliationRecord.updateMany).not.toHaveBeenCalled();
+  });
+
+  // Defaulting the channel meant a stuck TILL collection was queried with the
+  // tenant's PAYBILL shortcode and passkey, so the query always failed and the row
+  // stayed stuck forever.
+  it("queries a TILL collection with that tenant's TILL credentials, not the PAYBILL default", async () => {
+    jest.spyOn(prisma.transaction, "findMany").mockResolvedValueOnce([
+      { id: "tx-1", tenantId: "tenant-1", checkoutRequestId: "cr-1", channel: "TILL" },
+    ] as any);
+    jest.spyOn(tenantsService, "getMpesaCredentialsForPayment").mockResolvedValueOnce({} as any);
+    jest.spyOn(daraja, "queryStkPushStatus").mockResolvedValueOnce({ resultCode: 0, resultDesc: "Success" });
+
+    await service.detectStuckTransactions();
+
+    expect(tenantsService.getMpesaCredentialsForPayment).toHaveBeenCalledWith("tenant-1", "TILL");
+  });
+
+  it("queries a PAYBILL collection with PAYBILL credentials", async () => {
+    jest.spyOn(prisma.transaction, "findMany").mockResolvedValueOnce([
+      { id: "tx-1", tenantId: "tenant-1", checkoutRequestId: "cr-1", channel: "PAYBILL" },
+    ] as any);
+    jest.spyOn(tenantsService, "getMpesaCredentialsForPayment").mockResolvedValueOnce({} as any);
+    jest.spyOn(daraja, "queryStkPushStatus").mockResolvedValueOnce({ resultCode: 0, resultDesc: "Success" });
+
+    await service.detectStuckTransactions();
+
+    expect(tenantsService.getMpesaCredentialsForPayment).toHaveBeenCalledWith("tenant-1", "PAYBILL");
+  });
+
   it("continues processing remaining transactions when one Daraja query fails", async () => {
     jest.spyOn(prisma.transaction, "findMany").mockResolvedValueOnce([
       { id: "tx-1", tenantId: "tenant-1", checkoutRequestId: "cr-1" },

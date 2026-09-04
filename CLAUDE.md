@@ -21,7 +21,7 @@ repo imports from or calls into the frontend.
 - **Database**: PostgreSQL via Prisma 6 — no TypeORM, no Mongo
 - **Payment provider**: Safaricom Daraja API (STK Push; C2B/Paybill/Till modeled in schema) — no Stripe, no card processing
 - **Auth**: self-issued JWT (`jose`, HS256) + refresh-token rotation, argon2id password hashing. No Firebase — it was fully removed; some inline comments still say "Firebase" and are stale (see below)
-- **Retry/queue**: Postgres-table polling (`WebhookPollerService` via `@nestjs/schedule` cron) — no Redis, no BullMQ
+- **Retry/queue**: Postgres-table polling (`WebhookPollerService` via `@nestjs/schedule` cron) — no Redis, no BullMQ. `JOB_SCHEDULER=external` swaps those crons for HTTP triggers under `/internal/jobs/*`, for hosts that suspend an idle process; never run both at once (decisions.md entry 27)
 - **Other**: `argon2` (passwords + API keys), Node `crypto` AES-256-GCM (tenant Daraja credential encryption), `nestjs-pino` (structured logs), `@sentry/node`, `resend` (transactional email), `zod` (request validation + env schema)
 
 ## Project structure
@@ -71,6 +71,8 @@ There is no `apps/`, no `packages/`, no `k8s/`, no `docker-compose.yml`.
 | GET | `/v1/audit-logs` | AccessTokenGuard, RolesGuard | |
 | POST | `/v1/webhooks/daraja/stk-callback`, `/v1/webhooks/daraja/c2b-confirmation` | Throttler only | inbound from Safaricom; always returns 200, `@SkipResponseTransform` |
 | POST | `/v1/webhooks/daraja/b2c-result`, `/v1/webhooks/daraja/b2c-timeout` | Throttler only | payout outcome / queue timeout. The timeout is NOT a failure — it releases nothing (decisions.md entry 18) |
+| GET | `/health` | Throttler only | liveness/readiness probe; pings Postgres, 503 if unreachable. Unauthenticated by necessity, reveals nothing but up/down |
+| POST | `/internal/jobs/process-webhooks`, `/internal/jobs/deliver-tenant-webhooks`, `/internal/jobs/detect-drift` | Throttler, InternalJobsSecretGuard | external-scheduler triggers for the background jobs, used when `JOB_SCHEDULER=external`. Secret in the `x-internal-jobs-secret` header; guard fails closed if unset (decisions.md entry 27) |
 
 Controllers are the source of truth for exact guard order and scopes — verify against the file before repeating a route/guard claim.
 
@@ -92,7 +94,7 @@ Controllers are the source of truth for exact guard order and scopes — verify 
 - `WebhookEvent` is the idempotency guard — every inbound Daraja callback is inserted (unique on `(source, naturalKey)`) *before* processing; a Safaricom retry fails the insert, not the business logic.
 - `RefreshToken` stores only a SHA-256 hash, tracks a rotation chain (`replacedByTokenId`) — a revoked token presented again is a theft signal.
 - `AuditLog` is append-only by convention — never updated/deleted by application code.
-- Tenant-scoped tables carry `tenantId` and are meant to be protected by Postgres RLS; the policy SQL lives in `prisma/manual-sql/001_row_level_security.sql` and must be applied manually (Prisma doesn't manage RLS).
+- Tenant-scoped tables carry `tenantId` and are meant to be protected by Postgres RLS; the policy SQL lives in `prisma/manual-sql/001_row_level_security.sql` and must be applied manually (Prisma doesn't manage RLS). The `FORCE ROW LEVEL SECURITY` half is split into `004_force_row_level_security.sql` and is **not** part of setup — it only becomes safe once `DATABASE_URL` points at the non-owner `app_runtime` role, and applied before that it silently turns every query outside `withTenantContext` into an empty result rather than an error.
 - A tenant can hold multiple `TenantShortcode` rows of the same `type` (e.g. two `PAYBILL`s); at most one per `(tenantId, type)` may have `isDefault: true` — `TenantShortcodesService.create`/`update` enforce this by unsetting the previous default in the same transaction as the write, since `getMpesaCredentialsForPayment`'s `findFirst({ isDefault: true })` lookup is otherwise nondeterministic with two. See `docs/decisions.md` entry 20.
 
 ## Environment
@@ -108,6 +110,9 @@ Every var is validated by `src/config/env.schema.ts` (zod) — the app refuses t
 cp .env.example .env   # fill in real values, rotated credentials only
 npm install
 npx prisma migrate dev
+# Policies + RLS ENABLE + the app_runtime/app_privileged roles — safe to run as-is.
+# Do NOT run 004_force_row_level_security.sql until DATABASE_URL points at
+# app_runtime; see that file's header for why and for the rollback.
 psql $DATABASE_URL -f prisma/manual-sql/001_row_level_security.sql
 npm run start:dev
 ```

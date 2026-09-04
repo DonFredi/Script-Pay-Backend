@@ -52,15 +52,23 @@ ALTER TABLE reconciliation_records ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tenant_webhook_deliveries ENABLE ROW LEVEL SECURITY;
 
-ALTER TABLE tenants FORCE ROW LEVEL SECURITY;
-ALTER TABLE users FORCE ROW LEVEL SECURITY;
-ALTER TABLE api_keys FORCE ROW LEVEL SECURITY;
-ALTER TABLE transactions FORCE ROW LEVEL SECURITY;
-ALTER TABLE ledger_entries FORCE ROW LEVEL SECURITY;
-ALTER TABLE webhook_events FORCE ROW LEVEL SECURITY;
-ALTER TABLE reconciliation_records FORCE ROW LEVEL SECURITY;
-ALTER TABLE audit_logs FORCE ROW LEVEL SECURITY;
-ALTER TABLE tenant_webhook_deliveries FORCE ROW LEVEL SECURITY;
+-- The FORCE ROW LEVEL SECURITY statements that used to sit here have MOVED to
+-- 004_force_row_level_security.sql, and that move is the entire point.
+--
+-- This file is listed in README.md and CLAUDE.md as an ordinary setup step
+-- ("psql $DATABASE_URL -f prisma/manual-sql/001_row_level_security.sql"), so it
+-- gets run against a database whose DATABASE_URL is still the table OWNER — the
+-- app_runtime/app_privileged cutover described above has not happened yet. FORCE
+-- subjects the owner to RLS too, so running it in that state instantly breaks
+-- every query that doesn't call withTenantContext: AuthService's login lookup,
+-- ApiKeyGuard, TenantsService.listAll, both pollers. They return zero rows rather
+-- than erroring, so the app comes back up looking healthy and simply cannot find
+-- any users.
+--
+-- The header above always warned about exactly this. The executable SQL did not
+-- honour the warning, which made the warning worth nothing. ENABLE (above) is
+-- safe to apply today and is a no-op for the owner; FORCE is the step that must
+-- wait for the role cutover, so it now lives in a file you have to choose to run.
 
 -- Column is "tenantId" (camelCase, quoted) — Prisma only @@map'd table names to
 -- snake_case in this schema, not individual field names, so the raw column stays

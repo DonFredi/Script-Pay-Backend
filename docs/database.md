@@ -217,8 +217,16 @@ system-initiated entries (cron jobs, drift detection).
 
 Not managed by Prisma. `prisma/manual-sql/001_row_level_security.sql` must be
 applied by hand (`psql $DATABASE_URL -f prisma/manual-sql/001_row_level_security.sql`)
-after every fresh database setup — it is not part of `prisma migrate`. Shape,
-per tenant-scoped table:
+after every fresh database setup — it is not part of `prisma migrate`.
+
+`004_force_row_level_security.sql` is the second half and is **not** a setup
+step. `FORCE ROW LEVEL SECURITY` removes the table owner's exemption from its own
+policies, so it only means anything once the app connects as `app_runtime` rather
+than as the role that ran the migrations — and applied before that cutover it makes
+every query outside `withTenantContext` return zero rows instead of raising, login
+included. That file lists its prerequisites and carries a rollback.
+
+Shape, per tenant-scoped table:
 
 ```sql
 ALTER TABLE transactions ENABLE ROW LEVEL SECURITY;

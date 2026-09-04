@@ -15,5 +15,9 @@ export const createApiKeySchema = z.object({
     )
     .min(1, "at least one scope is required"),
   expiresAt: z.coerce.date().optional(),
-});
+})
+  // An unrecognized field is rejected rather than silently dropped. This one matters
+  // more than most: the request body decides what an API key is allowed to do, and a
+  // misspelled or invented field here should fail loudly, not vanish.
+  .strict();
 export type CreateApiKeyDto = z.infer<typeof createApiKeySchema>;

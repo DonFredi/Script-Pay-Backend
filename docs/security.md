@@ -175,6 +175,13 @@ logic. Notable domain constraints enforced at this layer: MSISDN format
 per-push limit), Daraja's hard length limits on `accountReference` (12 chars)
 and `transactionDesc` (13 chars), Paybill/Till shortcode format (5–7 digits).
 
+Plain `z.object()` is not strict by default in Zod 4 — an unrecognized body
+field is silently stripped rather than rejected. The six `auth.schema.ts`
+schemas (login, signup, forgot/reset password, verify email, resend
+verification) were hardened with `.strict()` so an unexpected field now
+fails validation instead of vanishing quietly — see `docs/decisions.md`
+entry 22. Every other `*.schema.ts` file still uses the non-strict default.
+
 ## Webhook trust boundary
 
 Inbound Daraja webhooks (`/v1/webhooks/daraja/*`) carry **no auth guard** —

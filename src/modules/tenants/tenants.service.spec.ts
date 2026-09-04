@@ -474,19 +474,55 @@ describe("TenantsService", () => {
       ).rejects.toThrow(ForbiddenException);
     });
 
-    it("forbids a TENANT_ADMIN from self-approving out of KYC review", async () => {
+    it("forbids a TENANT_ADMIN from moving a tenant INTO KYC review", async () => {
+      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({ status: "active" } as any);
+
       await expect(
         service.updateStatus("tenant-1", { status: "pending_kyc" }, user({ tenantId: "tenant-1" })),
       ).rejects.toThrow("Only platform staff can move a tenant into KYC review");
     });
 
-    it("lets a TENANT_ADMIN suspend their own tenant", async () => {
+    // The test that used to carry this name asserted the opposite direction — it
+    // moved a tenant INTO pending_kyc — so the actual escalation path (pending_kyc
+    // -> active, which also has provisionApiKeyOnActivation email a live API key)
+    // was never covered and passed happily for as long as it existed.
+    it("forbids a TENANT_ADMIN from self-approving out of KYC review", async () => {
+      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({ status: "pending_kyc" } as any);
+
+      await expect(
+        service.updateStatus("tenant-1", { status: "active" }, user({ tenantId: "tenant-1" })),
+      ).rejects.toThrow("Only platform staff can change the status of a tenant that is still in KYC review");
+      expect(prisma.tenant.update).not.toHaveBeenCalled();
+    });
+
+    // Closing only `pending_kyc -> active` would leave this two-hop route open,
+    // since the second hop starts from a status tenant admins may legitimately use.
+    it("forbids a TENANT_ADMIN from laundering out of KYC review via suspended", async () => {
+      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({ status: "pending_kyc" } as any);
+
+      await expect(
+        service.updateStatus("tenant-1", { status: "suspended" }, user({ tenantId: "tenant-1" })),
+      ).rejects.toThrow("Only platform staff can change the status of a tenant that is still in KYC review");
+      expect(prisma.tenant.update).not.toHaveBeenCalled();
+    });
+
+    it("lets a TENANT_ADMIN suspend their own already-approved tenant", async () => {
+      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({ status: "active" } as any);
       jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({ id: "tenant-1", status: "suspended" } as any);
 
       const result = await service.updateStatus("tenant-1", { status: "suspended" }, user({ tenantId: "tenant-1" }));
 
       expect(result.status).toBe("suspended");
       expect(auditLog.record).toHaveBeenCalledWith(expect.objectContaining({ action: "tenant.status_changed" }));
+    });
+
+    it("lets a TENANT_ADMIN resume their own suspended tenant", async () => {
+      jest.spyOn(prisma.tenant, "findUniqueOrThrow").mockResolvedValueOnce({ status: "suspended" } as any);
+      jest.spyOn(prisma.tenant, "update").mockResolvedValueOnce({ id: "tenant-1", status: "active" } as any);
+
+      const result = await service.updateStatus("tenant-1", { status: "active" }, user({ tenantId: "tenant-1" }));
+
+      expect(result.status).toBe("active");
     });
 
     it("turns a shortcode collision into a clear 409 when activating a tenant onto an already-claimed shortcode", async () => {

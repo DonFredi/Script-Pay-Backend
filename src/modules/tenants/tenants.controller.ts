@@ -2,6 +2,8 @@ import { Body, Controller, Get, Param, Patch, Post, UseGuards } from "@nestjs/co
 import { AccessTokenGuard } from "../auth/access-token.guard";
 import { CsrfGuard } from "../../common/guards/csrf.guard";
 import { RolesGuard } from "../../common/guards/roles.guard";
+import { TenantAwareThrottlerGuard } from "../../common/guards/tenant-aware-throttler.guard";
+import { ReadThrottle, StrictPaymentThrottle } from "../../common/throttle-tiers";
 import { Roles } from "../../common/decorators/roles.decorator";
 import { CurrentUser, type AuthenticatedUser } from "../../common/decorators/current-user.decorator";
 import { ZodValidationPipe } from "../../common/pipes/zod-validation.pipe";
@@ -14,8 +16,16 @@ import { setAppCredentialsSchema, type SetAppCredentialsDto } from "./tenants.sc
  * a forged request to that endpoint could overwrite a tenant's Daraja credentials,
  * which is at least as sensitive as the payment-initiation and API-key routes.
  */
+/*
+ * TenantAwareThrottlerGuard was missing entirely until now, and ThrottlerModule is
+ * not registered as a global APP_GUARD (see app.module.ts), so every route here was
+ * completely unrated — including the two below that make outbound Daraja calls on
+ * each request. Guard order follows the same rule as everywhere else: it reads
+ * request.user.tenantId, so it must run after AccessTokenGuard.
+ */
 @Controller("v1/tenants")
-@UseGuards(AccessTokenGuard, CsrfGuard, RolesGuard)
+@UseGuards(AccessTokenGuard, CsrfGuard, RolesGuard, TenantAwareThrottlerGuard)
+@ReadThrottle()
 export class TenantsController {
   constructor(private readonly tenants: TenantsService) {}
 
@@ -65,6 +75,16 @@ export class TenantsController {
    * TenantShortcodesController instead, one call per shortcode.
    */
   @Post(":id/app-credentials")
+  // TENANT_ADMIN, not any authenticated member of the tenant. This route carried no
+  // @Roles() at all, and the service only checks that the caller belongs to the
+  // tenant — so TENANT_STAFF could replace the consumer key and secret that every
+  // one of that tenant's payments authenticates with. Every other credential-bearing
+  // route in the codebase (TenantShortcodesController, DashboardB2cController) is
+  // already admin-gated; this one was the outlier.
+  @Roles("SUPER_ADMIN", "TENANT_ADMIN")
+  // Each call reaches out to Daraja to verify the credentials before persisting
+  // them, so it gets the tighter tier rather than the controller's read default.
+  @StrictPaymentThrottle()
   setAppCredentials(
     @Param("id") id: string,
     @Body(new ZodValidationPipe(setAppCredentialsSchema)) dto: SetAppCredentialsDto,

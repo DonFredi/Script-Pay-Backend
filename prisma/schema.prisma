@@ -234,11 +234,13 @@ model PasswordResetToken {
   @@map("password_reset_tokens")
 }
 
-// Backend-issued session tokens — this is what actually gates API access, NOT the
-// Firebase ID token, which is only ever verified once (at /auth/login or /auth/signup)
-// to prove identity before we mint our own tokens. Storing refresh tokens (hashed,
-// never plaintext) lets us revoke a single session, detect reuse of an already-rotated
-// token (a strong signal of theft), and control session lifetime independent of Firebase.
+// Backend-issued session tokens — this is what gates API access. (This comment used
+// to describe them as sitting in front of a Firebase ID token "verified once at
+// /auth/login or /auth/signup"; Firebase was removed entirely and identity is now
+// verified here, against the argon2id hash on User.passwordHash.)
+// Storing refresh tokens (hashed, never plaintext) lets us revoke a single session,
+// detect reuse of an already-rotated token (a strong signal of theft), and control
+// session lifetime directly.
 model RefreshToken {
   id              String        @id @default(uuid())
   userId          String

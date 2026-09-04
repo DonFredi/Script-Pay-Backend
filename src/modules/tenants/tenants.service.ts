@@ -146,11 +146,26 @@ export class TenantsService {
    */
   private async notifyWebhookSecretRotated(tenantId: string, webhookUrl: string, webhookSecret: string) {
     try {
-      const [tenant, admins, staff] = await Promise.all([
-        this.prisma.tenant.findUnique({ where: { id: tenantId }, select: { name: true } }),
-        this.prisma.user.findMany({ where: { tenantId, role: "TENANT_ADMIN" }, select: { email: true } }),
-        this.prisma.user.findMany({ where: { role: "SUPER_ADMIN" }, select: { email: true } }),
-      ]);
+      // Run under this tenant's RLS context. These reads are on the RLS-enforced
+      // connection and previously set no context at all, which is fine today (the
+      // owner role is still exempt) and silently wrong the moment
+      // 004_force_row_level_security.sql is applied: the `users` policy would match
+      // nothing, `admins` would come back empty, and the tenant admin would never
+      // receive the webhook secret — which is shown exactly once and is
+      // unrecoverable afterwards. An empty result, not an error, is the whole
+      // hazard here.
+      //
+      // One context covers both reads: the policy is
+      // `tenantId IS NULL OR tenantId = current_setting(...)`, so SUPER_ADMIN rows
+      // (tenantId null) still match while scoped to this tenant.
+      const { tenant, admins, staff } = await this.prisma.withTenantContext(tenantId, async (tx) => {
+        const [tenant, admins, staff] = await Promise.all([
+          tx.tenant.findUnique({ where: { id: tenantId }, select: { name: true } }),
+          tx.user.findMany({ where: { tenantId, role: "TENANT_ADMIN" }, select: { email: true } }),
+          tx.user.findMany({ where: { role: "SUPER_ADMIN" }, select: { email: true } }),
+        ]);
+        return { tenant, admins, staff };
+      });
 
       await Promise.all([
         ...admins.map((admin) =>
@@ -356,13 +371,30 @@ export class TenantsService {
       if (actor.tenantId !== tenantId) {
         throw new ForbiddenException("Cannot change another tenant's status");
       }
-      if (dto.status === "pending_kyc") {
-        throw new ForbiddenException("Only platform staff can move a tenant into KYC review");
-      }
-      // "removed" is a platform-only kill switch in both directions — a TENANT_ADMIN
-      // can neither remove their own tenant nor reinstate one already removed.
-      if (dto.status === "removed" || before.status === "removed") {
+
+      // A tenant admin's self-service is pausing and resuming an ALREADY-APPROVED
+      // tenant, nothing more. Both the current status and the target must be one of
+      // these — checking only the target was the bug: `pending_kyc -> active` passed
+      // every guard, so a self-registered admin could approve their own KYC and, via
+      // provisionApiKeyOnActivation below, have a live API key emailed to them.
+      //
+      // Gating on `before.status` too is what closes it properly. Rejecting only
+      // `pending_kyc -> active` would have left `pending_kyc -> suspended -> active`
+      // open, since the second hop starts from a status this rule permits — the same
+      // self-approval in two requests.
+      const SELF_SERVICE_STATUSES = ["active", "suspended"];
+
+      if (before.status === "removed" || dto.status === "removed") {
+        // Unchanged: "removed" is a platform-only kill switch in both directions.
         throw new ForbiddenException("Only platform staff can remove or reinstate a tenant");
+      }
+      if (!SELF_SERVICE_STATUSES.includes(before.status)) {
+        throw new ForbiddenException(
+          "Only platform staff can change the status of a tenant that is still in KYC review",
+        );
+      }
+      if (!SELF_SERVICE_STATUSES.includes(dto.status)) {
+        throw new ForbiddenException("Only platform staff can move a tenant into KYC review");
       }
     }
 
@@ -404,10 +436,15 @@ export class TenantsService {
       const provisioned = await this.apiKeysService.provisionDefaultKeyIfNeeded(tenantId);
       if (!provisioned) return; // tenant already held a live key — nothing to do
 
-      const admins = await this.prisma.user.findMany({
-        where: { tenantId, role: "TENANT_ADMIN" },
-        select: { email: true },
-      });
+      // Same RLS-context reasoning as notifyWebhookSecretRotated above: without it,
+      // this read returns zero admins once FORCE lands, and the one-time API key
+      // provisioned just above is never delivered to anyone.
+      const admins = await this.prisma.withTenantContext(tenantId, (tx) =>
+        tx.user.findMany({
+          where: { tenantId, role: "TENANT_ADMIN" },
+          select: { email: true },
+        }),
+      );
 
       await Promise.all(
         admins.map((admin) => this.emailService.sendApiKeyProvisionedEmail(admin.email, provisioned.rawKey)),

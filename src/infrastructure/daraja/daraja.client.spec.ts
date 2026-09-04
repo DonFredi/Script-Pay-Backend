@@ -169,6 +169,53 @@ describe("DarajaClient", () => {
 
       expect(result).toEqual({ resultCode: 0, resultDesc: "The service request is processed successfully." });
     });
+
+    // This is the real shape Safaricom returns while the customer still has the PIN
+    // prompt open: HTTP 500, an errorCode, and NO ResultCode anywhere. It used to be
+    // coerced to -1, which DriftDetectorService then read as "failed" and made
+    // terminal, so the success callback that followed could never settle the row.
+    it("reports no verdict when Daraja says the transaction is still being processed", async () => {
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse({ access_token: "tok-1", expires_in: "3599" }))
+        .mockResolvedValueOnce(
+          jsonResponse(
+            {
+              requestId: "req-1",
+              errorCode: "500.001.1001",
+              errorMessage: "The transaction is being processed",
+            },
+            false,
+            500,
+          ),
+        );
+
+      const result = await client.queryStkPushStatus(creds, "cr-1");
+
+      expect(result.resultCode).toBeNull();
+      expect(result.errorCode).toBe("500.001.1001");
+    });
+
+    it("reports no verdict rather than a bogus code when ResultCode is absent or unparseable", async () => {
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse({ access_token: "tok-1", expires_in: "3599" }))
+        .mockResolvedValueOnce(jsonResponse({ ResponseDescription: "no result code here" }));
+
+      const result = await client.queryStkPushStatus(creds, "cr-1");
+
+      expect(result.resultCode).toBeNull();
+    });
+
+    // 0 is falsy, and a `resultCode || null`-style guard would turn Safaricom's
+    // success verdict into "unknown" — the opposite failure, and a silent one.
+    it("treats a ResultCode of 0 as a real verdict, not as absent", async () => {
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse({ access_token: "tok-1", expires_in: "3599" }))
+        .mockResolvedValueOnce(jsonResponse({ ResultCode: 0, ResultDesc: "Success" }));
+
+      const result = await client.queryStkPushStatus(creds, "cr-1");
+
+      expect(result.resultCode).toBe(0);
+    });
   });
 
   describe("initiateB2C", () => {
