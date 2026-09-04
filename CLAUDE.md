@@ -59,7 +59,8 @@ There is no `apps/`, no `packages/`, no `k8s/`, no `docker-compose.yml`.
 | POST | `/auth/forgot-password`, `/auth/reset-password`, `/auth/verify-email`, `/auth/resend-verification` | Throttler, CsrfGuard | |
 | GET | `/profile` | AccessTokenGuard | resolves role/tenantId for the dashboard |
 | POST | `/profile/logout` | AccessTokenGuard | |
-| POST/GET/PATCH | `/v1/tenants*` | AccessTokenGuard, CsrfGuard, RolesGuard | SUPER_ADMIN for create/status |
+| POST/GET/PATCH | `/v1/tenants*` | AccessTokenGuard, CsrfGuard, RolesGuard, TenantAwareThrottlerGuard | SUPER_ADMIN for create/status. `POST /v1/tenants/:id/app-credentials` is TENANT_ADMIN+ (org-level consumer key/secret only) |
+| POST/GET/PATCH/DELETE | `/v1/tenant-shortcodes*` | AccessTokenGuard, CsrfGuard, RolesGuard, TenantAwareThrottlerGuard | per-shortcode passkey / B2C initiator credentials. `POST :id/register-c2b-url` re-sends C2B callback URLs to Safaricom after a domain change — the only callback type whose URL is stored on Safaricom's side |
 | POST/GET/DELETE | `/v1/api-keys*` | AccessTokenGuard, CsrfGuard, RolesGuard | |
 | POST | `/v1/payments/stk-push` | ApiKeyGuard, TenantAwareThrottlerGuard | tenant-to-platform, scope `PAYMENTS_INITIATE` |
 | POST | `/v1/dashboard/payments/stk-push` | AccessTokenGuard | dashboard-initiated STK push |

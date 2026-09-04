@@ -1,4 +1,4 @@
-import { ConflictException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
 import { Prisma } from "@prisma/client";
 import { PrismaService } from "../prisma/prisma.service";
 import { AuditLogService } from "../audit-log/audit-log.service";
@@ -208,6 +208,72 @@ export class TenantShortcodesService {
       targetType: "TenantShortcode",
       targetId: shortcodeId,
     });
+  }
+
+  /**
+   * Re-sends this shortcode's C2B callback URLs to Safaricom.
+   *
+   * WHY THIS IS A SEPARATE OPERATION
+   * Of the three callback types, only C2B's is stored on Safaricom's side.
+   * STK Push's CallBackURL and B2C's ResultURL/QueueTimeOutURL are built per
+   * request from MPESA_CALLBACK_BASE_URL, so changing that env var fixes them
+   * immediately. C2B's ConfirmationURL/ValidationURL are registered ONCE, and
+   * Safaricom keeps posting to whatever it was told until it is told otherwise.
+   *
+   * Until now the only code path that registered them was create(), so moving the
+   * backend to a new domain left every existing shortcode pointing at the old one
+   * with no way to fix it short of deleting and recreating the shortcode — which
+   * for a live tenant means losing the row that payments reference.
+   *
+   * Unlike create(), a failure here is NOT swallowed. There the registration is a
+   * best-effort side effect of saving a shortcode, and losing it must not roll back
+   * the save. Here registration IS the operation: reporting success when Safaricom
+   * rejected it would leave the caller believing callbacks are fixed when they are
+   * still going to the old host. The BadGatewayException from DarajaClient
+   * propagates unchanged.
+   */
+  async registerC2bUrl(tenantId: string, shortcodeId: string, actor: AuthenticatedUser) {
+    this.assertCanManage(tenantId, actor);
+
+    const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
+    if (!tenant.mpesaConsumerKey || !tenant.mpesaConsumerSecretEncrypted) {
+      throw new ForbiddenException(
+        "Set this tenant's Daraja app credentials (consumer key/secret) before registering callback URLs",
+      );
+    }
+
+    const shortcode = await this.prisma.withTenantContext(tenantId, (tx) =>
+      tx.tenantShortcode.findFirst({ where: { id: shortcodeId, tenantId } }),
+    );
+    if (!shortcode) throw new NotFoundException("Shortcode not found");
+
+    // A B2C shortcode has no C2B URLs to register — its ResultURL and
+    // QueueTimeOutURL travel with each payment request. Rejecting here rather than
+    // calling Daraja means the caller gets a reason instead of a confusing
+    // Safaricom-side error about a shortcode not enabled for C2B.
+    if (shortcode.type === "B2C") {
+      throw new BadRequestException(
+        "A B2C shortcode has no C2B callback URLs to register — its ResultURL is sent with each payout request",
+      );
+    }
+
+    await this.daraja.registerC2bUrl({
+      mpesaConsumerKey: tenant.mpesaConsumerKey,
+      mpesaConsumerSecretEncrypted: this.encryption.decrypt(tenant.mpesaConsumerSecretEncrypted),
+      shortcode: shortcode.shortcode,
+    });
+
+    await this.auditLog.record({
+      tenantId,
+      actorType: "user",
+      actorId: actor.id,
+      action: "daraja.c2b_url_registered",
+      targetType: "TenantShortcode",
+      targetId: shortcode.id,
+      metadata: { shortcode: shortcode.shortcode, type: shortcode.type },
+    });
+
+    return { registered: true, shortcode: shortcode.shortcode, type: shortcode.type };
   }
 
   /** Same "my own tenant only, unless SUPER_ADMIN" split as every other tenant-owned resource. */

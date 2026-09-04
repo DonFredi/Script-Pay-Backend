@@ -255,16 +255,39 @@ browser and can't read cookies to echo the header) and for GET/HEAD/OPTIONS.
 
 ## Retry and scheduling model
 
-No Redis, no BullMQ, no external queue — `@nestjs/schedule` cron jobs polling
-Postgres:
+No Redis, no BullMQ, no external queue — Postgres rows are the queue. What
+*fires* the pollers depends on `JOB_SCHEDULER` (see decisions.md entry 27):
 
-- `WebhookPollerService`: every 10 seconds, processes up to 20 unprocessed
-  `WebhookEvent` rows (`processedAt IS NULL AND attempts < 5`), with an
-  in-memory `isPolling` flag to prevent overlapping runs if one poll takes
-  longer than the interval.
-- `DriftDetectorService`: every 5 minutes, finds transactions stuck in
-  `PROCESSING` for 15+ minutes (bounded to 100 per run) and actively resolves
-  them against Daraja.
+- `in-process` (default) — `@nestjs/schedule` `@Cron` decorators inside the API
+  process. Needs a process that stays alive.
+- `external` — those crons no-op, and an outside scheduler POSTs the
+  `/internal/jobs/*` routes instead. Required on any host that suspends an idle
+  instance (a Render free instance sleeps after 15 minutes; a serverless
+  function is frozen between requests), where the in-process crons never fire
+  at all and inbound Daraja callbacks accumulate unprocessed.
+
+**The two modes are mutually exclusive.** The pollers select their batch without
+claiming rows (no `FOR UPDATE SKIP LOCKED` yet), so two schedulers driving the
+same batch can both transition a transaction and both write its ledger pair —
+crediting a tenant twice for one payment. Each service's `isPolling` flag only
+guards overlap within a single process.
+
+The jobs themselves, under either mode:
+
+- `WebhookPollerService`: processes up to 20 unprocessed `WebhookEvent` rows
+  (`processedAt IS NULL AND attempts < 5`), with an in-memory `isPolling` flag
+  to prevent overlapping runs.
+- `TenantWebhookPollerService`: delivers due `TenantWebhookDelivery` rows,
+  carrying its own backoff schedule (30s, 2m, 10m, 30m, 1h).
+- `DriftDetectorService`: finds collections stuck in `PROCESSING` for 15+
+  minutes and resolves them against Daraja's STK Query API; escalates stuck
+  payouts (5+ minutes) to a human rather than guessing. Bounded to 100 per run.
+
+Cadence in `external` mode is whatever the scheduler is set to — typically one
+minute for the two pollers and 5–15 minutes for drift detection, against the
+10s/10s/5m of the in-process crons. Settlement latency rises to ≤1 minute
+accordingly. The production deployment uses Supabase Cron (`pg_cron` + `pg_net`)
+— see `prisma/manual-sql/005_external_job_scheduler.sql`.
 
 ## Observability
 

@@ -713,3 +713,45 @@ typechecks `scripts/`.
 worked today and broken the moment `scripts/` was removed or another top-level
 source file was added, since the emit path would shift back — encoding an
 accident of directory layout into the start command.
+
+## 29. C2B callback URLs get an explicit re-registration route
+
+**Problem**: moving the backend from one domain to another fixed two of the
+three Daraja callback types and silently broke the third.
+
+STK Push's `CallBackURL` and B2C's `ResultURL`/`QueueTimeOutURL` are built per
+request from `MPESA_CALLBACK_BASE_URL`, so they follow the env var immediately.
+C2B's `ConfirmationURL`/`ValidationURL` are different: `registerC2bUrl` sends
+them to Safaricom **once**, Safaricom stores them, and it keeps posting there
+until told otherwise. Nothing in this codebase told it otherwise —
+`registerC2bUrl` was only ever called from `TenantShortcodesService.create`.
+
+The resulting state is nastier than an outright outage: STK pushes work, so the
+platform looks healthy, while direct Paybill/Till payments post to a host that
+may no longer exist. The only remedy was deleting and recreating the shortcode,
+which for a live tenant destroys the row every transaction references.
+
+**Chosen**: `POST /v1/tenant-shortcodes/:id/register-c2b-url`, on the existing
+controller and guard chain, re-sending the URLs built from the *current*
+`MPESA_CALLBACK_BASE_URL`. POST rather than PATCH because it changes state at
+Safaricom, not on the shortcode row — there is no local representation to
+modify. Idempotent by nature; re-registering the same URLs is the point.
+
+**The one real design decision**: this does NOT swallow a Daraja failure, where
+`create` deliberately does. In `create` the registration is a best-effort side
+effect of saving a shortcode, and losing it must not roll the save back — a
+tenant would rather have the shortcode saved and retry the registration. Here
+registration *is* the operation. Reporting success on a rejection would leave
+the caller believing callbacks are fixed when they are still pointed at the old
+host, which is precisely the invisible-breakage this route exists to end. The
+`BadGatewayException` propagates.
+
+Rejects a `B2C` shortcode with a 400 rather than calling Daraja: it has no C2B
+URLs to register, and letting the call through would return a confusing
+Safaricom-side error about a shortcode not being enabled for C2B.
+
+**Not done**: automatic re-registration on startup or on an
+`MPESA_CALLBACK_BASE_URL` change. That would mean calling Safaricom once per
+shortcode on every boot, and a deploy loop would hammer their API with the
+tenant's own credentials. Re-registration is rare and deliberate; a route the
+operator invokes is the right shape.

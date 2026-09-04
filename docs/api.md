@@ -54,8 +54,51 @@ Guard chain: `AccessTokenGuard, CsrfGuard, RolesGuard` (order matters —
 | POST | `/v1/tenants/onboard` | any authenticated | `{ name, businessShortcode }` | Self-service onboarding; `TenantsService.onboardSelf` enforces caller is `TENANT_ADMIN` with no existing tenant. **The caller's current access token still has `tenantId: null`** after this succeeds (signed before onboarding) — the frontend must call `/auth/refresh` immediately after, or every subsequent request looks tenant-less. |
 | GET | `/v1/tenants` | `SUPER_ADMIN` | — | List all tenants. |
 | GET | `/v1/tenants/:id` | any authenticated | — | No `@Roles()` restriction at the decorator level — `TenantsService.findOne` enforces "only your own tenant" for non-`SUPER_ADMIN` callers. |
-| POST | `/v1/tenants/:id/mpesa-credentials` | any authenticated (service-enforced) | `{ businessShortcode, consumerKey, consumerSecret, passkey, initiatorName?, securityCredential? }` | Encrypts `consumerSecret`/`passkey` before storage (see `docs/architecture.md`, secrets section). `initiatorName`/`securityCredential` are the B2C payout credentials — **optional, but must be supplied together** (zod rejects one without the other) and omitting both leaves any previously-stored pair untouched rather than wiping it, so a tenant re-submitting only collection credentials does not silently lose payout access. `securityCredential` is pasted from Safaricom's portal already RSA-encrypted; ScriptPay never sees the initiator password (`docs/decisions.md` entry 17). Without these, `POST /v1/payments/b2c` returns 403 with a message distinct from the collection-credentials one. |
+| POST | `/v1/tenants/:id/app-credentials` | `SUPER_ADMIN`, `TENANT_ADMIN` | `{ consumerKey, consumerSecret }` | The **org-level** Daraja app credentials only — Safaricom issues one production app per organization, shared across every shortcode the org holds. Everything shortcode-specific (the Paybill/Till number, STK passkey, B2C initiator/security credential) moved to `/v1/tenant-shortcodes`, below. `consumerSecret` is encrypted before storage (see `docs/architecture.md`, secrets section); `consumerKey` is not, since Safaricom's docs treat it as a client ID. Credentials are verified against Daraja **before** persisting, so a typo fails here rather than at the tenant's first real payment. Carries `StrictPaymentThrottle` for that reason. `@Roles()` is deliberate: without it `TENANT_STAFF` could replace the credentials every one of that tenant's payments authenticates with. |
 | PATCH | `/v1/tenants/:id/status` | `SUPER_ADMIN`, `TENANT_ADMIN` | `{ status: "active" \| "suspended" \| "pending_kyc" \| "removed" }` | `SUPER_ADMIN` may set any status on any tenant. `TENANT_ADMIN` may only toggle their own tenant between `active`/`suspended` — `TenantsService.updateStatus` blocks a `TENANT_ADMIN` from setting `pending_kyc`, even though the DTO itself accepts the value (authorization lives in the service, not the schema). `removed` is a platform-only kill switch in **both** directions: a `TENANT_ADMIN` can neither remove their own tenant nor reinstate one already removed — only `SUPER_ADMIN` can do either. `TENANT_STAFF` is excluded entirely by `@Roles()`. A `removed` (or `suspended`) tenant is blocked from moving money in either direction (`getMpesaCredentialsForPayment`/`Payout`) — see `docs/decisions.md` entry 19 for why this is a status flag rather than a hard delete. **A transition into `active` from any other status auto-provisions the tenant's first API key** (see the API-keys section below and `docs/decisions.md` entry 14) — idempotent, skipped if the tenant already holds a live key. |
+
+## Tenant shortcodes — `/v1/tenant-shortcodes`
+
+Guard chain: `AccessTokenGuard, CsrfGuard, RolesGuard, TenantAwareThrottlerGuard`,
+`@Roles("TENANT_ADMIN", "SUPER_ADMIN")` at the controller. `SUPER_ADMIN` must
+name the tenant with `?tenantId=`; everyone else is scoped to their own.
+
+One row per Safaricom shortcode a tenant holds — a Till, a Paybill, and a
+B2C-enabled shortcode are three separate registrations, not three names for one
+number. At most one per `(tenantId, type)` may be `isDefault`, enforced by
+unsetting the previous default in the same transaction as the write.
+
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| POST | `/v1/tenant-shortcodes` | `{ type, shortcode, isDefault?, passkey?, initiatorName?, securityCredential? }` | `TILL`/`PAYBILL` require `passkey` and no B2C fields; `B2C` requires `initiatorName` + `securityCredential` and no passkey. `securityCredential` is pasted from Safaricom's portal already RSA-encrypted — ScriptPay never sees the initiator password (`docs/decisions.md` entry 17). Verifies the tenant's app credentials against Daraja before saving, then registers C2B URLs (non-B2C only) **best-effort**: a registration failure is audit-logged as `daraja.c2b_url_registration_failed` and does not roll back the shortcode. `StrictPaymentThrottle` — calls Daraja twice per request. |
+| GET | `/v1/tenant-shortcodes` | — | Summaries only. Never returns the encrypted columns — just `stkConfigured` / `payoutConfigured` booleans. |
+| PATCH | `/v1/tenant-shortcodes/:id` | partial of the create body | Partial patch, e.g. rotating a passkey or flipping `isDefault`. Does **not** re-register C2B URLs. |
+| POST | `/v1/tenant-shortcodes/:id/register-c2b-url` | — | Re-sends this shortcode's C2B `ConfirmationURL`/`ValidationURL` to Safaricom using the **current** `MPESA_CALLBACK_BASE_URL`. See below. |
+| DELETE | `/v1/tenant-shortcodes/:id` | — | |
+
+### Why `register-c2b-url` exists
+
+Of the three callback types, only C2B's URLs are stored on Safaricom's side:
+
+| Callback | URL source | Follows `MPESA_CALLBACK_BASE_URL`? |
+|---|---|---|
+| STK Push `CallBackURL` | built per request | yes, automatically |
+| B2C `ResultURL` / `QueueTimeOutURL` | built per request | yes, automatically |
+| C2B `ConfirmationURL` / `ValidationURL` | registered once with Safaricom | **no** |
+
+So moving the backend to a new domain silently leaves direct Paybill/Till
+payments posting to the old host while STK Push works fine — a half-broken state
+that is confusing precisely because most things still work. Before this route
+existed the only remedy was deleting and recreating the shortcode, which for a
+live tenant destroys the row transactions reference.
+
+Unlike `create`, a Daraja rejection here is **not** swallowed. There the
+registration is a side effect of saving a shortcode and must not roll it back;
+here registration *is* the operation, and reporting success on a failure would
+leave the caller believing callbacks are fixed when they are not. Returns
+`{ registered: true, shortcode, type }`, or `400` for a `B2C` shortcode (which
+has no C2B URLs to register), `403` without app credentials, `404` for another
+tenant's shortcode, `502` on a Daraja rejection.
 
 ## API keys — `/v1/api-keys`
 
@@ -316,5 +359,47 @@ Note the three payload shapes are mutually incompatible: STK is wrapped in
 flat, and B2C is wrapped in `Result` with `ResultParameters.ResultParameter[]`
 (`Key`/`Value`). Reading the wrong accessor yields `undefined`, not an error.
 
-Both routes only *ingest* (write a `WebhookEvent` row) — actual processing
+All four routes only *ingest* (write a `WebhookEvent` row) — actual processing
 happens asynchronously via `WebhookPollerService`; see `docs/architecture.md`.
+Which mechanism drives that poller depends on `JOB_SCHEDULER`; under
+`external` it is the `/internal/jobs/*` routes below, and **if nothing is
+driving it, callbacks are accepted and stored but never processed.**
+
+## Health — `GET /health`
+
+Guard: `ThrottlerGuard` only. Unauthenticated by necessity — a platform health
+checker has no session and no API key — so it deliberately reveals nothing but
+up/down: no version, no environment, no dependency URLs. `@SkipResponseTransform()`,
+since probes match on shape and status code rather than the response envelope.
+
+Runs `SELECT 1` against Postgres rather than returning a literal: a process that
+is up but cannot reach the database serves nothing but 500s, and a probe that
+calls that healthy defeats the point. Returns `200 {"status":"ok"}`, or `503`
+("not ready to receive traffic", which is what an orchestrator can act on) when
+the database is unreachable.
+
+## Internal jobs — `/internal/jobs/*`
+
+Guard: `ThrottlerGuard, InternalJobsSecretGuard`. The secret travels in the
+`x-internal-jobs-secret` **header**, not a query param as the Daraja webhook
+secret must — there Safaricom builds the URL from what we register, here both
+ends are ours and a header stays out of access and proxy logs. The guard **fails
+closed** when `INTERNAL_JOBS_SECRET` is unset: comparing `""` to `""` would
+otherwise pass and expose money-moving jobs to anyone who found the path.
+
+HTTP triggers for the background jobs, used when `JOB_SCHEDULER=external` (see
+`docs/decisions.md` entry 27 and `prisma/manual-sql/005_external_job_scheduler.sql`).
+Each route calls exactly the method its cron wrapper calls, so the two trigger
+mechanisms cannot drift apart.
+
+| Method | Path | Suggested cadence | Notes |
+|---|---|---|---|
+| POST | `/internal/jobs/process-webhooks` | every minute | The most time-sensitive: until it runs, a customer has paid and the tenant has not been credited. |
+| POST | `/internal/jobs/deliver-tenant-webhooks` | every minute | Carries its own retry backoff, so running it often only re-checks what is due. |
+| POST | `/internal/jobs/detect-drift` | every 5–15 min | Deliberately coarser — querying Safaricom about a payment a few minutes old just returns "still processing". |
+
+All POST, including the read-heavy ones: they change state, and a GET would
+invite a crawler or link preview to settle transactions. Every job is idempotent
+and batch-bounded, so an extra call costs a query and a missed one is picked up
+next run — but they are **not** safe to run concurrently with the in-process
+crons; see the architecture doc's scheduling section.

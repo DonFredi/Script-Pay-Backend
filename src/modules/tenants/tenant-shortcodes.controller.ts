@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Param, Patch, Post, Query, UseGuards } from "@nestjs/common";
+import { BadRequestException, Body, Controller, Delete, ForbiddenException, Get, HttpCode, Param, Patch, Post, Query, UseGuards } from "@nestjs/common";
 import { AccessTokenGuard } from "../auth/access-token.guard";
 import { CsrfGuard } from "../../common/guards/csrf.guard";
 import { RolesGuard } from "../../common/guards/roles.guard";
@@ -50,6 +50,31 @@ export class TenantShortcodesController {
     @Query("tenantId") tenantId?: string,
   ) {
     return this.shortcodes.update(this.resolveTenantId(user, tenantId), id, dto, user);
+  }
+
+  /**
+   * Re-registers this shortcode's C2B callback URLs with Safaricom, using the
+   * CURRENT MPESA_CALLBACK_BASE_URL. Needed whenever the backend moves domain:
+   * STK Push and B2C callback URLs are rebuilt on every request and so follow the
+   * env var automatically, but C2B's are stored on Safaricom's side from a
+   * one-time registration and keep pointing at the old host until re-sent.
+   *
+   * A POST rather than a PATCH: it changes state at Safaricom, not on this
+   * shortcode row, so there is no representation here to modify. Idempotent —
+   * re-registering the same URLs is exactly what this is for.
+   *
+   * StrictPaymentThrottle because it calls Daraja on every invocation, matching
+   * create() on this same controller.
+   */
+  @Post(":id/register-c2b-url")
+  @HttpCode(200)
+  @StrictPaymentThrottle()
+  registerC2bUrl(
+    @Param("id") id: string,
+    @CurrentUser() user: AuthenticatedUser,
+    @Query("tenantId") tenantId?: string,
+  ) {
+    return this.shortcodes.registerC2bUrl(this.resolveTenantId(user, tenantId), id, user);
   }
 
   @Delete(":id")
