@@ -29,10 +29,19 @@ import { PrismaClient } from "@prisma/client";
  *    that happens to also log an audit event is fragile; giving audit logging its
  *    own connection isn't.
  *
- * Falls back to DATABASE_URL when PRIVILEGED_DATABASE_URL is unset — that's the
- * state today, before the live cutover: both connections are the same owner-role
- * connection, which already bypasses RLS regardless, so this class is a no-op
- * change in behavior until the cutover actually happens.
+ * PRIVILEGED_DATABASE_URL is REQUIRED and there is deliberately no fallback to
+ * DATABASE_URL. There used to be one, and it was correct while both connections were
+ * the same owner-role connection — an owner bypasses RLS regardless. The live cutover
+ * inverted that: DATABASE_URL is now app_runtime, which FORCE ROW LEVEL SECURITY
+ * applies to. Falling back would hand every caller above an RLS-enforced connection
+ * with no tenant context set, so each of them would read ZERO ROWS instead of raising
+ * — login rejects every password, ApiKeyGuard rejects every key, and the pollers find
+ * no callbacks to process. Silent, total, and indistinguishable from a data problem.
+ *
+ * Hence the throw below rather than letting PrismaClient quietly resolve `undefined`
+ * back to the schema's own env("DATABASE_URL") default. env.schema.ts already refuses
+ * to boot without it; this is the second line of defence for any construction path
+ * that doesn't go through that validation.
  *
  * Every other tenant-scoped read/write MUST go through PrismaService.withTenantContext
  * instead of this — this connection has no per-request tenant isolation whatsoever.
@@ -40,11 +49,16 @@ import { PrismaClient } from "@prisma/client";
 @Injectable()
 export class PrismaPrivilegedService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
   constructor() {
-    super({
-      datasources: {
-        db: { url: process.env.PRIVILEGED_DATABASE_URL || process.env.DATABASE_URL },
-      },
-    });
+    const url = process.env.PRIVILEGED_DATABASE_URL;
+    if (!url) {
+      throw new Error(
+        "PRIVILEGED_DATABASE_URL is not set. This connection must authenticate as a BYPASSRLS role " +
+          "(app_privileged); silently reusing DATABASE_URL would make every privileged query return " +
+          "zero rows once FORCE ROW LEVEL SECURITY is applied. See prisma/manual-sql/004_force_row_level_security.sql.",
+      );
+    }
+
+    super({ datasources: { db: { url } } });
   }
 
   async onModuleInit() {

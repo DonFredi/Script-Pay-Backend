@@ -55,6 +55,17 @@ const base64Key32Bytes = (envVarName: string) =>
   );
 
 /**
+ * Shared by the type check AND the url check on PRIVILEGED_DATABASE_URL below — see
+ * the comment there for why attaching it to only one of them isn't enough.
+ */
+const PRIVILEGED_DATABASE_URL_HELP =
+  "PRIVILEGED_DATABASE_URL must be set, and must point at the app_privileged (BYPASSRLS) role. " +
+  "Never point it at app_runtime: that role is subject to FORCE ROW LEVEL SECURITY, so every " +
+  "privileged query would return zero rows instead of erroring — no logins, no API keys, no " +
+  "callback processing, and nothing in the logs. If RLS has not been applied to this database " +
+  "at all, set it explicitly to the same value as DATABASE_URL.";
+
+/**
  * Every environment variable the app depends on is declared here.
  * The app refuses to boot if any REQUIRED value is missing or malformed —
  * this converts "undefined env var" from a 2am production bug into a startup failure in CI.
@@ -74,14 +85,33 @@ export const envSchema = z.object({
   // step does — so a running instance without it is fine, but a malformed one is not.
   DIRECT_URL: optionalUrl(),
 
-  // Second connection, for PrismaPrivilegedService — code paths that can't resolve
-  // to a single tenant before querying (see that file's own doc comment). Optional:
-  // unset falls back to DATABASE_URL, which is the correct behavior before the RLS
-  // rollout's live cutover (both connections are the same owner-role connection,
-  // which already bypasses RLS regardless — see 001_row_level_security.sql). Once
-  // that cutover happens, this must point at the app_privileged (BYPASSRLS) role,
-  // never at app_runtime.
-  PRIVILEGED_DATABASE_URL: optionalUrl(),
+  // Second connection, for PrismaPrivilegedService — code paths that cannot resolve
+  // to a single tenant before querying (see that file's own doc comment).
+  //
+  // REQUIRED, and it was not always. This used to be optional and fall back to
+  // DATABASE_URL, which was correct before the RLS cutover: both were the same
+  // owner-role connection, and an owner bypasses RLS anyway, so the fallback was a
+  // no-op. After the cutover it is the opposite of a no-op. DATABASE_URL now points
+  // at app_runtime, which is subject to FORCE ROW LEVEL SECURITY — so a deployment
+  // that simply forgot this one variable would get an "privileged" client that is
+  // silently RLS-enforced, and every query it exists to serve would return ZERO ROWS
+  // rather than raising: login-by-email finds no user ("Invalid email or password"
+  // for everyone), ApiKeyGuard finds no key (every tenant integration 401s), and both
+  // pollers find no work (Daraja callbacks never processed, money never credited).
+  //
+  // Nothing would error. The platform would just stop working, in a way that reads as
+  // a data problem rather than a config one. Requiring it turns that into a refusal to
+  // boot. A deployment that genuinely wants both connections identical — a local dev
+  // database with no RLS applied — must now say so by setting this explicitly to the
+  // same value, which is a deliberate choice rather than an omission.
+  // The message is attached to BOTH the type check and the url check on purpose. A
+  // message passed only to .url() never fires for the case it was written for: when
+  // the variable is absent entirely, zod raises the base string type error first and
+  // reports "expected string, received undefined", which tells an operator nothing
+  // about what to set or why it matters.
+  PRIVILEGED_DATABASE_URL: z
+    .string({ error: PRIVILEGED_DATABASE_URL_HELP })
+    .url(PRIVILEGED_DATABASE_URL_HELP),
 
   MPESA_CONSUMER_KEY: z.string().min(1),
   MPESA_CONSUMER_SECRET: z.string().min(1),

@@ -102,6 +102,7 @@ Controllers are the source of truth for exact guard order and scopes — verify 
 
 Every var is validated by `src/config/env.schema.ts` (zod) — the app refuses to boot on a missing/malformed value. See `.env.example` for the full list. Notable ones:
 - `JWT_ACCESS_SECRET` must be byte-for-byte identical to the frontend's `JWT_ACCESS_SECRET` — it's a shared secret the frontend's Edge middleware uses to verify tokens this backend signs.
+- `PRIVILEGED_DATABASE_URL` is **required** and must point at the `app_privileged` (BYPASSRLS) role — never at `app_runtime`. It used to be optional and fall back to `DATABASE_URL`, which was harmless while both were the owner role. Post-cutover it is not: `DATABASE_URL` is `app_runtime`, which `FORCE ROW LEVEL SECURITY` applies to, so the fallback would give `PrismaPrivilegedService` an RLS-enforced connection and every query it exists to serve would return **zero rows instead of erroring** — login rejects every password, `ApiKeyGuard` rejects every key, both pollers see no work. Nothing logs an error. If a database has no RLS applied at all, set it explicitly to the same value as `DATABASE_URL`. See `docs/decisions.md` entry 32.
 - `CREDENTIALS_ENCRYPTION_KEY` must be a base64-encoded 32-byte key (AES-256-GCM) for tenant Daraja credential encryption.
 - `FRONTEND_ORIGIN` is a required comma-separated CORS allow-list (not optional — an unset value previously produced a silent, headerless CORS failure).
 

@@ -864,3 +864,49 @@ racing the scheduled one cannot double-settle or double-credit anything.
 **Rejected**: processing inline before the ack (Safaricom times these out, and a
 slow ledger write would become a Daraja retry); and shortening the cron interval,
 which `pg_cron` cannot do below a minute anyway.
+
+## 32. `PRIVILEGED_DATABASE_URL` is required, and the fallback to `DATABASE_URL` is gone
+
+**Problem**: `PrismaPrivilegedService` read
+`process.env.PRIVILEGED_DATABASE_URL || process.env.DATABASE_URL`, and the env
+schema declared the variable optional. Both were correct *before* the RLS cutover:
+the two connections were the same owner-role connection, and a table owner bypasses
+RLS anyway, so the fallback was a genuine no-op.
+
+The cutover inverted it. `DATABASE_URL` now points at `app_runtime`, which
+`FORCE ROW LEVEL SECURITY` applies to. A deployment that simply forgot this one
+variable would therefore get a "privileged" client that is silently RLS-enforced —
+and because none of its callers set `app.current_tenant_id` (they can't; resolving
+the tenant is the *output* of those queries, not an input), every one of them would
+return **zero rows rather than raising**:
+
+- `AuthService.login` finds no user → "Invalid email or password" for every account,
+  including correct passwords.
+- `ApiKeyGuard` finds no key → every tenant integration gets 401 "Invalid API key".
+- `WebhookPollerService` / `TenantWebhookPollerService` find no work → Daraja
+  callbacks are never processed, so customers are charged and tenants never credited.
+
+Nothing errors. Nothing appears in the logs. The platform reports itself healthy —
+`/health` only pings Postgres — while being comprehensively broken, and it presents
+as a data problem rather than a config one. That is the single worst failure shape
+available to this codebase, and one missing env var was enough to reach it.
+
+**Chosen**: make it required in `env.schema.ts` with an error message that says what
+to point it at, and delete the fallback in `PrismaPrivilegedService` in favour of an
+explicit throw. The throw is not redundant with the schema — it covers any
+construction path that doesn't go through boot validation, and without it
+`PrismaClient` quietly resolves a `undefined` url back to the schema's own
+`env("DATABASE_URL")` default, which is exactly the silent behaviour being removed.
+
+A database with no RLS applied — a fresh local clone — must now set the variable
+explicitly to the same value as `DATABASE_URL`. That is one line of extra setup, and
+it converts an omission into a stated intention.
+
+**Rejected**: keeping it optional but warning at boot. A log line at startup is not
+seen by the person who redeploys six weeks later, and the failure it warns about is
+invisible in every other channel. Refusing to boot is the only signal that cannot be
+missed. Also rejected: having the app detect its own role at startup (`SELECT
+rolbypassrls`) and fail if the privileged connection lacks `BYPASSRLS`. That is a
+strictly better check and worth doing later — but it is a runtime probe against a
+live database, whereas this is a config error that should be caught before the
+process starts.

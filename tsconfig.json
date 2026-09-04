@@ -11,6 +11,9 @@
     "sourceMap": true,
     "outDir": "./dist",
     "incremental": true,
+    // Inside dist/ so nest-cli's deleteOutDir clears the cache together with the
+    // output it describes — see tsconfig.build.json for the full failure it caused.
+    "tsBuildInfoFile": "./dist/.tsbuildinfo",
     "skipLibCheck": true,
     "strict": true,
     "strictNullChecks": true,

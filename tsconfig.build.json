@@ -15,7 +15,21 @@
     // Stating rootDir rather than relying on the exclude below means a future stray
     // .ts file outside src/ fails the build loudly instead of silently relocating
     // every emitted path again.
-    "rootDir": "./src"
+    "rootDir": "./src",
+
+    // Inside dist/, deliberately. The incremental cache defaulted to
+    // ./tsconfig.build.tsbuildinfo at the REPO ROOT, while nest-cli's deleteOutDir
+    // wipes dist/ before each build — so the cache outlived the output it describes.
+    // The next build read it, concluded every file was already emitted, and emitted
+    // NOTHING while still exiting 0. That is what produced
+    // "Cannot find module './modules/prisma/prisma.module'" from a build that had
+    // just reported success, and it reproduced on every second `nest build`.
+    //
+    // Untracking the file (see .gitignore) stopped a stale cache shipping to the
+    // build host, but did not stop this locally — the file is regenerated on every
+    // build. Putting it inside dist/ is the actual fix: the cache is now deleted by
+    // the same deleteOutDir that deletes the output, so the two can never disagree.
+    "tsBuildInfoFile": "./dist/.tsbuildinfo.build"
   },
   // "scripts" is the addition: those are operator utilities run with ts-node, not
   // part of the deployable server, and including them is what moved the root.
