@@ -1,6 +1,7 @@
 import { Injectable, Logger, BadRequestException } from "@nestjs/common";
 import { PrismaService } from "../prisma/prisma.service";
 import { extractNaturalKey } from "./extract-natural-key";
+import { redactCallbackPayload } from "./redact-callback-payload";
 import type {
   DarajaStkCallback,
   DarajaC2bCallback,
@@ -29,14 +30,14 @@ export class WebhookIngestService {
   async ingest(source: WebhookSource, rawPayload: unknown): Promise<void> {
     // 1. Validate payload structure
     if (!rawPayload || typeof rawPayload !== "object") {
-      this.logger.warn(`Invalid ${source} payload: not an object`, { rawPayload });
+      this.logger.warn(`Invalid ${source} payload: not an object`, redactCallbackPayload(rawPayload));
       throw new BadRequestException(`Invalid ${source} payload`);
     }
 
     // 2. Extract unique key (for idempotency)
     const naturalKey = extractNaturalKey(source, rawPayload);
     if (!naturalKey) {
-      this.logger.warn(`No extractable natural key from ${source} callback`, { rawPayload });
+      this.logger.warn(`No extractable natural key from ${source} callback`, redactCallbackPayload(rawPayload));
       throw new BadRequestException("Cannot extract unique identifier from callback");
     }
 

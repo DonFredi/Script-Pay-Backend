@@ -4,6 +4,8 @@ import { WebhookThrottle } from "../../common/throttle-tiers";
 import { SkipResponseTransform } from "../../common/decorators/skip-response-transform.decorator";
 import { DarajaWebhookSecretGuard } from "../../common/guards/daraja-webhook-secret.guard";
 import { WebhookIngestService } from "./webhook-ingest.service";
+import { WebhookPollerService } from "./webhook-poller.service";
+import { redactCallbackPayload } from "./redact-callback-payload";
 
 /**
  * Daraja Webhook Controller
@@ -32,7 +34,37 @@ import { WebhookIngestService } from "./webhook-ingest.service";
 export class DarajaWebhookController {
   private readonly logger = new Logger(DarajaWebhookController.name);
 
-  constructor(private readonly ingest: WebhookIngestService) {}
+  constructor(
+    private readonly ingest: WebhookIngestService,
+    private readonly poller: WebhookPollerService,
+  ) {}
+
+  /**
+   * Nudges the poller to drain what was just ingested, WITHOUT awaiting it — the 200
+   * to Safaricom must not wait on our own processing.
+   *
+   * The row in `webhook_events` is still the queue and the scheduled poll is still
+   * what guarantees delivery; this only removes the waiting. Under
+   * `JOB_SCHEDULER=external` the scheduler is Supabase Cron, and pg_cron's finest
+   * granularity is one minute — so a customer could enter their M-Pesa PIN and the
+   * merchant's dashboard would keep saying PROCESSING for up to a further 60 seconds,
+   * purely because nothing looked at the row. The instance is already awake and
+   * holding this request; draining now costs nothing and makes settlement land in
+   * about the time the DB round-trips take.
+   *
+   * Safe to fire on every callback, duplicates included: `pollUnprocessedEvents` no-ops
+   * when a run is already in flight, and each transition locks its transaction row
+   * before reading it, so a poll racing the cron cannot double-settle anything.
+   *
+   * The `.catch()` is not optional — an unhandled rejection from a floating promise
+   * terminates the Node process by default, which would turn a single bad callback
+   * into a backend-wide outage. Same reasoning as `ApiKeyGuard`'s `lastUsedAt` write.
+   */
+  private kickProcessing(): void {
+    this.poller.pollUnprocessedEvents().catch((error: unknown) => {
+      this.logger.warn(`Post-ingest processing kick failed, leaving it to the scheduled poll: ${String(error)}`);
+    });
+  }
 
   /**
    * STK Push Callback
@@ -53,6 +85,7 @@ export class DarajaWebhookController {
 
       // Ingest webhook (stores in DB, queues for processing)
       await this.ingest.ingest("daraja_stk_callback", rawPayload);
+      this.kickProcessing();
 
       // Always return 200 to Safaricom (success or not, we've accepted it)
       return { ResultCode: 0, ResultDesc: "Accepted" };
@@ -60,7 +93,9 @@ export class DarajaWebhookController {
       // Log error but still return 200 (so Safaricom doesn't retry indefinitely)
       this.logger.error(`Failed to ingest STK callback: ${String(error)}`, {
         error: String(error),
-        payload: rawPayload,
+        // Never the raw payload — it carries the payer's phone number, name and
+        // amount. See redact-callback-payload.ts.
+        ...redactCallbackPayload(rawPayload),
       });
 
       // Return 200 anyway (Safaricom will eventually stop retrying)
@@ -85,12 +120,15 @@ export class DarajaWebhookController {
       }
 
       await this.ingest.ingest("daraja_c2b_confirmation", rawPayload);
+      this.kickProcessing();
 
       return { ResultCode: 0, ResultDesc: "Accepted" };
     } catch (error) {
       this.logger.error(`Failed to ingest C2B confirmation: ${String(error)}`, {
         error: String(error),
-        payload: rawPayload,
+        // Never the raw payload — it carries the payer's phone number, name and
+        // amount. See redact-callback-payload.ts.
+        ...redactCallbackPayload(rawPayload),
       });
 
       return { ResultCode: 0, ResultDesc: "Accepted" };
@@ -114,12 +152,15 @@ export class DarajaWebhookController {
       }
 
       await this.ingest.ingest("daraja_b2c_result", rawPayload);
+      this.kickProcessing();
 
       return { ResultCode: 0, ResultDesc: "Accepted" };
     } catch (error) {
       this.logger.error(`Failed to ingest B2C result: ${String(error)}`, {
         error: String(error),
-        payload: rawPayload,
+        // Never the raw payload — it carries the payer's phone number, name and
+        // amount. See redact-callback-payload.ts.
+        ...redactCallbackPayload(rawPayload),
       });
 
       return { ResultCode: 0, ResultDesc: "Accepted" };
@@ -146,12 +187,15 @@ export class DarajaWebhookController {
       }
 
       await this.ingest.ingest("daraja_b2c_timeout", rawPayload);
+      this.kickProcessing();
 
       return { ResultCode: 0, ResultDesc: "Accepted" };
     } catch (error) {
       this.logger.error(`Failed to ingest B2C timeout: ${String(error)}`, {
         error: String(error),
-        payload: rawPayload,
+        // Never the raw payload — it carries the payer's phone number, name and
+        // amount. See redact-callback-payload.ts.
+        ...redactCallbackPayload(rawPayload),
       });
 
       return { ResultCode: 0, ResultDesc: "Accepted" };

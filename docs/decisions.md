@@ -682,6 +682,47 @@ correctly — `StkPushService` marks the transaction `FAILED`, `B2cService` also
 releases the reservation — so failing loudly costs nothing, and mis-charging
 costs real money.
 
+## 27. A `JOB_SCHEDULER` switch, because a suspended instance runs no crons
+
+**Problem**: every background job in this repo is a `@nestjs/schedule` `@Cron`
+inside the API process — `WebhookPollerService` (which is what actually turns a
+Daraja callback into a settled transaction and its ledger entries),
+`TenantWebhookPollerService` and `DriftDetectorService`. That design assumes a
+process that is always running. Render's free tier, like most hosts at that
+price, suspends an idle instance instead. A suspended process fires no crons, so
+a customer could pay, Safaricom could deliver the callback, the row could land in
+`webhook_events` — and nothing would ever read it. The money moved and the books
+never noticed.
+
+**Chosen**: a `JOB_SCHEDULER` env var with two values. The default,
+`in-process`, is the existing behaviour. `external` makes every `@Cron` method
+early-return via `inProcessCronEnabled()` and exposes the same work as three
+routes under `/internal/jobs/*`, driven by Supabase Cron (`pg_cron` + `pg_net`,
+set up in `manual-sql/005_external_job_scheduler.sql`) hitting them over HTTP.
+The cron entry point and the HTTP entry point call the *same* method — the
+scheduled wrapper is deliberately a one-line delegate — so the two triggers
+cannot drift into behaving differently.
+
+`InternalJobsSecretGuard` protects the routes with a timing-safe comparison
+against `INTERNAL_JOBS_SECRET`, and **fails closed** when that secret is unset:
+an unconfigured deployment rejects every call rather than exposing job triggers
+to the internet.
+
+**Never run both at once.** The two schedulers would poll the same rows
+concurrently. That is survivable — `pollUnprocessedEvents` no-ops while a run is
+in flight, and every transition locks its transaction row before reading it — but
+it is wasted work and duplicated Daraja queries for no benefit.
+
+**Rejected**: paying for an always-on instance (the point was to run this tier
+first); reintroducing Redis/BullMQ (entry 5 rejected that already, and it does
+not solve a suspended process anyway); and having the external scheduler POST
+*business* payloads rather than trigger-only routes, which would have made the
+scheduler a second, unauthenticated write path into the payment logic.
+
+**Consequence**: `pg_cron`'s finest granularity is one minute, so under
+`external` the queue is drained a minute after a callback arrives rather than
+every ten seconds. See entry 31 for what that cost and how it was bought back.
+
 ## 28. `rootDir` pinned in tsconfig.build.json — the build emitted to the wrong path
 
 **Problem**: production start died with
@@ -755,3 +796,71 @@ Safaricom-side error about a shortcode not being enabled for C2B.
 shortcode on every boot, and a deploy loop would hammer their API with the
 tenant's own credentials. Re-registration is rare and deliberate; a route the
 operator invokes is the right shape.
+
+## 30. Daraja payloads are redacted before they reach a log line
+
+**Problem**: every error path in the callbacks module logged the raw Safaricom
+payload — the four `catch` blocks in `DarajaWebhookController` and two `warn`
+calls in `WebhookIngestService`. Those payloads are not anonymous. An STK
+callback's `CallbackMetadata` carries `PhoneNumber` and `Amount`; a C2B
+confirmation carries `MSISDN`, `FirstName` and `LastName`; a B2C
+`ResultParameter` carries `ReceiverPartyPublicName`, which is a single string
+holding the recipient's phone number *and* their real name. So a malformed
+callback — the exact case these logs exist to debug — wrote a named Kenyan
+customer, their phone number and what they paid into the application logs, and
+from there into wherever those logs ship.
+
+The frontend already refuses to do this: `api-client.ts`'s
+`scrubErrorDataForSentry` sends validation field *names* only, never the
+submitted values, with a comment explaining that payment requests carry msisdn
+and amount. The backend, which handles the same data in rawer form, had no
+equivalent.
+
+**Chosen**: `redactCallbackPayload()`, applied at all six sites. It returns the
+top-level key *names* (enough to see the shape of something malformed) plus an
+allowlist of fields that identify a **transaction** rather than a **person** —
+the correlation ids, `ResultCode`/`ResultDesc`, and `BusinessShortCode`, which is
+the tenant's own shortcode rather than the payer's number.
+
+**Allowlist, not denylist**, deliberately. Safaricom has changed payload shapes
+before (see `extract-natural-key`'s doc comment), and a field nobody has seen yet
+must default to being withheld rather than leaked. `BillRefNumber` is excluded
+despite looking innocuous: merchants routinely put a customer account or member
+number in it.
+
+The raw payload is still persisted to `webhook_events.payload` — that row is the
+audit record and the replay source, it is RLS-protected, and losing it would cost
+the ability to reprocess. The problem was never storing it; it was logging it.
+
+## 31. The queue is drained when a callback arrives, not only when the clock says so
+
+**Problem**: entry 27 moved job scheduling to Supabase Cron, whose finest
+granularity is one minute. `webhook_events` rows are what turn a paid STK push
+into a settled transaction, so under `JOB_SCHEDULER=external` a customer could
+enter their M-Pesa PIN, Safaricom could deliver the callback immediately, and the
+merchant's dashboard would still say `PROCESSING` for up to a further 60 seconds
+— purely because nothing had looked at the row yet. The frontend polls every 2.5s
+against a five-minute ceiling, so it resolved eventually; it just looked broken
+for a minute on every payment.
+
+**Chosen**: `DarajaWebhookController` calls `pollUnprocessedEvents()` immediately
+after a successful ingest, **without awaiting it**. Safaricom's 200 must not wait
+on our processing, so the promise floats — with a mandatory `.catch()`, because
+an unhandled rejection from a floating promise terminates the Node process by
+default and would turn one bad callback into a backend-wide outage (the same
+reasoning as `ApiKeyGuard`'s `lastUsedAt` write).
+
+The row in `webhook_events` is still the queue and the scheduled poll is still
+what *guarantees* delivery. This only removes the waiting: if the kick fails, is
+skipped because a run is already in flight, or the instance dies mid-drain, the
+next scheduled poll picks the row up exactly as before. Nothing depends on the
+kick having run.
+
+**Safe to fire on every callback, duplicates included**: `pollUnprocessedEvents`
+no-ops while a run is in flight, and each transition takes a `FOR UPDATE` lock on
+its transaction row *before* reading the status it decides on, so a kicked poll
+racing the scheduled one cannot double-settle or double-credit anything.
+
+**Rejected**: processing inline before the ack (Safaricom times these out, and a
+slow ledger write would become a Daraja retry); and shortening the cron interval,
+which `pg_cron` cannot do below a minute anyway.

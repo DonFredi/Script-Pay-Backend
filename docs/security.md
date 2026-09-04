@@ -260,12 +260,31 @@ in the codebase is not, by itself, sufficient to leak cross-tenant data.
   significant security-relevant events (webhook processing exhausted its
   retries, STK push failed at Safaricom).
 - `nestjs-pino` structured logs via `LoggingInterceptor` on every request.
+- **Daraja payloads never reach a log line intact.** `redactCallbackPayload()`
+  is applied at all six places the callbacks module logs a Safaricom payload
+  (four `catch` blocks in `DarajaWebhookController`, two `warn` calls in
+  `WebhookIngestService`). Those payloads carry the payer's identity next to
+  the amount — `PhoneNumber` in an STK `CallbackMetadata`, `MSISDN`/`FirstName`/
+  `LastName` on a C2B confirmation, and `ReceiverPartyPublicName` ("2547… -
+  Jane Doe") in a B2C `ResultParameter`. What survives redaction is the
+  top-level key *names* plus an allowlist of transaction identifiers and
+  `ResultCode`/`ResultDesc`. It is an allowlist, not a denylist, so a field
+  Safaricom adds later is withheld by default. See `docs/decisions.md` entry 30.
+- `Sentry.init` in `main.ts` leaves `sendDefaultPii` **off**, deliberately —
+  this process handles raw M-Pesa payloads, and enabling it would attach
+  request bodies and headers to every event. Don't turn it on without a
+  `beforeSend` scrubber.
+- The raw payload IS still persisted to `webhook_events.payload`. That row is
+  the audit record and the replay source, and it sits behind RLS. Storing it
+  was never the problem; logging it was.
 
 ## Known gaps / out of scope
 
-- No CI pipeline or automated security scanning is currently configured in
-  this repo (no `.github/workflows/`, no Dockerfile) — verified absent as of
-  2026-08-21, not merely undocumented.
+- CI exists as of 2026-09-04 (`.github/workflows/ci.yml`: `tsc --noEmit`,
+  `eslint "{src,scripts}/**/*.ts"`, `jest --ci`, `nest build`). This entry
+  previously said no pipeline was configured, verified absent 2026-08-21 —
+  that is no longer true. **Automated security scanning is still absent**: no
+  dependency audit, no SAST, no secret scanning in the pipeline.
 - RLS policy application is a manual step (`psql -f ...`) with no automated
   check that it was actually run against a given database — a fresh
   environment that skips this step loses the second isolation layer without
