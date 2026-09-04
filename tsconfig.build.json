@@ -1,4 +1,23 @@
 {
   "extends": "./tsconfig.json",
-  "exclude": ["node_modules", "test", "dist", "**/*spec.ts"]
+  "compilerOptions": {
+    // Pinned explicitly, and this is load-bearing. tsconfig.json sets outDir but no
+    // rootDir, so TypeScript infers the root as the longest common prefix of its
+    // inputs. With `scripts/*.ts` included alongside `src/`, that prefix was the
+    // REPO ROOT — so `nest build` emitted dist/src/main.js and dist/scripts/, while
+    // package.json's start:prod runs `node dist/main`. Production start therefore
+    // died with MODULE_NOT_FOUND on a build that had just reported success.
+    //
+    // Nothing caught it: `npm run build` exits 0 either way, so CI passed, and local
+    // development uses `nest start --watch`, which never reads dist at all. It only
+    // surfaces on a real deploy.
+    //
+    // Stating rootDir rather than relying on the exclude below means a future stray
+    // .ts file outside src/ fails the build loudly instead of silently relocating
+    // every emitted path again.
+    "rootDir": "./src"
+  },
+  // "scripts" is the addition: those are operator utilities run with ts-node, not
+  // part of the deployable server, and including them is what moved the root.
+  "exclude": ["node_modules", "test", "dist", "scripts", "**/*spec.ts"]
 }

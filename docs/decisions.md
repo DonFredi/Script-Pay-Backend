@@ -681,3 +681,35 @@ always allowed up to 150,000, so the two repos disagreed. The B2C constant
 correctly — `StkPushService` marks the transaction `FAILED`, `B2cService` also
 releases the reservation — so failing loudly costs nothing, and mis-charging
 costs real money.
+
+## 28. `rootDir` pinned in tsconfig.build.json — the build emitted to the wrong path
+
+**Problem**: production start died with
+`Error: Cannot find module '/opt/render/project/src/dist/main'` on a build that
+had just reported success.
+
+`tsconfig.json` sets `outDir: "./dist"` but no `rootDir`, so TypeScript infers
+the root as the longest common prefix of its inputs. `tsconfig.build.json`
+excluded `node_modules`, `test`, `dist` and specs — but not `scripts/`, which
+holds two operator utilities (`promote-to-admin.ts`,
+`check-tenant-credentials.ts`). With both `src/` and `scripts/` as inputs, that
+prefix was the repo root, so `nest build` emitted `dist/src/main.js` and
+`dist/scripts/` — while `package.json`'s `start:prod` runs `node dist/main`.
+
+**Why nothing caught it**: `npm run build` exits 0 either way, so the CI build
+step passed; `tsc --noEmit` passed because compiling is fine, only the emit path
+moved; and local development runs `nest start --watch`, which never reads `dist`
+at all. The failure only exists on a real deploy running the compiled output —
+which is exactly the path no check exercised.
+
+**Chosen**: `scripts` added to the build config's `exclude`, and
+`rootDir: "./src"` stated explicitly rather than left to inference. The exclude
+alone would fix today's symptom; pinning `rootDir` means a future stray `.ts`
+file outside `src/` fails the build loudly instead of silently relocating every
+emitted path again. `tsconfig.json` is untouched, so `tsc --noEmit` in CI still
+typechecks `scripts/`.
+
+**Rejected**: changing `start:prod` to `node dist/src/main`. It would have
+worked today and broken the moment `scripts/` was removed or another top-level
+source file was added, since the emit path would shift back — encoding an
+accident of directory layout into the start command.
