@@ -244,6 +244,16 @@ separately). Append-only by convention: application code never updates or
 deletes a row. `GET /v1/audit-logs` is `RolesGuard`-restricted to
 `SUPER_ADMIN`/`TENANT_ADMIN` — `TENANT_STAFF` cannot read it.
 
+Authentication events are recorded too, as of 2026-09-05: `user.login`,
+`user.login_failed` (both the unknown-email and wrong-password cases, with the
+attempted email in `metadata` and never the password), and
+`auth.refresh_token_reuse_detected`. The last one is the system's strongest
+theft signal — `RefreshTokenService` revokes every session for the user when a
+already-rotated token is presented outside the grace window — and it previously
+existed only as an application log line, which is not something an account
+review weeks later can query. The generic "invalid email or password" response
+is unchanged; the detail lives in the audit row, not the HTTP body.
+
 ## Defense in depth: Row-Level Security
 
 Every tenant-scoped table is meant to carry a Postgres RLS policy
@@ -283,8 +293,17 @@ in the codebase is not, by itself, sufficient to leak cross-tenant data.
 - CI exists as of 2026-09-04 (`.github/workflows/ci.yml`: `tsc --noEmit`,
   `eslint "{src,scripts}/**/*.ts"`, `jest --ci`, `nest build`). This entry
   previously said no pipeline was configured, verified absent 2026-08-21 —
-  that is no longer true. **Automated security scanning is still absent**: no
-  dependency audit, no SAST, no secret scanning in the pipeline.
+  that is no longer true. A dependency audit gate was added 2026-09-05
+  (`npm audit --audit-level=high`, which fails the build on a high or
+  critical advisory; moderates are reported but don't gate). **SAST and
+  secret scanning are still absent.**
+- `deepmerge-ts` is pinned via a `package.json` `overrides` entry rather than
+  by taking the Prisma major bump its advisory fix ships in. The vulnerable
+  path is `prisma` (the dev-only CLI) → `@prisma/config` → `deepmerge-ts`,
+  and the input is this repo's own config file, so there is no attacker
+  surface; a Prisma 6 → 8 upgrade is real migration work that shouldn't ride
+  along with a security patch. Revisit the override when Prisma is upgraded
+  deliberately.
 - RLS policy application is a manual step (`psql -f ...`) with no automated
   check that it was actually run against a given database — a fresh
   environment that skips this step loses the second isolation layer without

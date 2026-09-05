@@ -95,13 +95,40 @@ export class AuthService {
   async login(dto: LoginBodyDto): Promise<SessionResult> {
     const user = await this.prisma.user.findUnique({ where: { email: dto.email } });
     if (!user) {
+      // The failure reason stays out of the HTTP response (enumeration) but belongs
+      // in the audit trail: "which account was targeted, how often, from when" is
+      // the first question asked in an incident review, and the response the
+      // attacker sees is unchanged either way.
+      await this.auditLog.record({
+        actorType: "user",
+        action: "user.login_failed",
+        metadata: { email: dto.email, reason: "unknown_email" },
+      });
       throw new UnauthorizedException("Invalid email or password");
     }
 
     const passwordValid = await argon2.verify(user.passwordHash, dto.password);
     if (!passwordValid) {
+      await this.auditLog.record({
+        tenantId: user.tenantId,
+        actorType: "user",
+        actorId: user.id,
+        action: "user.login_failed",
+        targetType: "User",
+        targetId: user.id,
+        metadata: { email: dto.email, reason: "bad_password" },
+      });
       throw new UnauthorizedException("Invalid email or password");
     }
+
+    await this.auditLog.record({
+      tenantId: user.tenantId,
+      actorType: "user",
+      actorId: user.id,
+      action: "user.login",
+      targetType: "User",
+      targetId: user.id,
+    });
 
     return this.issueSession(user.id, user.email, user.role, user.tenantId, user.username, user.emailVerified);
   }

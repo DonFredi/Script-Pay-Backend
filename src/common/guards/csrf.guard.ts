@@ -1,6 +1,6 @@
 import { Injectable, CanActivate, ExecutionContext, ForbiddenException, Logger } from "@nestjs/common";
 import { Request } from "express";
-import { createHash, randomBytes } from "crypto";
+import { createHash, randomBytes, timingSafeEqual } from "crypto";
 
 /**
  * CSRF Protection Guard
@@ -45,8 +45,13 @@ export class CsrfGuard implements CanActivate {
       throw new ForbiddenException("CSRF token missing");
     }
 
-    // They must match (double-submit validation)
-    if (tokenFromCookie !== tokenFromHeader) {
+    // They must match (double-submit validation). Compared with timingSafeEqual for
+    // the same reason DarajaWebhookSecretGuard and InternalJobsSecretGuard do — and
+    // like those, the length check comes first because timingSafeEqual throws on
+    // mismatched buffer lengths rather than returning false.
+    const cookieBuf = Buffer.from(tokenFromCookie);
+    const headerBuf = Buffer.from(tokenFromHeader);
+    if (cookieBuf.length !== headerBuf.length || !timingSafeEqual(cookieBuf, headerBuf)) {
       this.logger.warn(`CSRF token mismatch: endpoint=${request.path}, method=${method}`);
       throw new ForbiddenException("CSRF token mismatch");
     }

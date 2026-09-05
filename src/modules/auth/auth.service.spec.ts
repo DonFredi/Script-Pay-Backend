@@ -12,6 +12,7 @@ import { AuditLogService } from "../audit-log/audit-log.service";
 describe("AuthService", () => {
   let service: AuthService;
   let prisma: PrismaPrivilegedService;
+  let auditLog: AuditLogService;
 
   const now = new Date();
   const baseUser = {
@@ -84,6 +85,7 @@ describe("AuthService", () => {
 
     service = module.get<AuthService>(AuthService);
     prisma = module.get<PrismaPrivilegedService>(PrismaPrivilegedService);
+    auditLog = module.get<AuditLogService>(AuditLogService);
   });
 
   describe("signup", () => {
@@ -160,6 +162,60 @@ describe("AuthService", () => {
       await expect(service.login({ email: "nonexistent@example.com", password: "any" })).rejects.toThrow(
         "Invalid email or password",
       );
+    });
+
+    it("records a successful login in the audit trail", async () => {
+      const email = "test@example.com";
+      const password = "test123";
+      jest.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        ...baseUser,
+        email,
+        passwordHash: await hash(password),
+        tenantId: "tenant-1",
+      });
+
+      await service.login({ email, password });
+
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: "user.login", actorId: baseUser.id, tenantId: "tenant-1" }),
+      );
+    });
+
+    // The generic error response is what the attacker sees; the audit row is what the
+    // incident reviewer sees. Both failure modes have to leave a trail.
+    it("records a failed login for both an unknown email and a wrong password", async () => {
+      jest.spyOn(prisma.user, "findUnique").mockResolvedValueOnce(null);
+      await expect(service.login({ email: "nobody@example.com", password: "any" })).rejects.toThrow(
+        UnauthorizedException,
+      );
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: "user.login_failed", metadata: expect.objectContaining({ reason: "unknown_email" }) }),
+      );
+
+      jest.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        ...baseUser,
+        passwordHash: await hash("the-real-password"),
+      });
+      await expect(service.login({ email: baseUser.email, password: "wrong-password" })).rejects.toThrow(
+        UnauthorizedException,
+      );
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: "user.login_failed",
+          actorId: baseUser.id,
+          metadata: expect.objectContaining({ reason: "bad_password" }),
+        }),
+      );
+    });
+
+    it("never puts the submitted password in the audit trail", async () => {
+      jest.spyOn(prisma.user, "findUnique").mockResolvedValueOnce(null);
+
+      await expect(service.login({ email: "nobody@example.com", password: "hunter2" })).rejects.toThrow(
+        UnauthorizedException,
+      );
+
+      expect(JSON.stringify((auditLog.record as jest.Mock).mock.calls)).not.toContain("hunter2");
     });
   });
 });

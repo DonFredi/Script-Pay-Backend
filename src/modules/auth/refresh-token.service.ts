@@ -1,6 +1,7 @@
 import { Injectable, UnauthorizedException } from "@nestjs/common";
 import { createHash, randomBytes } from "node:crypto";
 import { PrismaService } from "../prisma/prisma.service";
+import { AuditLogService } from "../audit-log/audit-log.service";
 import type { RefreshToken } from "@prisma/client";
 
 const REFRESH_TTL_DAYS = Number(process.env.JWT_REFRESH_TTL_DAYS ?? 30);
@@ -20,7 +21,10 @@ function hashToken(token: string): string {
 
 @Injectable()
 export class RefreshTokenService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly auditLog: AuditLogService,
+  ) {}
 
   async issue(userId: string): Promise<string> {
     const rawToken = randomBytes(48).toString("base64url");
@@ -58,6 +62,17 @@ export class RefreshTokenService {
         // Reuse of an already-rotated token, outside the grace window (or with no live
         // descendant at all) — treat as compromise, not a normal error.
         await this.revokeAllForUser(existing.userId);
+        // This is the strongest theft signal the system produces, so it goes to the
+        // queryable audit trail rather than application logs alone — someone
+        // reviewing an account weeks later needs to find it via GET /v1/audit-logs.
+        await this.auditLog.record({
+          actorType: "user",
+          actorId: existing.userId,
+          action: "auth.refresh_token_reuse_detected",
+          targetType: "User",
+          targetId: existing.userId,
+          metadata: { revokedTokenId: existing.id },
+        });
         throw new UnauthorizedException("Refresh token reuse detected — all sessions revoked");
       }
 

@@ -2,6 +2,7 @@ import { UnauthorizedException } from "@nestjs/common";
 import { createHash } from "node:crypto";
 import { RefreshTokenService } from "./refresh-token.service";
 import { PrismaService } from "../prisma/prisma.service";
+import { AuditLogService } from "../audit-log/audit-log.service";
 
 function hash(token: string): string {
   return createHash("sha256").update(token).digest("hex");
@@ -10,6 +11,7 @@ function hash(token: string): string {
 describe("RefreshTokenService", () => {
   let service: RefreshTokenService;
   let prisma: PrismaService;
+  let auditLog: AuditLogService;
 
   beforeEach(() => {
     prisma = {
@@ -20,7 +22,8 @@ describe("RefreshTokenService", () => {
         updateMany: jest.fn(),
       },
     } as any;
-    service = new RefreshTokenService(prisma);
+    auditLog = { record: jest.fn().mockResolvedValue(undefined) } as any;
+    service = new RefreshTokenService(prisma, auditLog);
   });
 
   describe("issue", () => {
@@ -90,6 +93,11 @@ describe("RefreshTokenService", () => {
       });
       // Must not also try to rotate a token it just determined was compromised.
       expect(prisma.refreshToken.create).not.toHaveBeenCalled();
+      // The theft signal has to outlive application logs — an account review weeks
+      // later finds it through the audit log or not at all.
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: "auth.refresh_token_reuse_detected", actorId: "user-1" }),
+      );
     });
 
     it("forgives a race: a just-rotated token presented again within the grace window rotates from the live descendant instead of revoking everything", async () => {
