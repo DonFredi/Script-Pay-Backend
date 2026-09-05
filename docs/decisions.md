@@ -910,3 +910,39 @@ rolbypassrls`) and fail if the privileged connection lacks `BYPASSRLS`. That is 
 strictly better check and worth doing later — but it is a runtime probe against a
 live database, whereas this is a config error that should be caught before the
 process starts.
+
+## 33. The production host never got `PRIVILEGED_DATABASE_URL`, and the fix in
+entry 32 could not deploy until it did
+
+**Problem**: This backend runs on Render (Web Service `Script-Pay-Backend`,
+`https://script-pay-backend.onrender.com`), and `PRIVILEGED_DATABASE_URL` was never
+added to that service's environment variables. Entry 32's predicted failure shape
+happened exactly as written: production was stuck on an older deployed commit whose
+`PrismaPrivilegedService` still fell back to `DATABASE_URL`, so `AuthService.login`
+silently ran RLS-enforced with no tenant context and returned zero rows for every
+account — "Invalid email or password" on correct credentials, in production only,
+with nothing in the logs. Local dev worked because the local `.env` has always set
+`PRIVILEGED_DATABASE_URL` correctly.
+
+The commit that made this fail loudly instead of silently (entry 32 itself) had
+already been pushed and auto-deployed on Render — and its boot-time
+`env.schema.ts` validation immediately refused to start, exactly as designed,
+because the variable really was missing. Render's default behavior on a failed
+deploy is to leave the previous successful deploy running. That is correct and safe
+in general, but it meant the stricter, correct version of the code was sitting in a
+"Failed" deploy at the top of the deploy list while the older, silently-broken
+version kept serving traffic underneath it — indistinguishable from "everything is
+fine" unless someone opened the deploy history.
+
+**Chosen**: add `PRIVILEGED_DATABASE_URL` to the Render service's environment
+variables, pointing at the same Supabase `app_privileged` role (BYPASSRLS) that
+local dev already uses against the same database. Once set, the pending deploy
+booted clean and went live on the first retry — no code change was needed beyond
+what entry 32 had already shipped.
+
+**Lesson for next time**: when a production-only symptom looks like entry 32's
+failure shape (auth/API-key/webhook-poller work locally but not in prod, nothing in
+the logs), check the hosting dashboard's deploy history *before* the database or
+the code — specifically, whether the most recent deploy actually succeeded, or
+whether a failed deploy is sitting on top of an older one that's still "Live". A
+boot-time validation error only protects you once it's actually running.

@@ -119,6 +119,30 @@ psql $DATABASE_URL -f prisma/manual-sql/001_row_level_security.sql
 npm run start:dev
 ```
 
+## Deployment
+
+Production runs on **Render** (Web Service `Script-Pay-Backend`,
+`https://script-pay-backend.onrender.com`, free tier), against a **Supabase**
+Postgres database — not Vercel. An earlier Vercel deployment attempt was
+abandoned; don't trust a `.vercel/` folder, `.env.production.local`, or a
+`vercel-build` script if any resurface — they're dead ends, not the real deploy
+target. `pay.scripttagg.co.ke` is the separate frontend repo's Vercel deployment,
+not this backend.
+
+All production env vars live in the Render dashboard for that service, not in any
+file in this repo. `JOB_SCHEDULER=external` is the mode actually running in
+production, driven by Supabase Cron (decisions.md entry 27) — Render's free tier
+suspends an idle instance, so the in-process `@nestjs/schedule` crons alone would
+never fire there.
+
+Render leaves the previous successful deploy live when a new one fails to boot —
+so a stricter env-var check shipped in code is not actually protecting production
+until its deploy has *succeeded*, not merely been pushed. See decisions.md entry 33
+for the incident this caused (`PRIVILEGED_DATABASE_URL` missing from Render only,
+silently breaking login/API-keys/webhook-polling in production while local dev
+worked fine). When a bug is production-only and looks like an RLS/auth-shaped
+silent failure, check the Render deploy history before the code or the database.
+
 ## Further docs
 
 This file and `README.md` are the fast-orientation layer. For depth, see

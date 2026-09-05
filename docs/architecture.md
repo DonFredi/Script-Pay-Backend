@@ -266,6 +266,14 @@ No Redis, no BullMQ, no external queue — Postgres rows are the queue. What
   function is frozen between requests), where the in-process crons never fire
   at all and inbound Daraja callbacks accumulate unprocessed.
 
+Production runs on Render's free tier (Web Service `Script-Pay-Backend`,
+`https://script-pay-backend.onrender.com`), which does sleep on idle, so it runs in
+`external` mode: Supabase Cron (`pg_cron` + `pg_net`, see decisions.md entry 27's
+setup) POSTs `/internal/jobs/*` once a minute, which also happens to keep the
+instance awake. Environment variables live in the Render dashboard for that
+service, not in any file in this repo — see decisions.md entry 33 for what happens
+when one goes missing there specifically.
+
 **The two modes are mutually exclusive.** The pollers select their batch without
 claiming rows (no `FOR UPDATE SKIP LOCKED` yet), so two schedulers driving the
 same batch can both transition a transaction and both write its ledger pair —
