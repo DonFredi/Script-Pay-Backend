@@ -78,7 +78,16 @@ export class AlertsService {
     }
 
     try {
-      await this.resend.emails.send({ from: this.emailFrom, to, subject, html: body });
+      // Resend RESOLVES with `{ data: null, error }` on an API-level rejection
+      // (unverified sending domain, revoked key, rate limit) and only throws on a
+      // transport failure — so awaiting without reading `error` silently discards
+      // exactly the failures most likely to happen in production. This is the alert
+      // channel of last resort; it going quietly missing is the worst case there is.
+      // See EmailService.deliver and docs/decisions.md entry 38.
+      const { error } = await this.resend.emails.send({ from: this.emailFrom, to, subject, html: body });
+      if (error) {
+        this.logger.error(`Failed to send alert email to ${to}: ${error.name} — ${error.message}`);
+      }
     } catch (error) {
       // Same reasoning as sendSlack: never let alert delivery itself throw.
       this.logger.error(`Failed to send alert email to ${to}`, error as Error);

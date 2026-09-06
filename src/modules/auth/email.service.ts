@@ -21,6 +21,49 @@ export class EmailService {
     }
   }
 
+  /**
+   * Every send goes through here, because Resend's SDK has two distinct failure
+   * modes and the obvious code only handles one of them.
+   *
+   * `emails.send()` RESOLVES with `{ data: null, error }` when Resend rejects the
+   * request at the API level — an unverified sending domain, a revoked key, a
+   * rate limit, a malformed recipient — and only *throws* on a transport-level
+   * failure. Every call site here used to `await` the promise inside a try/catch
+   * and inspect neither the returned error nor the resolved value, so a refused
+   * email produced no log line whatsoever: byte-for-byte indistinguishable from a
+   * delivered one, in the logs and everywhere else. That is exactly how you ship
+   * a system whose password resets silently reach nobody. See docs/decisions.md
+   * entry 38.
+   *
+   * Deliberately still never throws. A notification that fails must not fail the
+   * operation that triggered it — a signup whose verification mail bounces is
+   * still a valid signup, and a tenant activation whose API-key email bounces has
+   * still activated the tenant. The boolean is returned for callers that want to
+   * react; ignoring it leaves today's behaviour unchanged apart from the log.
+   */
+  private async deliver(
+    payload: { from: string; to: string; subject: string; html: string },
+    description: string,
+  ): Promise<boolean> {
+    const client = this.resend;
+    if (!client) return false;
+
+    try {
+      const { error } = await client.emails.send(payload);
+      if (error) {
+        // error.name/.message, not the whole object: Resend echoes the payload back
+        // on some validation errors, and these payloads carry raw API keys and
+        // webhook secrets that must never reach a log line.
+        this.logger.error(`Failed to send ${description}: ${error.name} — ${error.message}`);
+        return false;
+      }
+      return true;
+    } catch (error) {
+      this.logger.error(`Failed to send ${description}`, error as Error);
+      return false;
+    }
+  }
+
   async sendVerificationEmail(to: string, token: string): Promise<void> {
     if (!this.resend || !this.from || !this.appUrl) {
       this.logger.warn(`Verification email skipped because email is not configured. User: ${to}`);
@@ -29,17 +72,16 @@ export class EmailService {
 
     const link = `${this.appUrl}/auth/verify-email?token=${encodeURIComponent(token)}`;
 
-    try {
-      await this.resend.emails.send({
+    await this.deliver(
+      {
         from: this.from,
         to,
         subject: `Verify your ${this.platformName} email`,
         html: `<p>Confirm your email address.</p>
                <p><a href="${link}">Verify my email</a></p>`,
-      });
-    } catch (error) {
-      this.logger.error(`Failed to send verification email to ${to}`, error as Error);
-    }
+      },
+      `verification email to ${to}`,
+    );
   }
 
   async sendPasswordResetEmail(to: string, token: string): Promise<void> {
@@ -50,16 +92,15 @@ export class EmailService {
 
     const link = `${this.appUrl}/auth/reset-password?token=${encodeURIComponent(token)}`;
 
-    try {
-      await this.resend.emails.send({
+    await this.deliver(
+      {
         from: this.from,
         to,
         subject: `Reset your ${this.platformName} password`,
         html: `<p><a href="${link}">Reset my password</a></p>`,
-      });
-    } catch (error) {
-      this.logger.error(`Failed to send password reset email to ${to}`, error as Error);
-    }
+      },
+      `password reset email to ${to}`,
+    );
   }
 
   /**
@@ -74,18 +115,17 @@ export class EmailService {
       return;
     }
 
-    try {
-      await this.resend.emails.send({
+    await this.deliver(
+      {
         from: this.from,
         to,
         subject: `Your ${this.platformName} API key`,
         html: `<p>Your account is now active. Here is your API key for integrating with ${this.platformName} —
                store it securely, it will not be shown again.</p>
                <p><code>${rawKey}</code></p>`,
-      });
-    } catch (error) {
-      this.logger.error(`Failed to send API key email to ${to}`, error as Error);
-    }
+      },
+      `API key email to ${to}`,
+    );
   }
 
   /**
@@ -101,8 +141,8 @@ export class EmailService {
       return;
     }
 
-    try {
-      await this.resend.emails.send({
+    await this.deliver(
+      {
         from: this.from,
         to,
         subject: `A new ${this.platformName} API key was issued`,
@@ -110,10 +150,9 @@ export class EmailService {
                it will not be shown again. If you didn't request this, revoke it immediately from your
                dashboard and contact support.</p>
                <p><code>${rawKey}</code></p>`,
-      });
-    } catch (error) {
-      this.logger.error(`Failed to send API key email to ${to}`, error as Error);
-    }
+      },
+      `API key rotation email to ${to}`,
+    );
   }
 
   /**
@@ -130,18 +169,17 @@ export class EmailService {
   ): Promise<void> {
     if (!this.resend || !this.from) return;
 
-    try {
-      await this.resend.emails.send({
+    await this.deliver(
+      {
         from: this.from,
         to,
         subject: `API key issued for ${tenantName}`,
         html: `<p>A new API key (prefix <code>${keyPrefix}</code>, scopes: ${scopes.join(", ")}) was issued for
                tenant <strong>${tenantName}</strong> by ${actorEmail}. The raw key itself is not included here —
                it was delivered directly to the tenant's admin(s).</p>`,
-      });
-    } catch (error) {
-      this.logger.error(`Failed to send API key staff notice to ${to}`, error as Error);
-    }
+      },
+      `API key staff notice to ${to}`,
+    );
   }
 
   /**
@@ -156,8 +194,8 @@ export class EmailService {
       return;
     }
 
-    try {
-      await this.resend.emails.send({
+    await this.deliver(
+      {
         from: this.from,
         to,
         subject: `Your ${this.platformName} webhook secret was rotated`,
@@ -165,27 +203,25 @@ export class EmailService {
                Store it securely — it will not be shown again, and any signature verified against the old
                secret will start failing immediately.</p>
                <p><code>${webhookSecret}</code></p>`,
-      });
-    } catch (error) {
-      this.logger.error(`Failed to send webhook secret email to ${to}`, error as Error);
-    }
+      },
+      `webhook secret email to ${to}`,
+    );
   }
 
   /** Platform-staff notice mirroring sendApiKeyStaffNotice — metadata only, never the secret. */
   async sendWebhookSecretStaffNotice(to: string, tenantName: string, webhookUrl: string): Promise<void> {
     if (!this.resend || !this.from) return;
 
-    try {
-      await this.resend.emails.send({
+    await this.deliver(
+      {
         from: this.from,
         to,
         subject: `Webhook secret rotated for ${tenantName}`,
         html: `<p>The webhook signing secret for tenant <strong>${tenantName}</strong> was rotated, delivering to
                <code>${webhookUrl}</code>. The secret itself is not included here — it was delivered directly to
                the tenant's admin(s).</p>`,
-      });
-    } catch (error) {
-      this.logger.error(`Failed to send webhook secret staff notice to ${to}`, error as Error);
-    }
+      },
+      `webhook secret staff notice to ${to}`,
+    );
   }
 }

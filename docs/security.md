@@ -273,9 +273,17 @@ in the codebase is not, by itself, sufficient to leak cross-tenant data.
 ## Observability
 
 - `@sentry/node` reports 5xx errors via the global `HttpExceptionFilter`.
-- `AlertsService` sends Slack webhook notifications for operationally
-  significant security-relevant events (webhook processing exhausted its
-  retries, STK push failed at Safaricom).
+- `AlertsService` reports operationally significant events (webhook
+  processing exhausted its retries, a payout stuck in `PROCESSING`, an STK
+  push or B2C payout rejected by Safaricom) over two independent channels: a
+  Slack-shaped webhook (`SLACK_WEBHOOK_URL`, all severities) and email
+  (`ALERTS_EMAIL_TO`, `severity: "critical"` only). **Production runs
+  email-only**, so warning-severity alerts — the per-transaction Safaricom
+  rejections — reach the logs, the transaction's own `failureReason` and an
+  `AuditLog` row, but no alert channel. Everything worth waking someone for
+  is `critical` and is delivered. See `docs/decisions.md` entry 37 for why
+  that tradeoff was accepted, and entry 36 for what an unconfigured alerting
+  setup cost before it was.
 - `nestjs-pino` structured logs via `LoggingInterceptor` on every request.
 - **Daraja payloads never reach a log line intact.** `redactCallbackPayload()`
   is applied at all six places the callbacks module logs a Safaricom payload

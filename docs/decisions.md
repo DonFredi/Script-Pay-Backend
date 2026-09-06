@@ -1017,3 +1017,142 @@ before going live") is worth writing down when a claim is genuinely
 unverified, but it should get resolved one way or the other before it ages
 into permanent uncertainty in a security document. This one sat for three
 entries' worth of history before anyone actually checked it.
+
+## 36. Every Daraja callback since the Render migration was going to a dead
+Vercel URL
+
+**Problem**: `MPESA_CALLBACK_BASE_URL` on Render was still set to
+`https://script-pay-backend.vercel.app` — the decommissioned Vercel
+deployment this backend used before moving to Render (see the "Deployment"
+section of `CLAUDE.md` and entry 33). `DarajaClient.buildWebhookUrl` uses
+this value to build the exact `CallBackURL`/`ResultURL`/`QueueTimeOutURL`/
+`ConfirmationURL` Safaricom is told to call back on for every STK push, B2C
+payout, and C2B confirmation. Since that Vercel project no longer serves
+anything, every one of those callbacks since the migration has been going
+nowhere.
+
+The last successfully-received `daraja_b2c_result` webhook was
+2026-08-31T07:26 UTC — consistent with the Vercel deployment having still
+been live and receiving callbacks up to that point, before the cutover to
+Render. Two real B2C payouts initiated afterward (2026-09-05, KES 10 each,
+on a `pending_kyc` sandbox-testing tenant) went to `PROCESSING` and never
+resolved. `DriftDetectorService.detectStuckPayouts` correctly flagged both
+with `driftDetected: true` after 5 minutes exactly as designed — but with no
+alerting channel configured (`SLACK_WEBHOOK_URL`/`ALERTS_EMAIL_TO` both
+unset, a known gap from the go-live audit), that escalation reached only a
+log line, and the stuck payouts sat unnoticed for 5 days until this audit's
+database check found them directly.
+
+STK push (collection) traffic was not silently lost the same way:
+`DriftDetectorService.detectStuckTransactions` resolves those independently
+via Daraja's synchronous STK Push Query API, which never depends on the
+callback URL at all. B2C payouts have no equivalent — by design, per entry
+18 — so this failure mode was specific to payouts and C2B confirmations.
+
+**Chosen**: corrected `MPESA_CALLBACK_BASE_URL` on Render to
+`https://script-pay-backend.onrender.com`, and the same stale value in local
+`.env`. The two stuck payouts were resolved by calling
+`TransactionStateMachine.transitionPayoutToFailed` directly (the same
+function the real `daraja_b2c_result` webhook handler calls on a Safaricom
+failure) — releasing their reserved funds back to the tenant's ledger
+balance through the actual production code path, with an audit-log entry
+(`daraja.b2c_failed_manual_resolution`) recording that this was a manual
+intervention rather than a genuine Safaricom callback.
+
+**Lesson for next time**: a migration between hosts needs every
+outbound-URL-shaped env var re-checked, not just the ones an app needs to
+boot. `MPESA_CALLBACK_BASE_URL` passed `env.schema.ts`'s validation (it's a
+syntactically valid URL) and the app booted and ran normally — the failure
+was entirely in a URL Safaricom holds and calls back on independently, which
+nothing internal ever exercises directly. This is also the second incident
+in a row (see entry 33) caused by a value the previous host's copy still
+had and the new host's never got given — worth a standing checklist item
+for the *next* host migration, not just a lesson for this one.
+
+## 37. Alerting runs on email alone, which silently drops every
+warning-severity alert
+
+**Problem**: `AlertsService` supports two independent channels — a Slack
+incoming webhook (`SLACK_WEBHOOK_URL`, all severities) and email
+(`ALERTS_EMAIL_TO`, `severity: "critical"` only). Neither was configured in
+production, so every alert reached a log line and nothing else. Entry 36 is
+what that costs in practice: two payouts stuck for five days with the
+escalation working exactly as designed and no human at the other end.
+
+**Chosen**: configure email only — `ALERTS_EMAIL_TO` set to a monitored
+operator mailbox (the value itself lives in the Render dashboard, not here),
+reusing the `RESEND_API_KEY`/`EMAIL_FROM` pair the app already needs for
+verification and password-reset mail. No Slack workspace was in use, and
+nothing about `sendSlack` is actually Slack-specific (it POSTs a plain
+`{"text": ...}` body, which Google Chat accepts as-is and Discord accepts at
+a `/slack`-suffixed webhook URL), so that option stays open later at zero
+code cost.
+
+**The tradeoff this makes, stated plainly**: the email branch is gated on
+`severity === "critical"`, so with email as the only channel, every
+`severity: "warning"` alert now has no destination at all. Those are the
+per-transaction failures in `WebhookPollerService` — an individual STK push
+or B2C payout rejected by Safaricom. That is an acceptable loss because each
+one already lands in three other places a person can actually look: the
+transaction row's own `failureReason` (which the frontend polls onto and
+shows the merchant), an `AuditLog` entry, and the structured logs. The
+alerts worth waking someone for — stuck payouts, exhausted webhook retries,
+queue timeouts — are all `critical` and all still delivered.
+
+**Lesson for next time**: "alerting is configured" is not one boolean. Check
+which severities the configured channel actually carries, because a channel
+that covers only half the severity range looks identical to full coverage
+from the outside — right up until the half it drops is the half you needed.
+
+## 38. Every email failure was invisible, because Resend reports rejections by
+returning them rather than throwing
+
+**Problem**: all eight send sites — seven in `EmailService`, one in
+`AlertsService` — were written as `await this.resend.emails.send({...})`
+inside a `try`/`catch`, inspecting neither the resolved value nor the
+returned error. Resend's SDK (v4) types the result as:
+
+```ts
+type CreateEmailResponse =
+  | { data: CreateEmailResponseSuccess; error: null }
+  | { data: null; error: ErrorResponse };
+```
+
+It **resolves** with `{ data: null, error }` for every API-level rejection —
+an unverified sending domain, a revoked or wrong key, a rate limit, a
+recipient the account isn't allowed to mail — and only *throws* on a
+transport-level failure. So the `catch` caught the rare case and the common
+case sailed straight through as success. A refused email produced no log
+line, no metric, no thrown error: byte-for-byte identical to a delivered one
+from the outside.
+
+This was found while testing the alerting configured in entry 37. The first
+test run "succeeded" — no error, no exception. Adding the error check and
+re-running the identical test immediately produced:
+
+```
+Failed to send alert email to <address>: validation_error —
+The scripttagg.co.ke domain is not verified.
+```
+
+Nothing had changed except that the failure became visible. Every
+verification email, password reset, one-time API-key handoff, webhook-secret
+rotation notice and critical alert this deployment had ever "sent" had been
+silently refused.
+
+**Chosen**: a single private `EmailService.deliver()` that both sends and
+inspects `error`, with all seven call sites routed through it, and the same
+check inline in `AlertsService.sendEmail` (one site, no helper warranted).
+Both still deliberately never throw — a notification that fails must not fail
+the operation that triggered it, since a signup whose verification mail
+bounces is still a valid signup — but the failure is now logged with
+Resend's own `name` and `message`. Only those two fields are logged, never
+the whole error object: Resend echoes the request payload back on some
+validation errors, and these payloads carry raw API keys and webhook secrets.
+
+**Lesson for next time**: "wrapped in try/catch" is not the same as "errors
+are handled". Check what the SDK actually does on failure before trusting a
+`catch` to see it — a library that returns errors as values will slip
+straight past exception-shaped error handling, and the resulting silence
+reads exactly like success. The tell was available the whole time: it is in
+the SDK's own exported type, one `.d.ts` away.
