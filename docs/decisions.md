@@ -1156,3 +1156,54 @@ are handled". Check what the SDK actually does on failure before trusting a
 straight past exception-shaped error handling, and the resulting silence
 reads exactly like success. The tell was available the whole time: it is in
 the SDK's own exported type, one `.d.ts` away.
+
+## 39. Two quote characters broke every B2C payout, and the error named the
+wrong field
+
+**Problem**: every payout attempt came back from Safaricom as
+`The initiator information is invalid.` (Daraja `2001`). The initiator name
+was correct (`testapi`, the sandbox operator), the shortcode was correct
+(`600992`, a valid sandbox B2C shortcode), the consumer key/secret were
+correct — OAuth succeeded, which is what proves it, since `2001` is returned
+by the B2C endpoint itself and not by the token endpoint.
+
+The actual fault was in `TenantShortcode.mpesaSecurityCredentialEncrypted`.
+The stored credential decrypted to **346** characters. An RSA-2048 ciphertext
+is 256 bytes, which is exactly **344** characters of base64. The extra two
+were a literal `"` on each end — the value had been pasted complete with its
+surrounding JSON quotes:
+
+```
+"Ab3dEf…P=="     instead of     Ab3dEf…P==
+```
+
+Nothing in the system objected. It was a non-empty string, so
+`optionalCredential()` accepted it; AES-256-GCM encrypted and decrypted it
+perfectly, because it is just a string; `DarajaClient` passes the credential
+through verbatim by design (entry: this app never holds Safaricom's
+certificate and never decrypts the initiator password). The only component
+that could tell was Safaricom, which failed to RSA-decrypt it and reported
+the failure against the *initiator* — sending every investigation toward the
+initiator name and the shortcode, which were both fine.
+
+**Chosen**: two changes, because either alone leaves a gap.
+
+1. Repaired the stored value in place: decrypt, strip the matched wrapping
+   quotes, and refuse to write unless the result is exactly 344 characters of
+   clean base64 decoding to 256 bytes AND survives an encrypt/decrypt round
+   trip unchanged. Gated behind a dry run that prints the checks first.
+2. Hardened `optionalCredential()` in `tenant-shortcodes.schema.ts` to strip a
+   matched leading+trailing quote pair, so the next paste-from-JSON is
+   corrected at the boundary instead of surfacing days later as a Safaricom
+   error naming the wrong field. Only a *matched* pair is removed — a
+   one-sided quote is a value the operator really submitted, and silently
+   rewriting that would be worse than passing it through.
+
+**Lesson for next time**: when a credential is opaque to every layer that
+handles it, length is the only cheap invariant available — and it is a strong
+one. 344 characters of base64 decoding to 256 bytes is a property this
+codebase could have asserted the moment the value arrived, years before
+Safaricom ever saw it. Prefer validating the *shape* of a secret you cannot
+otherwise verify over trusting that whatever was pasted is what was meant.
+And treat a third party's error message as a hint about where it noticed the
+problem, not a statement of what the problem is.

@@ -12,9 +12,40 @@ import { z } from "zod";
  * Same preprocess pattern, and same reasoning, as `optionalString` in
  * config/env.schema.ts. It has to run BEFORE the length check, which is why it
  * wraps rather than chains.
+ *
+ * It also strips a matched pair of wrapping quotes, which `.trim()` alone does not.
+ *
+ * A Daraja security credential is 344 characters of base64 that operators copy out
+ * of Safaricom's portal — and often out of a JSON response, a quoted CSV cell, or a
+ * shell variable, all of which carry the surrounding `"` along with the value. The
+ * result stores as `"Ab3dEf…P=="` instead of `Ab3dEf…P==`, which is still a non-empty
+ * string, still passes every check here, and still encrypts and decrypts perfectly.
+ * It only fails at Safaricom, days later, as `The initiator information is invalid.`
+ * — an error that points at the initiator NAME and gives no hint that the credential
+ * has two extra characters on it. That cost a real debugging session; see
+ * docs/decisions.md entry 39.
+ *
+ * Only a MATCHED leading+trailing pair is removed, so a value that legitimately
+ * contains a quote on one side is left exactly as submitted rather than silently
+ * altered.
  */
+const stripWrappingQuotes = (v: string) => {
+  const trimmed = v.trim();
+  const quoted =
+    trimmed.length >= 2 &&
+    ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'")));
+  return quoted ? trimmed.slice(1, -1).trim() : trimmed;
+};
+
 const optionalCredential = () =>
-  z.preprocess((v) => (typeof v === "string" && v.trim() === "" ? undefined : v), z.string().trim().min(1).optional());
+  z.preprocess(
+    (v) => {
+      if (typeof v !== "string") return v;
+      const cleaned = stripWrappingQuotes(v);
+      return cleaned === "" ? undefined : cleaned;
+    },
+    z.string().trim().min(1).optional(),
+  );
 
 const shortcodeBaseSchema = z
   .object({
