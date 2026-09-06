@@ -27,6 +27,14 @@ async function bootstrap() {
   // (argon2 password hashing, its own access/refresh JWTs). See auth.service.ts.
 
   const app = await NestFactory.create(AppModule);
+  // Render puts exactly one reverse proxy in front of this service. Without this,
+  // Express never trusts X-Forwarded-For, so req.ip/req.ips always resolve to
+  // Render's proxy address for every request — TenantAwareThrottlerGuard's
+  // unauthenticated-request fallback then buckets all unauthenticated traffic
+  // together under that one address instead of per real client. `1` trusts exactly
+  // the first hop (Render's edge) and no further, so a client can't spoof this by
+  // sending its own X-Forwarded-For header. See docs/decisions.md entry 34.
+  app.getHttpAdapter().getInstance().set("trust proxy", 1);
   app.use(
     helmet({
       // Pure JSON API — no HTML/script/style ever served from here, so a CSP

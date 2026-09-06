@@ -3,13 +3,16 @@ import { z } from "zod";
 /**
  * NOTE the amount ceiling is NOT the same number as the STK push one. 150,000 in
  * initiate-stk-push.dto.ts is Safaricom's per-transaction limit for a customer
- * paying IN; B2C has its own, separately-tariffed limit. 250,000 is a reasonable
- * platform-wide default, but Safaricom's actual B2C ceiling is NOT one fixed global
- * number — it varies per shortcode based on that tenant's specific B2C agreement/
- * tier with Safaricom, and can change over time. Before any tenant goes live,
- * confirm this figure against that tenant's own Daraja account limits rather than
- * assuming this default applies to them; do not assume the STK figure transfers
- * either.
+ * paying IN; B2C has its own, separately-tariffed limit. 250,000 is Safaricom's
+ * published per-transaction maximum for B2C (verified against Safaricom's own
+ * M-PESA/Daraja documentation 2026-09-06, see docs/decisions.md entry 35), not a
+ * platform-invented guess — do not assume the STK figure transfers either.
+ *
+ * The real ceiling on any given payout is actually the lower of this figure and
+ * the recipient's available room under their own KES 500,000 M-PESA wallet balance
+ * cap. Safaricom enforces that itself (result code 3 for over the transaction max,
+ * 8 for over the recipient's balance) — this platform has no visibility into a
+ * recipient's balance beforehand, so it isn't worth pre-validating client-side.
  *
  * This ceiling is not what protects the platform from over-spending: that is the
  * balance check in LedgerService.assertSufficientBalance, which no request can

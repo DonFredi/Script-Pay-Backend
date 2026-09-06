@@ -148,6 +148,13 @@ unauthenticated requests. Three tiers (`src/common/throttle-tiers.ts`):
 | `ReadThrottle` | 120/min | Transaction/reporting/audit-log reads |
 | `WebhookThrottle` | 300/min | Inbound Daraja webhooks — generous, since real protection there is idempotency, not rate limiting |
 
+The IP fallback above only identifies a real client because `main.ts` sets
+`trust proxy` to `1` — Render puts exactly one reverse proxy in front of this
+service, so trusting the first hop's `X-Forwarded-For` entry (and no further)
+gives the real client IP without letting a client spoof it themselves. Without
+this, every unauthenticated request resolves to Render's proxy address and
+the fallback buckets all such traffic together. See `docs/decisions.md` entry 34.
+
 ## Secrets at rest
 
 | Secret | Mechanism | Reversible? |
@@ -316,9 +323,20 @@ in the codebase is not, by itself, sufficient to leak cross-tenant data.
   Status API answers asynchronously and auto-recovery therefore needs its own
   callback route and correlation. See `docs/decisions.md` entry 18. The
   collection path does self-heal, so this asymmetry is specific to payouts.
-- **The B2C amount ceiling in `initiate-b2c.dto.ts` (KES 250,000) has not
-  been verified against live Daraja documentation** for a specific shortcode,
-  and it is explicitly *not* the same limit as the STK push one. It bounds
-  requests that Safaricom would reject anyway; it is not what protects the
-  platform from over-spending — the ledger balance check is. Confirm it
-  before going live.
+- **The B2C amount ceiling in `initiate-b2c.dto.ts` (KES 250,000) was
+  verified against Safaricom's published M-PESA/Daraja B2C limits on
+  2026-09-06** (see `docs/decisions.md` entry 35): KES 250,000 is Safaricom's
+  documented per-transaction maximum for B2C, not a platform-invented number,
+  and it is explicitly *not* the same limit as the STK push one (KES
+  150,000). The real-world ceiling on any given payout is actually the lower
+  of that figure and the recipient's available room under their own KES
+  500,000 M-PESA wallet balance cap — Safaricom rejects an over-balance
+  payout with its own result code (`3` over the transaction max, `8` over the
+  recipient's balance), which is out of this platform's control and not
+  worth pre-validating client-side. This ceiling bounds requests that
+  Safaricom would reject anyway; it is not what protects the platform from
+  over-spending — the ledger balance check is. A specific tenant's
+  negotiated Bulk Disbursement account could in principle carry a different
+  limit; nothing found during this pass indicates that's common, but it
+  hasn't been confirmed against Safaricom's private per-account limits
+  either.

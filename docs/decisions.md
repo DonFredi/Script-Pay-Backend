@@ -946,3 +946,74 @@ the logs), check the hosting dashboard's deploy history *before* the database or
 the code — specifically, whether the most recent deploy actually succeeded, or
 whether a failed deploy is sitting on top of an older one that's still "Live". A
 boot-time validation error only protects you once it's actually running.
+
+## 34. Rate limiting was silently keying off Render's proxy address, not the
+real client
+
+**Problem**: A go-live audit of the whole system (prompted by the incident in
+entry 33) found that `main.ts` never called Express's `trust proxy` setting.
+Render terminates TLS and forwards every request through its own reverse
+proxy, so without `trust proxy`, `req.ip`/`req.ips` always resolved to
+Render's proxy address rather than the real client's. `TenantAwareThrottlerGuard`
+(`src/common/guards/tenant-aware-throttler.guard.ts`) falls back to that value
+for any request it can't attribute to a tenant yet — signup, login,
+password-reset, and any bad/missing API key. With every such request
+resolving to the same address, the fallback was bucketing all unauthenticated
+traffic together under Render's proxy IP instead of per real client: one
+abusive client on the 10/min `StrictPaymentThrottle` tier could exhaust the
+whole bucket and lock out every real user trying to sign in or reset a
+password. This shipped unnoticed because local dev has no proxy in front of
+it, so `req.ip` is already correct there — the bug only exists in the exact
+topology production runs under.
+
+**Chosen**: `app.getHttpAdapter().getInstance().set("trust proxy", 1)` in
+`main.ts`, right after `NestFactory.create`. `1` trusts exactly the first hop
+(Render's own edge) and stops there — not `true`, which trusts every hop and
+would let a client set its own `X-Forwarded-For` and have it taken at face
+value, defeating the guard's whole purpose.
+
+**Lesson for next time**: `trust proxy` is a single line that's easy to
+forget entirely on a framework default (Express trusts nothing by default),
+and nothing fails loudly when it's missing — IP-based logic just silently
+degrades to treating every client as the same client. Any code that reads
+`req.ip`/`req.ips` behind a reverse proxy needs this set correctly for the
+exact number of proxy hops in front of it, checked as part of go-live review
+rather than assumed.
+
+## 35. The B2C amount ceiling was a guess with a hedge, not a verified number
+
+**Problem**: `docs/security.md`'s known-gaps section (and the doc comment on
+`B2C_MAX_MINOR_UNITS` in `initiate-b2c.dto.ts`) had flagged the KES 250,000
+B2C ceiling as unverified against live Safaricom documentation, and
+speculated it might vary per tenant based on their specific B2C
+agreement/tier with Safaricom — a caveat added out of caution rather than
+from any confirmed source.
+
+**Investigation**: checked Safaricom's own M-PESA guidance
+(mobilemoney.co.ke, the current home of the content formerly at
+mpesa.or.ke) and a mirrored copy of Safaricom's Daraja v3 API reference for
+the B2C endpoint specifically. Both independently state the same figures for
+B2C: a KES 250,000 maximum per individual transaction, a minimum of KES 10,
+and a KES 500,000 cap on the recipient's total M-PESA wallet balance — the
+same 250,000/500,000 pair that also governs ordinary consumer M-PESA
+transaction/wallet limits generally. The Daraja reference lists explicit
+result codes for both failure modes: code `3` ("greater than the maximum
+transaction amount") and code `8` ("would exceed the maximum balance").
+Neither source described the 250,000 figure as configurable per shortcode
+or tenant tier.
+
+**Chosen**: treat KES 250,000 as Safaricom's genuine documented B2C ceiling,
+not a platform guess — no code change needed, since that was already the
+value in use. Updated the doc comment and `docs/security.md` to state this as
+verified rather than assumed, and to note the real, unavoidable second
+constraint: a payout can still fail with result code 8 if it would push the
+recipient over their own KES 500,000 wallet balance, which this platform
+cannot see in advance and isn't worth pre-validating client-side — the
+existing `failureReason` persistence (decisions.md entry 21) already surfaces
+that rejection to the tenant when it happens.
+
+**Lesson for next time**: a hedge in a comment ("this might vary, confirm
+before going live") is worth writing down when a claim is genuinely
+unverified, but it should get resolved one way or the other before it ages
+into permanent uncertainty in a security document. This one sat for three
+entries' worth of history before anyone actually checked it.
