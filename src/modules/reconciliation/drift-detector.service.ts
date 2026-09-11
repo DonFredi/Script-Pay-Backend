@@ -147,6 +147,13 @@ export class DriftDetectorService {
         });
         if (existing?.driftDetected) continue;
 
+        // Best-effort auto-recovery: ask Safaricom directly rather than only waiting
+        // for a callback that may never arrive. Deliberately does NOT replace the
+        // alert below — the query's own result can just as easily go missing (see
+        // WebhookPollerService.processTransactionStatusResult's Stage 1 note), so the
+        // human safety net stays unconditional either way.
+        await this.attemptStatusQuery(payout);
+
         await this.prisma.reconciliationRecord.upsert({
           where: { transactionId: payout.id },
           create: {
@@ -192,6 +199,66 @@ export class DriftDetectorService {
         // One payout failing to escalate must not stop the rest of the batch.
         this.logger.error(`Failed to escalate stuck payout ${payout.id}`, error as Error);
       }
+    }
+  }
+
+  /**
+   * Fires the Transaction Status API query added in docs/decisions.md entry 41. Every
+   * failure mode here is swallowed and logged, never rethrown — this must never be
+   * able to stop the alert that follows it, since the alert is what has always
+   * resolved a stuck payout up to now and the query firing successfully is no
+   * guarantee its own result will arrive either.
+   */
+  private async attemptStatusQuery(payout: {
+    id: string;
+    tenantId: string;
+    originatorConversationId: string | null;
+    amountMinorUnits: number;
+  }): Promise<void> {
+    if (!payout.originatorConversationId) return; // nothing to query Safaricom by
+
+    try {
+      // Guards against firing a second query while one is already in flight — the
+      // outer driftDetected check already prevents re-entry on the common path, this
+      // covers the case where an earlier pass created the query row but failed
+      // before reaching driftDetected: true.
+      const inFlight = await this.prisma.payoutStatusQuery.findFirst({
+        where: { transactionId: payout.id, resolvedAt: null },
+      });
+      if (inFlight) return;
+
+      // Deliberately the tenant's DEFAULT B2C shortcode — a payout's own row doesn't
+      // record which shortcode it was sent from (see docs/decisions.md entry 41's
+      // open item), so this can be wrong for a tenant with more than one B2C
+      // shortcode. Every real tenant observed so far has exactly one; skip rather
+      // than guess for one that doesn't.
+      const shortcode = await this.prisma.tenantShortcode.findFirst({
+        where: { tenantId: payout.tenantId, type: "B2C", isDefault: true },
+      });
+      if (!shortcode) {
+        this.logger.warn(
+          `No default B2C shortcode for tenant ${payout.tenantId} — skipping auto-recovery query for payout ${payout.id}`,
+        );
+        return;
+      }
+
+      const credentials = await this.tenantsService.getMpesaCredentialsForPayout(payout.tenantId, shortcode.id);
+      const query = await this.daraja.queryPayoutStatus(credentials, payout.originatorConversationId);
+
+      await this.prisma.payoutStatusQuery.create({
+        data: {
+          tenantId: payout.tenantId,
+          transactionId: payout.id,
+          queryOriginatorConversationId: query.originatorConversationId,
+          queryConversationId: query.conversationId,
+        },
+      });
+
+      this.logger.log(
+        `Fired auto-recovery status query for stuck payout ${payout.id} (query OriginatorConversationID ${query.originatorConversationId})`,
+      );
+    } catch (error) {
+      this.logger.error(`Auto-recovery status query failed for payout ${payout.id}`, error as Error);
     }
   }
 

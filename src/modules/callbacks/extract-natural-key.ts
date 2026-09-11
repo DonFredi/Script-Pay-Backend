@@ -24,7 +24,15 @@ export function extractNaturalKey(source: string, payload: unknown): string | nu
   // (source, naturalKey)), so a result and a timeout for the SAME payout are two
   // distinct events and both get processed. That is intended: they mean different
   // things and the timeout handler must still run even if a result also arrived.
-  if (source === "daraja_b2c_result" || source === "daraja_b2c_timeout") {
+  // Same Result envelope as the B2C callbacks, but note this OriginatorConversationID
+  // belongs to the STATUS QUERY itself, not the original stuck payout — see
+  // PayoutStatusQuery and DarajaTransactionStatusResultCallback's doc comment.
+  if (
+    source === "daraja_b2c_result" ||
+    source === "daraja_b2c_timeout" ||
+    source === "daraja_transaction_status_result" ||
+    source === "daraja_transaction_status_timeout"
+  ) {
     const result = (payload as Partial<DarajaB2cResultCallback>).Result;
     return typeof result?.OriginatorConversationID === "string" ? result.OriginatorConversationID : null;
   }

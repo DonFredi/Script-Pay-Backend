@@ -202,6 +202,21 @@ self-healing drift is still a signal that webhook delivery had a problem
 `docs/reporting`) is worth alerting on even though any individual case
 self-healed.
 
+### `payout_status_queries` (`PayoutStatusQuery`)
+
+Correlation map for the Transaction Status API's asynchronous result (docs/decisions.md
+entry 41's auto-recovery for a B2C payout stuck without a real result callback). The
+query is sent using the ORIGINAL payout's own `originatorConversationId`
+(`OriginalConversationID` in the request — confirmed empirically not to require a
+Safaricom receipt/`TransactionID`, which a stuck payout never has), but Safaricom's
+synchronous accept returns a FRESH `OriginatorConversationID`/`ConversationID` for
+the query itself, and that's what the eventual `ResultURL`/`QueueTimeOutURL` callback
+carries. `queryOriginatorConversationId` (`@unique`) is that fresh id — without this
+row, the async result has no way back to the payout it was asking about.
+`resolvedAt` closes the row once a result or timeout arrives; `transactionId,
+resolvedAt` is indexed so `DriftDetectorService` can cheaply check "is a query
+already in flight for this payout" before firing another one.
+
 ### `audit_logs` (`AuditLog`)
 
 Append-only by convention (application code never updates or deletes a row —

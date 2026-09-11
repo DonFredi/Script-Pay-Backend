@@ -25,14 +25,19 @@ describe("DriftDetectorService", () => {
           useValue: {
             transaction: { findMany: jest.fn() },
             reconciliationRecord: { updateMany: jest.fn(), findUnique: jest.fn(), upsert: jest.fn() },
+            payoutStatusQuery: { findFirst: jest.fn(), create: jest.fn() },
+            tenantShortcode: { findFirst: jest.fn() },
           },
         },
-        { provide: DarajaClient, useValue: { queryStkPushStatus: jest.fn() } },
+        { provide: DarajaClient, useValue: { queryStkPushStatus: jest.fn(), queryPayoutStatus: jest.fn() } },
         {
           provide: TransactionStateMachine,
           useValue: { transitionToSettled: jest.fn(), transitionToFailed: jest.fn() },
         },
-        { provide: TenantsService, useValue: { getMpesaCredentialsForPayment: jest.fn() } },
+        {
+          provide: TenantsService,
+          useValue: { getMpesaCredentialsForPayment: jest.fn(), getMpesaCredentialsForPayout: jest.fn() },
+        },
         { provide: AlertsService, useValue: { send: jest.fn() } },
         { provide: AuditLogService, useValue: { record: jest.fn() } },
       ],
@@ -263,6 +268,90 @@ describe("DriftDetectorService", () => {
 
       expect(stateMachine.transitionToSettled).not.toHaveBeenCalled();
       expect(stateMachine.transitionToFailed).not.toHaveBeenCalled();
+    });
+
+    describe("auto-recovery status query", () => {
+      const shortcode = { id: "shortcode-1", tenantId: "tenant-1", type: "B2C", isDefault: true };
+      const credentials = { shortcode: "600992", initiatorName: "testapi", securityCredential: "blob" };
+
+      it("fires a status query using the payout's own originatorConversationId, then still alerts", async () => {
+        jest.spyOn(prisma.transaction, "findMany").mockResolvedValueOnce([stuckPayout] as any);
+        jest.spyOn(prisma.reconciliationRecord, "findUnique").mockResolvedValueOnce(null);
+        jest.spyOn(prisma.payoutStatusQuery, "findFirst").mockResolvedValueOnce(null);
+        jest.spyOn(prisma.tenantShortcode, "findFirst").mockResolvedValueOnce(shortcode as any);
+        jest.spyOn(tenantsService, "getMpesaCredentialsForPayout").mockResolvedValueOnce(credentials as any);
+        jest
+          .spyOn(daraja, "queryPayoutStatus")
+          .mockResolvedValueOnce({ conversationId: "AG_query1", originatorConversationId: "query-oc-1" });
+
+        await service.detectStuckPayouts();
+
+        expect(daraja.queryPayoutStatus).toHaveBeenCalledWith(credentials, "oc-1");
+        expect(prisma.payoutStatusQuery.create).toHaveBeenCalledWith({
+          data: {
+            tenantId: "tenant-1",
+            transactionId: "payout-1",
+            queryOriginatorConversationId: "query-oc-1",
+            queryConversationId: "AG_query1",
+          },
+        });
+        // The query firing must never replace the human alert — its own result can
+        // just as easily go missing.
+        expect(alerts.send).toHaveBeenCalledWith(expect.objectContaining({ severity: "critical" }));
+      });
+
+      it("skips the query and still alerts when the tenant has no default B2C shortcode", async () => {
+        jest.spyOn(prisma.transaction, "findMany").mockResolvedValueOnce([stuckPayout] as any);
+        jest.spyOn(prisma.reconciliationRecord, "findUnique").mockResolvedValueOnce(null);
+        jest.spyOn(prisma.payoutStatusQuery, "findFirst").mockResolvedValueOnce(null);
+        jest.spyOn(prisma.tenantShortcode, "findFirst").mockResolvedValueOnce(null);
+
+        await service.detectStuckPayouts();
+
+        expect(daraja.queryPayoutStatus).not.toHaveBeenCalled();
+        expect(alerts.send).toHaveBeenCalledWith(expect.objectContaining({ severity: "critical" }));
+      });
+
+      it("does not fire a second query while one is already unresolved for this payout", async () => {
+        jest.spyOn(prisma.transaction, "findMany").mockResolvedValueOnce([stuckPayout] as any);
+        jest.spyOn(prisma.reconciliationRecord, "findUnique").mockResolvedValueOnce(null);
+        jest
+          .spyOn(prisma.payoutStatusQuery, "findFirst")
+          .mockResolvedValueOnce({ id: "existing-query", resolvedAt: null } as any);
+
+        await service.detectStuckPayouts();
+
+        expect(daraja.queryPayoutStatus).not.toHaveBeenCalled();
+        expect(alerts.send).toHaveBeenCalledWith(expect.objectContaining({ severity: "critical" }));
+      });
+
+      // The query is best-effort. Its failure must never be able to suppress the
+      // one thing that has always resolved a stuck payout: the human alert.
+      it("still escalates normally when the status query itself throws", async () => {
+        jest.spyOn(prisma.transaction, "findMany").mockResolvedValueOnce([stuckPayout] as any);
+        jest.spyOn(prisma.reconciliationRecord, "findUnique").mockResolvedValueOnce(null);
+        jest.spyOn(prisma.payoutStatusQuery, "findFirst").mockResolvedValueOnce(null);
+        jest.spyOn(prisma.tenantShortcode, "findFirst").mockResolvedValueOnce(shortcode as any);
+        jest.spyOn(tenantsService, "getMpesaCredentialsForPayout").mockResolvedValueOnce(credentials as any);
+        jest.spyOn(daraja, "queryPayoutStatus").mockRejectedValueOnce(new Error("Daraja rejected the query"));
+
+        await service.detectStuckPayouts();
+
+        expect(alerts.send).toHaveBeenCalledWith(expect.objectContaining({ severity: "critical" }));
+        expect(prisma.reconciliationRecord.upsert).toHaveBeenCalled();
+      });
+
+      it("skips the query entirely when the payout has no originatorConversationId to query by", async () => {
+        jest
+          .spyOn(prisma.transaction, "findMany")
+          .mockResolvedValueOnce([{ ...stuckPayout, originatorConversationId: null }] as any);
+        jest.spyOn(prisma.reconciliationRecord, "findUnique").mockResolvedValueOnce(null);
+
+        await service.detectStuckPayouts();
+
+        expect(prisma.tenantShortcode.findFirst).not.toHaveBeenCalled();
+        expect(daraja.queryPayoutStatus).not.toHaveBeenCalled();
+      });
     });
 
     it("keeps escalating the rest of the batch when one payout fails to escalate", async () => {

@@ -343,6 +343,8 @@ protection is the `WebhookEvent` idempotency constraint, not authentication.
 | POST | `/v1/webhooks/daraja/c2b-confirmation` | Paybill/Till payment confirmation. Same always-200 contract. |
 | POST | `/v1/webhooks/daraja/b2c-result` | Payout outcome (Daraja `ResultURL`). Here a `ResultCode` of 0 **does** mean the money moved, unlike the sync response to the payment request. Correlates on `Result.OriginatorConversationID`. |
 | POST | `/v1/webhooks/daraja/b2c-timeout` | Payout queue timeout (Daraja `QueueTimeOutURL`). **Not a failure notice** — see below. |
+| POST | `/v1/webhooks/daraja/transaction-status-result` | Async answer to `DriftDetectorService`'s auto-recovery status query for a stuck payout (see `docs/decisions.md` entry 41). Correlates on `Result.OriginatorConversationID` — but that id belongs to the STATUS QUERY, not the original payout; joined via `PayoutStatusQuery`. **Stage 1**: records the result for inspection but does not yet apply it to the transaction — see `WebhookPollerService.processTransactionStatusResult`'s doc comment. |
+| POST | `/v1/webhooks/daraja/transaction-status-timeout` | The status query itself timed out (not the underlying payout). Closes the `PayoutStatusQuery` row; `DriftDetectorService`'s own alert is still what a human acts on. |
 
 The timeout route deliberately performs **no state transition and releases no
 reservation**. A queue timeout means Safaricom could not process the request

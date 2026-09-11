@@ -338,4 +338,82 @@ describe("DarajaClient", () => {
       await expect(client.initiateB2C(payoutCreds, b2cParams)).rejects.toThrow(BadGatewayException);
     });
   });
+
+  describe("queryPayoutStatus", () => {
+    const acceptedResponse = {
+      ConversationID: "AG_20260911_queryconv1",
+      OriginatorConversationID: "query-oc-1",
+      ResponseCode: "0",
+      ResponseDescription: "Accept the service request successfully.",
+    };
+
+    it("POSTs to the transaction status endpoint and returns the QUERY's own conversation ids", async () => {
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse({ access_token: "tok-1", expires_in: "3599" }))
+        .mockResolvedValueOnce(jsonResponse(acceptedResponse));
+
+      const result = await client.queryPayoutStatus(payoutCreds, "original-oc-1");
+
+      expect(result).toEqual({ conversationId: "AG_20260911_queryconv1", originatorConversationId: "query-oc-1" });
+      expect(fetchMock.mock.calls[1][0]).toContain("sandbox.safaricom.co.ke/mpesa/transactionstatus/v1/query");
+    });
+
+    // The exact field name confirmed empirically against Safaricom's sandbox
+    // (docs/decisions.md entry 41) — "OriginalConversationID", not
+    // "OriginatorConversationID", the field every other Daraja response echoes back.
+    it("sends the original payout's id as OriginalConversationID, not OriginatorConversationID", async () => {
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse({ access_token: "tok-1", expires_in: "3599" }))
+        .mockResolvedValueOnce(jsonResponse(acceptedResponse));
+
+      await client.queryPayoutStatus(payoutCreds, "original-oc-1");
+
+      const body = JSON.parse(fetchMock.mock.calls[1][1].body);
+      expect(body.OriginalConversationID).toBe("original-oc-1");
+      expect(body.OriginatorConversationID).toBeUndefined();
+    });
+
+    it("authenticates with the initiator name and security credential, not the passkey", async () => {
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse({ access_token: "tok-1", expires_in: "3599" }))
+        .mockResolvedValueOnce(jsonResponse(acceptedResponse));
+
+      await client.queryPayoutStatus(payoutCreds, "original-oc-1");
+
+      const body = JSON.parse(fetchMock.mock.calls[1][1].body);
+      expect(body.Initiator).toBe("testapi");
+      expect(body.SecurityCredential).toBe("rsa-encrypted-blob");
+      expect(body.CommandID).toBe("TransactionStatusQuery");
+      expect(body.PartyA).toBe("600000");
+      expect(body.IdentifierType).toBe("4");
+    });
+
+    it("sends BOTH callback URLs, built from MPESA_CALLBACK_BASE_URL", async () => {
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse({ access_token: "tok-1", expires_in: "3599" }))
+        .mockResolvedValueOnce(jsonResponse(acceptedResponse));
+
+      await client.queryPayoutStatus(payoutCreds, "original-oc-1");
+
+      const body = JSON.parse(fetchMock.mock.calls[1][1].body);
+      expect(body.ResultURL).toBe(
+        "https://api.scriptpay.test/v1/webhooks/daraja/transaction-status-result?token=test-webhook-secret",
+      );
+      expect(body.QueueTimeOutURL).toBe(
+        "https://api.scriptpay.test/v1/webhooks/daraja/transaction-status-timeout?token=test-webhook-secret",
+      );
+    });
+
+    it("throws BadGatewayException surfacing Safaricom's own rejection reason", async () => {
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse({ access_token: "tok-1", expires_in: "3599" }))
+        .mockResolvedValueOnce(
+          jsonResponse({ errorCode: "400.002.02", errorMessage: "Bad Request - Transaction ID or OriginalConversation ID is mandatory" }, false, 400),
+        );
+
+      await expect(client.queryPayoutStatus(payoutCreds, "original-oc-1")).rejects.toThrow(
+        "Transaction ID or OriginalConversation ID is mandatory",
+      );
+    });
+  });
 });

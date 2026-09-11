@@ -1265,3 +1265,78 @@ the gap between "detected" and "resolved automatically." That remains the
 real follow-up, and is more pressing now that this route makes manual
 resolution easy enough that it could quietly become the permanent answer
 instead of a stopgap.
+
+## 41. Transaction Status API auto-recovery, verified empirically rather than
+assumed from documentation
+
+**Problem**: entry 18 deferred auto-recovery for stuck payouts specifically
+because "guessing at Safaricom's correlation semantics on a money-recovery
+path is exactly the kind of invention this codebase has been bitten by
+before" (see entries 26, 35, 39 for the cost of exactly that mistake). Before
+writing any code, the question was: can the Transaction Status API even be
+queried using a payout's own `originatorConversationId` — the only thing a
+stuck payout has, since it never received a Safaricom receipt — or does it
+require a `TransactionID` this platform will never have for the one case that
+matters?
+
+**Investigation**: web research produced genuinely conflicting answers across
+community mirrors of Safaricom's docs — one source said `OriginatorConversationID`
+was accepted as an alternative to `TransactionID`; another said it was
+response-only; a third named a differently-spelled field
+(`OriginalConversationID`) as the accepted one; a fourth (a maintained client
+library) implemented no such alternative at all. Safaricom's own developer
+portal (which would have settled it) requires an authenticated login this
+assistant doesn't have.
+
+Rather than pick a source and hope, the request was fired directly at
+Safaricom's real sandbox using this platform's own stored credentials and a
+real (already-resolved) payout's `originatorConversationId`. First attempt,
+field named `OriginatorConversationID`: `400.002.02 — "Transaction ID or
+OriginalConversation ID is mandatory"`. Second attempt, field renamed to
+`OriginalConversationID`: `ResponseCode: "0"`, accepted. The error message
+itself named the correct field — Safaricom's own rejection was a more
+reliable source than any third-party mirror.
+
+**Chosen**: `DarajaClient.queryPayoutStatus` sends `OriginalConversationID`
+(not `OriginatorConversationID`) set to the stuck payout's own
+`originatorConversationId`, requiring no `TransactionID`. Confirmed
+separately that Safaricom's synchronous accept returns a **fresh**
+`OriginatorConversationID`/`ConversationID` for the query itself — distinct
+from the original payout's — which is why `PayoutStatusQuery` exists as a
+correlation table: without it, the eventual `ResultURL`/`QueueTimeOutURL`
+callback (new routes, same ingest+poll shape as every other Daraja callback)
+has no way back to the payout it was asking about.
+
+`DriftDetectorService.detectStuckPayouts` now fires this query once per
+stuck payout (guarded by both the existing `driftDetected` check and a
+`PayoutStatusQuery.resolvedAt: null` check, so a retry storm never spams
+Safaricom) — but the human alert stays **unconditional**, fired regardless of
+whether the query itself succeeded. The query's own result can just as
+easily go missing (that's the entire premise this feature exists to work
+around), so it augments the safety net, never replaces it.
+
+**Deliberately incomplete — Stage 1 only**: `WebhookPollerService
+.processTransactionStatusResult` records the async result (including the raw
+`TransactionStatus` value) for inspection but does **not** call
+`TransactionStateMachine.transitionPayoutToSettled`/`transitionPayoutToFailed`
+yet. The request shape was verified against Safaricom's real sandbox; the
+*response* shape — specifically, what `TransactionStatus` actually says for a
+completed vs. failed payout — was not, since no async callback had actually
+been captured before this shipped. Applying an unverified value to a
+money-recovery decision is the exact mistake entry 18 was written to avoid
+repeating. A follow-up entry will record the confirmed mapping once a real
+result has been captured and read back from `webhook_events`.
+
+**Also not done**: which B2C shortcode a payout was sent from is not stored
+on `Transaction` — `attemptStatusQuery` falls back to the tenant's *default*
+B2C shortcode, which is only correct for a tenant with exactly one (true of
+every tenant observed so far). A tenant with two B2C shortcodes would get
+skipped rather than risk querying with the wrong shortcode's credentials —
+same "skip rather than guess" choice as the shortcode lookup elsewhere in
+this file, not yet a real gap because no such tenant exists yet.
+
+**Lesson for next time**: when third-party documentation disagrees with
+itself and the authoritative source is behind a login this assistant can't
+reach, a live sandbox call against a real, already-known-resolved record is
+faster and more reliable than reading five more mirrors — the API's own
+error message told us the correct field name outright.

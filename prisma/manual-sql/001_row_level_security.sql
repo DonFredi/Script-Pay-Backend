@@ -51,6 +51,7 @@ ALTER TABLE webhook_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE reconciliation_records ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tenant_webhook_deliveries ENABLE ROW LEVEL SECURITY;
+ALTER TABLE payout_status_queries ENABLE ROW LEVEL SECURITY;
 
 -- The FORCE ROW LEVEL SECURITY statements that used to sit here have MOVED to
 -- 004_force_row_level_security.sql, and that move is the entire point.
@@ -100,6 +101,12 @@ CREATE POLICY tenant_isolation ON audit_logs
 -- go through PrismaPrivilegedService (cross-tenant, same reasoning as webhook_events
 -- above), so this policy is defense-in-depth rather than the primary access path.
 CREATE POLICY tenant_isolation ON tenant_webhook_deliveries
+  USING ("tenantId" = current_setting('app.current_tenant_id', true));
+
+-- Written by DriftDetectorService and read by WebhookPollerService — both go
+-- through PrismaPrivilegedService, same reasoning as tenant_webhook_deliveries
+-- above: defense-in-depth, not the primary access path.
+CREATE POLICY tenant_isolation ON payout_status_queries
   USING ("tenantId" = current_setting('app.current_tenant_id', true));
 
 -- `tenants` itself has no tenantId column (it IS the tenant) — isolation for that

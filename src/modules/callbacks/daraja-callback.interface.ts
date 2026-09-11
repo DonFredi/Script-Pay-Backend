@@ -147,6 +147,46 @@ export interface DarajaB2cResultCallback {
 export type DarajaB2cTimeoutCallback = DarajaB2cResultCallback;
 
 /**
+ * Transaction Status API result (posted to ResultURL) — the async answer to
+ * DarajaClient.queryPayoutStatus's auto-recovery query for a stuck payout. Same
+ * `Result` envelope as the B2C callbacks above, structurally, but note two things
+ * that are NOT the same:
+ *
+ * 1. `OriginatorConversationID`/`ConversationID` here are the STATUS QUERY's own
+ *    ids (fresh ones Safaricom generated when the query was accepted), never the
+ *    original stuck payout's — see PayoutStatusQuery for the correlation table this
+ *    requires. Confirmed empirically against the sandbox (docs/decisions.md entry 41).
+ * 2. `ResultParameters` carries a different key set than B2C's — most importantly
+ *    `TransactionStatus`, a string describing the ORIGINAL payout's outcome (its
+ *    exact possible values were not fully enumerable from documentation alone; the
+ *    processing code treats anything other than a recognized value as "unknown, ask
+ *    again later" — never as a guessed failure, same discipline as
+ *    docs/decisions.md entry 23).
+ *
+ * Example (fields vary by source consulted — not yet confirmed against a real
+ * captured payload; treat with the same caution as any other unverified shape):
+ * {
+ *   "Result": {
+ *     "ResultCode": 0,
+ *     "ResultDesc": "The service request has been accepted successfully.",
+ *     "OriginatorConversationID": "<the QUERY's own id>",
+ *     "ConversationID": "<the QUERY's own id>",
+ *     "ResultParameters": {
+ *       "ResultParameter": [
+ *         { "Key": "TransactionStatus", "Value": "Completed" },
+ *         { "Key": "ReceiptNo", "Value": "LGR019G3J2" },
+ *         { "Key": "FinalisedTime", "Value": 20260911120000 }
+ *       ]
+ *     }
+ *   }
+ * }
+ */
+export type DarajaTransactionStatusResultCallback = DarajaB2cResultCallback;
+
+/** Same reasoning as DarajaB2cTimeoutCallback — a timeout on the STATUS QUERY itself. */
+export type DarajaTransactionStatusTimeoutCallback = DarajaB2cResultCallback;
+
+/**
  * Every `source` value WebhookEvent's (source, naturalKey) idempotency key accepts.
  * Distinct sources are distinct namespaces, so a B2C key can never collide with an
  * STK one even if the strings were identical.
@@ -155,7 +195,9 @@ export type WebhookSource =
   | "daraja_stk_callback"
   | "daraja_c2b_confirmation"
   | "daraja_b2c_result"
-  | "daraja_b2c_timeout";
+  | "daraja_b2c_timeout"
+  | "daraja_transaction_status_result"
+  | "daraja_transaction_status_timeout";
 
 /**
  * Extracted/normalized callback data

@@ -38,6 +38,14 @@ const SAFE_KEYS = new Set([
   "ResultType",
   "TransactionType",
   "BusinessShortCode",
+  // Transaction Status result/timeout callbacks (auto-recovery) — a status word and
+  // timestamps, not identity. DebitPartyName/CreditPartyName are deliberately absent:
+  // those ARE the payer/payee's name, the same class of field ReceiverPartyPublicName
+  // already withholds on the B2C result callback.
+  "TransactionStatus",
+  "ReceiptNo",
+  "FinalisedTime",
+  "InitiatedTime",
 ]);
 
 // Safaricom nests the useful ids about four levels down (Body.stkCallback.…,

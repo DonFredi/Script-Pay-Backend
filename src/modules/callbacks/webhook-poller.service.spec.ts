@@ -144,6 +144,7 @@ describe("WebhookPollerService — B2C payout callbacks", () => {
             webhookEvent: { findMany: jest.fn(), update: jest.fn() },
             tenantShortcode: { findMany: jest.fn() },
             transaction: { findUnique: jest.fn() },
+            payoutStatusQuery: { findUnique: jest.fn(), update: jest.fn() },
           },
         },
         {
@@ -289,6 +290,96 @@ describe("WebhookPollerService — B2C payout callbacks", () => {
       expect(prisma.webhookEvent.update).toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ processedAt: expect.any(Date) }) }),
       );
+    });
+  });
+
+  describe("transaction status result (auto-recovery)", () => {
+    const queryRow = { id: "query-1", tenantId: "tenant-1", transactionId: "payout-1" };
+
+    it("correlates on the QUERY's own OriginatorConversationID, not the original payout's", async () => {
+      const event = b2cEvent("daraja_transaction_status_result", { OriginatorConversationID: "query-oc-1" });
+      jest.spyOn(prisma.webhookEvent, "findMany").mockResolvedValueOnce([event] as any);
+      jest.spyOn(prisma.payoutStatusQuery, "findUnique").mockResolvedValueOnce(queryRow as any);
+
+      await service.pollUnprocessedEvents();
+
+      expect(prisma.payoutStatusQuery.findUnique).toHaveBeenCalledWith({
+        where: { queryOriginatorConversationId: "query-oc-1" },
+      });
+    });
+
+    // Stage 1 (deliberate): the exact TransactionStatus value Safaricom uses for a
+    // completed vs failed payout hasn't been confirmed against a real captured
+    // payload — this must NOT touch the transaction until that's verified. See
+    // docs/decisions.md entry 41 and WebhookPollerService's own doc comment.
+    it("does NOT call TransactionStateMachine yet, regardless of TransactionStatus value", async () => {
+      const event = b2cEvent("daraja_transaction_status_result", {
+        OriginatorConversationID: "query-oc-1",
+        ResultParameters: { ResultParameter: [{ Key: "TransactionStatus", Value: "Completed" }] },
+      });
+      jest.spyOn(prisma.webhookEvent, "findMany").mockResolvedValueOnce([event] as any);
+      jest.spyOn(prisma.payoutStatusQuery, "findUnique").mockResolvedValueOnce(queryRow as any);
+
+      await service.pollUnprocessedEvents();
+
+      expect(stateMachine.transitionPayoutToSettled).not.toHaveBeenCalled();
+      expect(stateMachine.transitionPayoutToFailed).not.toHaveBeenCalled();
+    });
+
+    it("marks the query resolved and audit-logs the raw result for inspection", async () => {
+      const event = b2cEvent("daraja_transaction_status_result", {
+        OriginatorConversationID: "query-oc-1",
+        ResultParameters: { ResultParameter: [{ Key: "TransactionStatus", Value: "Completed" }] },
+      });
+      jest.spyOn(prisma.webhookEvent, "findMany").mockResolvedValueOnce([event] as any);
+      jest.spyOn(prisma.payoutStatusQuery, "findUnique").mockResolvedValueOnce(queryRow as any);
+
+      await service.pollUnprocessedEvents();
+
+      expect(prisma.payoutStatusQuery.update).toHaveBeenCalledWith({
+        where: { id: "query-1" },
+        data: { resolvedAt: expect.any(Date) },
+      });
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: "daraja.transaction_status_result_received",
+          targetId: "payout-1",
+          metadata: expect.objectContaining({ transactionStatus: "Completed" }),
+        }),
+      );
+    });
+
+    it("records an unmatched result without touching any transaction", async () => {
+      const event = b2cEvent("daraja_transaction_status_result", { OriginatorConversationID: "query-oc-unknown" });
+      jest.spyOn(prisma.webhookEvent, "findMany").mockResolvedValueOnce([event] as any);
+      jest.spyOn(prisma.payoutStatusQuery, "findUnique").mockResolvedValueOnce(null);
+
+      await service.pollUnprocessedEvents();
+
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: "daraja.transaction_status_unmatched" }),
+      );
+      expect(stateMachine.transitionPayoutToSettled).not.toHaveBeenCalled();
+      expect(stateMachine.transitionPayoutToFailed).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("transaction status timeout (auto-recovery)", () => {
+    it("does not touch the underlying payout, only closes the query row", async () => {
+      const event = b2cEvent("daraja_transaction_status_timeout", { OriginatorConversationID: "query-oc-1" });
+      jest.spyOn(prisma.webhookEvent, "findMany").mockResolvedValueOnce([event] as any);
+      jest
+        .spyOn(prisma.payoutStatusQuery, "findUnique")
+        .mockResolvedValueOnce({ id: "query-1", tenantId: "tenant-1", transactionId: "payout-1" } as any);
+
+      await service.pollUnprocessedEvents();
+
+      expect(stateMachine.transitionPayoutToFailed).not.toHaveBeenCalled();
+      expect(stateMachine.transitionPayoutToSettled).not.toHaveBeenCalled();
+      expect(prisma.payoutStatusQuery.update).toHaveBeenCalledWith({
+        where: { id: "query-1" },
+        data: { resolvedAt: expect.any(Date) },
+      });
     });
   });
 });

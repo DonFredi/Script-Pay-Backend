@@ -415,4 +415,65 @@ export class DarajaClient {
 
     return { resultCode: parsed, resultDesc: body.ResultDesc };
   }
+
+  /**
+   * Payout counterpart to queryStkPushStatus — but structurally different in a way
+   * that stalled this method's existence for a while (docs/decisions.md entry 18):
+   * the STK query answers SYNCHRONOUSLY, this one does not. A "0" ResponseCode here
+   * means Safaricom accepted the STATUS QUERY into its queue, not that it's telling
+   * you the answer — the real verdict arrives later at ResultURL, same two-callback
+   * shape (result + timeout) as the B2C payout itself.
+   *
+   * `OriginalConversationID` (note the spelling — NOT `OriginatorConversationID`,
+   * the field every other Daraja response echoes back) is what lets this be queried
+   * with nothing but the payout's own originatorConversationId — no Safaricom
+   * receipt/TransactionID required, which matters because a stuck payout never got
+   * one. Verified empirically against the sandbox (entry 41): sending
+   * `OriginatorConversationID` here gets a 400 ("Transaction ID or
+   * OriginalConversation ID is mandatory"); `OriginalConversationID` is accepted.
+   *
+   * Safaricom's synchronous accept returns a FRESH OriginatorConversationID/
+   * ConversationID for the query itself, not the original payout's — those are what
+   * the caller must persist (PayoutStatusQuery) to correlate the eventual async
+   * result back to the stuck payout it was asking about.
+   */
+  async queryPayoutStatus(
+    creds: TenantPayoutCredentials,
+    originalConversationId: string,
+  ): Promise<{ conversationId: string; originatorConversationId: string }> {
+    const accessToken = await this.getAccessToken(creds);
+
+    const response = await fetch(`${this.baseUrl}/mpesa/transactionstatus/v1/query`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        Initiator: creds.initiatorName,
+        SecurityCredential: creds.securityCredential,
+        CommandID: "TransactionStatusQuery",
+        OriginalConversationID: originalConversationId,
+        // The shortcode that SENT the original payout, same PartyA convention as
+        // initiateB2C — IdentifierType 4 is "organization shortcode" (vs 1 MSISDN,
+        // 2 Till number), matching every source consulted for this endpoint.
+        PartyA: creds.shortcode,
+        IdentifierType: "4",
+        ResultURL: this.buildWebhookUrl("transaction-status-result"),
+        QueueTimeOutURL: this.buildWebhookUrl("transaction-status-timeout"),
+        Remarks: "Auto-recovery status check for a payout stuck without a result callback",
+        Occasion: "",
+      }),
+    });
+
+    const body = await this.parseDarajaJson(response, "Transaction status query");
+    if (!response.ok || body.ResponseCode !== "0") {
+      this.logger.error(`Daraja transaction status query rejected: ${JSON.stringify(body)}`);
+      throw new BadGatewayException(
+        body.errorMessage ?? body.ResponseDescription ?? "Daraja rejected the transaction status query",
+      );
+    }
+
+    return {
+      conversationId: body.ConversationID,
+      originatorConversationId: body.OriginatorConversationID,
+    };
+  }
 }

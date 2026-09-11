@@ -201,4 +201,66 @@ export class DarajaWebhookController {
       return { ResultCode: 0, ResultDesc: "Accepted" };
     }
   }
+
+  /**
+   * Transaction Status Query result (Safaricom -> ResultURL) — the async answer to
+   * DriftDetectorService's auto-recovery query for a payout stuck without a real B2C
+   * result ever arriving. See PayoutStatusQuery and
+   * WebhookPollerService.processTransactionStatusResult for the correlation this
+   * requires: the ids in this payload belong to the STATUS QUERY, not the original
+   * stuck payout.
+   */
+  @Post("transaction-status-result")
+  @HttpCode(200)
+  async handleTransactionStatusResult(@Body() rawPayload: unknown) {
+    try {
+      this.logger.log("Received transaction status query result");
+
+      if (!rawPayload || typeof rawPayload !== "object") {
+        throw new BadRequestException("Invalid payload: must be an object");
+      }
+
+      await this.ingest.ingest("daraja_transaction_status_result", rawPayload);
+      this.kickProcessing();
+
+      return { ResultCode: 0, ResultDesc: "Accepted" };
+    } catch (error) {
+      this.logger.error(`Failed to ingest transaction status result: ${String(error)}`, {
+        error: String(error),
+        ...redactCallbackPayload(rawPayload),
+      });
+
+      return { ResultCode: 0, ResultDesc: "Accepted" };
+    }
+  }
+
+  /**
+   * Transaction Status Query timeout (Safaricom -> QueueTimeOutURL) — the query
+   * itself timed out, not the original payout. Ingested for visibility only:
+   * DriftDetectorService's own escalation alert is what a human acts on if
+   * auto-recovery can't get an answer either.
+   */
+  @Post("transaction-status-timeout")
+  @HttpCode(200)
+  async handleTransactionStatusTimeout(@Body() rawPayload: unknown) {
+    try {
+      this.logger.warn("Received transaction status query timeout");
+
+      if (!rawPayload || typeof rawPayload !== "object") {
+        throw new BadRequestException("Invalid payload: must be an object");
+      }
+
+      await this.ingest.ingest("daraja_transaction_status_timeout", rawPayload);
+      this.kickProcessing();
+
+      return { ResultCode: 0, ResultDesc: "Accepted" };
+    } catch (error) {
+      this.logger.error(`Failed to ingest transaction status timeout: ${String(error)}`, {
+        error: String(error),
+        ...redactCallbackPayload(rawPayload),
+      });
+
+      return { ResultCode: 0, ResultDesc: "Accepted" };
+    }
+  }
 }

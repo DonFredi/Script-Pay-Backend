@@ -19,9 +19,9 @@ datasource db {
 }
 
 enum Role {
-  SUPER_ADMIN   // ScriptPay staff
-  TENANT_ADMIN  // owns a tenant account
-  TENANT_STAFF  // scoped access within a tenant
+  SUPER_ADMIN // ScriptPay staff
+  TENANT_ADMIN // owns a tenant account
+  TENANT_STAFF // scoped access within a tenant
 }
 
 enum TransactionChannel {
@@ -87,10 +87,10 @@ enum TenantWebhookDeliveryStatus {
 model AuditLog {
   id         String   @id @default(uuid())
   tenantId   String?
-  actorType  String   // "user" | "api_key" | "system"
-  actorId    String?  // User.id, ApiKey.id, or null for system-initiated actions
-  action     String   // e.g. "tenant.created", "api_key.revoked", "daraja.stk_push_initiated", "daraja.stk_push_failed"
-  targetType String?  // e.g. "Transaction", "ApiKey", "Tenant"
+  actorType  String // "user" | "api_key" | "system"
+  actorId    String? // User.id, ApiKey.id, or null for system-initiated actions
+  action     String // e.g. "tenant.created", "api_key.revoked", "daraja.stk_push_initiated", "daraja.stk_push_failed"
+  targetType String? // e.g. "Transaction", "ApiKey", "Tenant"
   targetId   String?
   metadata   Json?
   createdAt  DateTime @default(now())
@@ -101,11 +101,11 @@ model AuditLog {
 }
 
 model Tenant {
-  id                String        @id @default(uuid())
-  name              String
-  status            String        @default("active") // active | suspended | pending_kyc | removed
-  createdAt         DateTime      @default(now())
-  updatedAt         DateTime      @updatedAt
+  id        String   @id @default(uuid())
+  name      String
+  status    String   @default("active") // active | suspended | pending_kyc | removed
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   // Shared, org-level Daraja app credentials — one production app is issued per
   // organization at Safaricom go-live, and every shortcode the org holds (see
@@ -117,7 +117,7 @@ model Tenant {
   // (all hex), self-contained in one column. Consumer Key isn't secret enough to
   // need encryption (Safaricom docs treat it like a client ID), but Consumer
   // Secret genuinely is.
-  mpesaConsumerKey           String?
+  mpesaConsumerKey             String?
   mpesaConsumerSecretEncrypted String?
   mpesaCredentialsConfiguredAt DateTime?
 
@@ -128,17 +128,18 @@ model Tenant {
   // webhookSecretEncrypted follows the exact same AES-256-GCM-at-rest pattern as the
   // Daraja credentials above; the raw secret is only ever shown once, at creation time
   // (see TenantsService.configureWebhook), same principle as ApiKey.keyHash.
-  webhookUrl                String?
-  webhookSecretEncrypted    String?
-  webhookConfiguredAt       DateTime?
+  webhookUrl             String?
+  webhookSecretEncrypted String?
+  webhookConfiguredAt    DateTime?
 
-  users             User[]
-  apiKeys           ApiKey[]
-  transactions      Transaction[]
-  ledgerEntries     LedgerEntry[]
-  webhookEvents     WebhookEvent[]
-  reconciliations   ReconciliationRecord[]
-  webhookDeliveries TenantWebhookDelivery[]
+  users               User[]
+  apiKeys             ApiKey[]
+  transactions        Transaction[]
+  ledgerEntries       LedgerEntry[]
+  webhookEvents       WebhookEvent[]
+  reconciliations     ReconciliationRecord[]
+  webhookDeliveries   TenantWebhookDelivery[]
+  payoutStatusQueries PayoutStatusQuery[]
 
   @@map("tenants")
 }
@@ -192,7 +193,7 @@ model User {
   passwordHash  String
   emailVerified Boolean  @default(false)
   role          Role
-  tenantId      String?  // null for SUPER_ADMIN, and null for a user who hasn't completed onboarding yet
+  tenantId      String? // null for SUPER_ADMIN, and null for a user who hasn't completed onboarding yet
   tenant        Tenant?  @relation(fields: [tenantId], references: [id])
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
@@ -209,26 +210,26 @@ model User {
 // Same design as RefreshToken/ApiKey: only a hash is ever persisted, and a used
 // token can never be replayed.
 model EmailVerificationToken {
-  id         String    @id @default(uuid())
-  userId     String
-  user       User      @relation(fields: [userId], references: [id])
-  tokenHash  String    @unique
-  expiresAt  DateTime
-  usedAt     DateTime?
-  createdAt  DateTime  @default(now())
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id])
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
 
   @@index([userId])
   @@map("email_verification_tokens")
 }
 
 model PasswordResetToken {
-  id         String    @id @default(uuid())
-  userId     String
-  user       User      @relation(fields: [userId], references: [id])
-  tokenHash  String    @unique
-  expiresAt  DateTime
-  usedAt     DateTime?
-  createdAt  DateTime  @default(now())
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id])
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
 
   @@index([userId])
   @@map("password_reset_tokens")
@@ -242,38 +243,38 @@ model PasswordResetToken {
 // detect reuse of an already-rotated token (a strong signal of theft), and control
 // session lifetime directly.
 model RefreshToken {
-  id              String        @id @default(uuid())
-  userId          String
-  user            User          @relation(fields: [userId], references: [id])
+  id                String    @id @default(uuid())
+  userId            String
+  user              User      @relation(fields: [userId], references: [id])
   // SHA-256, not argon2/bcrypt: this is a high-entropy random token, not a low-entropy
   // password — a fast hash is the correct tool here, since brute-forcing a 256-bit
   // random value is infeasible regardless of hash speed, and slow hashing would just
   // waste CPU on every refresh request for zero additional security.
-  tokenHash       String        @unique
-  expiresAt       DateTime
-  revokedAt       DateTime?
+  tokenHash         String    @unique
+  expiresAt         DateTime
+  revokedAt         DateTime?
   // Rotation chain: when a token is used, it's revoked and replaced by a new one.
   // If a REVOKED token is ever presented again, that's a reuse signal — the entire
   // chain (and ideally the user's other active sessions) should be revoked in response.
-  replacedByTokenId String?     @unique
-  createdAt       DateTime      @default(now())
+  replacedByTokenId String?   @unique
+  createdAt         DateTime  @default(now())
 
   @@index([userId])
   @@map("refresh_tokens")
 }
 
 model ApiKey {
-  id          String        @id @default(uuid())
-  tenantId    String
-  tenant      Tenant        @relation(fields: [tenantId], references: [id])
+  id         String        @id @default(uuid())
+  tenantId   String
+  tenant     Tenant        @relation(fields: [tenantId], references: [id])
   // Store only a hash, never the raw key, following the same principle as password storage.
-  keyHash     String        @unique
-  keyPrefix   String        // first 8 chars, shown in dashboards for identification
-  scopes      ApiKeyScope[]
-  lastUsedAt  DateTime?
-  revokedAt   DateTime?
-  expiresAt   DateTime?
-  createdAt   DateTime      @default(now())
+  keyHash    String        @unique
+  keyPrefix  String // first 8 chars, shown in dashboards for identification
+  scopes     ApiKeyScope[]
+  lastUsedAt DateTime?
+  revokedAt  DateTime?
+  expiresAt  DateTime?
+  createdAt  DateTime      @default(now())
 
   @@index([tenantId])
   // ApiKeyGuard narrows every incoming request by keyPrefix before the (expensive)
@@ -284,18 +285,18 @@ model ApiKey {
 }
 
 model Transaction {
-  id                  String              @id @default(uuid())
-  tenantId            String
-  tenant              Tenant              @relation(fields: [tenantId], references: [id])
-  channel             TransactionChannel
+  id                String               @id @default(uuid())
+  tenantId          String
+  tenant            Tenant               @relation(fields: [tenantId], references: [id])
+  channel           TransactionChannel
   // Defaulted rather than required so this stays a pure column add with no backfill.
-  direction           TransactionDirection @default(INBOUND)
-  status              TransactionStatus   @default(PENDING)
-  amountMinorUnits     Int                 // KES cents — never a float
-  currency            String              @default("KES")
-  msisdn              String              // counterparty: the payer on INBOUND, the payee on OUTBOUND
-  merchantRequestId   String?             // Daraja STK Push identifier
-  checkoutRequestId   String?             @unique // Daraja STK Push identifier — natural idempotency key
+  direction         TransactionDirection @default(INBOUND)
+  status            TransactionStatus    @default(PENDING)
+  amountMinorUnits  Int // KES cents — never a float
+  currency          String               @default("KES")
+  msisdn            String // counterparty: the payer on INBOUND, the payee on OUTBOUND
+  merchantRequestId String? // Daraja STK Push identifier
+  checkoutRequestId String?              @unique // Daraja STK Push identifier — natural idempotency key
 
   // B2C's equivalents of merchantRequestId/checkoutRequestId above, and a genuine
   // improvement on them: STK Push only learns its CheckoutRequestID FROM Daraja's
@@ -304,26 +305,27 @@ model Transaction {
   // generated by US before the call goes out, so the correlation key exists even when
   // the HTTP request itself never completes. It is also the natural idempotency key
   // for the B2C result callback, the way checkoutRequestId is for the STK one.
-  originatorConversationId String?        @unique
-  conversationId           String?        // Safaricom's own id, returned in the sync response
+  originatorConversationId String? @unique
+  conversationId           String? // Safaricom's own id, returned in the sync response
 
-  mpesaReceiptNumber  String?             @unique // populated once settled
-  failureReason       String?
-  payoutRemarks       String?             // Daraja B2C "Remarks" — OUTBOUND only
-  payoutOccasion      String?             // Daraja B2C "Occasion" — OUTBOUND only
+  mpesaReceiptNumber String?  @unique // populated once settled
+  failureReason      String?
+  payoutRemarks      String? // Daraja B2C "Remarks" — OUTBOUND only
+  payoutOccasion     String? // Daraja B2C "Occasion" — OUTBOUND only
   // Caller-supplied dedupe token (currently only B2C payout initiation sends one) —
   // a retried/double-clicked request with the same key returns the existing row
   // instead of creating a second real payout. NULL doesn't collide with other NULLs
   // under Postgres's unique-index semantics, so callers that don't send a key are
   // unaffected.
-  idempotencyKey      String?
-  metadata            Json?               // arbitrary tenant-supplied reference data
-  createdAt           DateTime            @default(now())
-  updatedAt           DateTime            @updatedAt
+  idempotencyKey     String?
+  metadata           Json? // arbitrary tenant-supplied reference data
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
 
-  ledgerEntries       LedgerEntry[]
-  reconciliation      ReconciliationRecord?
-  webhookDeliveries   TenantWebhookDelivery[]
+  ledgerEntries     LedgerEntry[]
+  reconciliation    ReconciliationRecord?
+  webhookDeliveries TenantWebhookDelivery[]
+  statusQueries     PayoutStatusQuery[]
 
   @@unique([tenantId, idempotencyKey])
   @@index([tenantId, createdAt])
@@ -360,15 +362,15 @@ model TenantWebhookDelivery {
 // Double-entry style ledger: every settled transaction produces balanced entries.
 // This is what makes "tenant balance" a computed, auditable value instead of a mutable hot counter.
 model LedgerEntry {
-  id            String   @id @default(uuid())
-  tenantId      String
-  tenant        Tenant   @relation(fields: [tenantId], references: [id])
-  transactionId String
-  transaction   Transaction @relation(fields: [transactionId], references: [id])
-  account       String   // e.g. "tenant_balance", "platform_fees", "pending_settlement"
-  direction     String   // "debit" | "credit"
+  id               String      @id @default(uuid())
+  tenantId         String
+  tenant           Tenant      @relation(fields: [tenantId], references: [id])
+  transactionId    String
+  transaction      Transaction @relation(fields: [transactionId], references: [id])
+  account          String // e.g. "tenant_balance", "platform_fees", "pending_settlement"
+  direction        String // "debit" | "credit"
   amountMinorUnits Int
-  createdAt     DateTime @default(now())
+  createdAt        DateTime    @default(now())
 
   @@index([tenantId, account])
   @@map("ledger_entries")
@@ -377,17 +379,17 @@ model LedgerEntry {
 // Idempotency guard for inbound webhooks. Insert-first, process-second.
 // Unique constraint on the natural key means a duplicate Daraja retry fails the insert, not the business logic.
 model WebhookEvent {
-  id                String   @id @default(uuid())
-  tenantId          String?
-  tenant            Tenant?  @relation(fields: [tenantId], references: [id])
-  source            String   // "daraja_stk_callback" | "daraja_c2b_confirmation" | ...
-  naturalKey        String   // e.g. CheckoutRequestID or TransactionID from Safaricom
-  payload           Json
-  processedAt       DateTime?
-  processingError   String?
-  status            WebhookEventStatus  @default(pending)
-  attempts          Int      @default(0)
-  receivedAt        DateTime @default(now())
+  id              String             @id @default(uuid())
+  tenantId        String?
+  tenant          Tenant?            @relation(fields: [tenantId], references: [id])
+  source          String // "daraja_stk_callback" | "daraja_c2b_confirmation" | ...
+  naturalKey      String // e.g. CheckoutRequestID or TransactionID from Safaricom
+  payload         Json
+  processedAt     DateTime?
+  processingError String?
+  status          WebhookEventStatus @default(pending)
+  attempts        Int                @default(0)
+  receivedAt      DateTime           @default(now())
 
   @@unique([source, naturalKey])
   @@map("webhook_events")
@@ -400,22 +402,51 @@ enum WebhookEventStatus {
   failed
 }
 
-
 // One row per transaction per reconciliation pass — records what we expected vs what Safaricom confirmed.
 model ReconciliationRecord {
-  id              String   @id @default(uuid())
+  id              String      @id @default(uuid())
   tenantId        String
-  tenant          Tenant   @relation(fields: [tenantId], references: [id])
-  transactionId   String   @unique
+  tenant          Tenant      @relation(fields: [tenantId], references: [id])
+  transactionId   String      @unique
   transaction     Transaction @relation(fields: [transactionId], references: [id])
   expectedAmount  Int
   confirmedAmount Int?
-  driftDetected   Boolean  @default(false)
+  driftDetected   Boolean     @default(false)
   reconciledAt    DateTime?
-  createdAt       DateTime @default(now())
+  createdAt       DateTime    @default(now())
 
   @@index([tenantId, driftDetected])
   @@map("reconciliation_records")
+}
+
+// Correlation map for the Transaction Status API's async result. Confirmed empirically
+// against Safaricom's sandbox (docs/decisions.md entry 41) that the QUERY request
+// itself carries our stuck payout's own originatorConversationId (as
+// OriginalConversationID) — but Safaricom's synchronous accept returns a FRESH
+// OriginatorConversationID/ConversationID for the query, distinct from the payout's own,
+// and the eventual ResultURL/QueueTimeOutURL callback carries THAT fresh id, not the
+// payout's. Without this table, the async result has no way back to the payout it was
+// asking about.
+model PayoutStatusQuery {
+  id                            String      @id @default(uuid())
+  tenantId                      String
+  tenant                        Tenant      @relation(fields: [tenantId], references: [id])
+  transactionId                 String
+  transaction                   Transaction @relation(fields: [transactionId], references: [id])
+  // Safaricom's OWN id for this status query (not the original payout's) — the field
+  // the async result/timeout callback correlates on.
+  queryOriginatorConversationId String      @unique
+  queryConversationId           String?
+  requestedAt                   DateTime    @default(now())
+  resolvedAt                    DateTime?
+
+  // "Is a query already in flight for this payout" is checked application-side
+  // (resolvedAt: null for this transactionId) rather than as a DB constraint —
+  // same reasoning as decisions.md entry 20's one-default-shortcode rule: Prisma
+  // has no partial unique index, and there's exactly one write path to guard.
+  @@index([tenantId, requestedAt])
+  @@index([transactionId, resolvedAt])
+  @@map("payout_status_queries")
 }
 
 // --- Row-Level Security (apply via a raw SQL migration, Prisma doesn't manage RLS directly) ---
