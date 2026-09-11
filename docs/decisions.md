@@ -1207,3 +1207,61 @@ Safaricom ever saw it. Prefer validating the *shape* of a secret you cannot
 otherwise verify over trusting that whatever was pasted is what was meant.
 And treat a third party's error message as a hint about where it noticed the
 problem, not a statement of what the problem is.
+
+## 40. A second batch of stuck payouts, and a real resolution route instead of another one-off script
+
+**Problem**: entry 36 documented 2 B2C payouts stuck `PROCESSING` for 5 days
+after `MPESA_CALLBACK_BASE_URL` pointed at a dead Vercel host, resolved by a
+one-off script calling `TransactionStateMachine.transitionPayoutToFailed`
+directly against `PRIVILEGED_DATABASE_URL`. A routine investigation found a
+second batch of 5, same tenant (`Fralon Peanuts`, `pending_kyc`, Safaricom's
+standard sandbox B2C shortcode `600992`), stuck 2-5 days with zero matching
+rows in `webhook_events` for any of their `OriginatorConversationID`s —
+Safaricom's sandbox never answered them at all, result or timeout. Both
+`entry 18`'s reasoning and entry 36's precedent held: `DriftDetectorService`
+correctly flagged all 5 (`driftDetected: true`) and had nothing further to
+do, by design.
+
+Resolving this batch the same way entry 36 did — a hand-written script
+against the privileged connection — worked, but isn't a repeatable operational
+path. It requires production database credentials, re-deriving the exact
+ledger-entry pairs and audit-log shape by hand each time, and leaves no guard
+against resolving a transaction that isn't actually a stuck payout.
+
+**Rejected**: leaving manual resolution as an ad hoc script, on the theory
+that stuck payouts are rare enough not to warrant a real endpoint. Two
+incidents in one project history, both on the one tenant that exists so far,
+say otherwise — and the whole point of this platform is to make Daraja
+reconciliation an operational process rather than something an engineer does
+by hand against production.
+
+**Chosen**: `PATCH /v1/reconciliation/payouts/:id/resolve`
+(`PayoutResolutionController`/`PayoutResolutionService`), `SUPER_ADMIN`-only.
+It performs the exact validation a script has to be trusted to remember every
+time — the transaction exists, is `direction: OUTBOUND`, is currently
+`PROCESSING` — then calls the same `TransactionStateMachine.transitionPayoutToFailed`/
+`transitionPayoutToSettled` a real Safaricom callback would call, closes the
+`ReconciliationRecord`'s drift flag (`reconciledAt`), and writes an audit log
+entry under the same `daraja.b2c_failed_manual_resolution`/
+`daraja.b2c_settled_manual_resolution` action names entry 36 already
+established, rather than inventing new ones. `mpesaReceiptNumber` is required
+when resolving as `SETTLED` — a failed payout has no receipt to show, and
+requiring one for a settlement forces the operator to have actual proof
+rather than a guess.
+
+Deliberately **not** exposed to `TENANT_ADMIN`, even for the caller's own
+tenant's payout: a tenant asserting `FAILED` on their own stuck payout to
+reclaim reserved funds is indistinguishable from genuine uncertainty about
+whether Safaricom actually paid out, which is exactly the double-spend risk
+`processB2cTimeout` (entry 18) already refuses to guess at. Only platform
+staff, with no financial stake in the outcome and (implicitly) their own
+independent confirmation via Safaricom's portal or support channel, should
+be trusted to make this call.
+
+**Not done**: this is still a human in the loop, not the Transaction Status
+API auto-recovery entry 18 deferred. It closes the gap between "detected" and
+"resolvable by someone other than an engineer with database credentials," not
+the gap between "detected" and "resolved automatically." That remains the
+real follow-up, and is more pressing now that this route makes manual
+resolution easy enough that it could quietly become the permanent answer
+instead of a stopgap.

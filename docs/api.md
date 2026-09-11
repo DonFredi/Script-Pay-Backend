@@ -359,6 +359,21 @@ Note the three payload shapes are mutually incompatible: STK is wrapped in
 flat, and B2C is wrapped in `Result` with `ResultParameters.ResultParameter[]`
 (`Key`/`Value`). Reading the wrong accessor yields `undefined`, not an error.
 
+## Reconciliation — `/v1/reconciliation/payouts/:id/resolve`
+
+Guard chain: `AccessTokenGuard, CsrfGuard, RolesGuard, TenantAwareThrottlerGuard`,
+`@Roles("SUPER_ADMIN")`, `StrictPaymentThrottle`.
+
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| PATCH | `/v1/reconciliation/payouts/:id/resolve` | `{ resolution: "FAILED" \| "SETTLED", mpesaReceiptNumber?, reason }` | Manual override for a B2C payout stuck `PROCESSING` with no Safaricom callback ever arriving — see `docs/decisions.md` entry 18 (payouts never self-heal) and entry 40. `mpesaReceiptNumber` is required when `resolution` is `SETTLED`. Goes through the same `TransactionStateMachine.transitionPayoutToFailed`/`transitionPayoutToSettled` a real callback would use — same ledger writes, same webhook-delivery enqueue. 404 if the transaction doesn't exist, 400 if it isn't a payout (`direction: OUTBOUND`), 409 if it isn't currently `PROCESSING`. |
+
+`SUPER_ADMIN` only, deliberately not available to `TENANT_ADMIN` even for
+their own tenant's payout: a tenant asserting `FAILED` on their own stuck
+payout to reclaim reserved funds is indistinguishable from genuine
+uncertainty, and only platform staff checking Safaricom's own portal/support
+channel has anything resembling proof either way.
+
 All four routes only *ingest* (write a `WebhookEvent` row) — actual processing
 happens asynchronously via `WebhookPollerService`; see `docs/architecture.md`.
 Which mechanism drives that poller depends on `JOB_SCHEDULER`; under
