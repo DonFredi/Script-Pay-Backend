@@ -18,10 +18,10 @@ src/
 │   ├── ledger/           tenant balance computed from LedgerEntry; authorizes payouts behind a row lock
 │   ├── payments/         STK Push + B2C payouts (tenant + dashboard variants each), transaction reads, state machine
 │   ├── callbacks/        idempotent webhook ingestion + Postgres-polling retry/backoff
-│   ├── reconciliation/   drift detection: active recovery for collections, escalation for stuck payouts
+│   ├── reconciliation/   drift detection: active recovery for collections, Stage 1 auto-recovery query + manual PATCH .../resolve override for stuck payouts
 │   ├── reporting/        GET /v1/reporting/summary — aggregated success/failure metrics
 │   ├── audit-log/        global AuditLogService — records every sensitive action and M-Pesa interaction
-│   └── alerts/           global AlertsService — Slack webhook notifications on failures
+│   └── alerts/           global AlertsService — Slack + email notifications on failures, POST /v1/alerts/test to verify delivery
 ├── infrastructure/
 │   └── daraja/           the only place that talks to Safaricom's API
 └── common/

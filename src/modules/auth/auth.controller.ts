@@ -4,7 +4,7 @@ import { ThrottlerGuard } from "@nestjs/throttler";
 import { AuthService } from "./auth.service";
 import { RefreshTokenService } from "./refresh-token.service";
 import { ZodValidationPipe } from "../../common/pipes/zod-validation.pipe";
-import { CsrfGuard, generateCsrfToken } from "../../common/guards/csrf.guard";
+import { generateCsrfToken } from "../../common/guards/csrf.guard";
 import { RefreshCsrfGuard } from "./refresh-csrf.guard";
 import {
   forgotPasswordSchema,
@@ -103,9 +103,18 @@ export class AuthController {
     return { accessToken };
   }
 
+  // No CsrfGuard on these four: each runs for a visitor with no session, so the
+  // csrf-token cookie (only ever issued by signup/login/refresh, see setCsrfCookie
+  // below) never exists yet — plain CsrfGuard would 403 every legitimate call here,
+  // the same trap RefreshCsrfGuard's doc comment already worked through for
+  // /auth/refresh. reset-password and verify-email don't need it anyway: the
+  // emailed, single-use token in the body is itself the possession proof a forged
+  // cross-site request can't supply. forgot-password and resend-verification have
+  // no session state for a forgery to change — worst case is an extra email, and
+  // StrictPaymentThrottle already rate-limits that.
+
   @Post("forgot-password")
   @StrictPaymentThrottle()
-  @UseGuards(CsrfGuard)
   async forgotPassword(@Body(new ZodValidationPipe(forgotPasswordSchema)) dto: ForgotPasswordDto) {
     await this.authService.requestPasswordReset(dto);
     return { message: "If an account exists for that email, a reset link has been sent." };
@@ -113,14 +122,12 @@ export class AuthController {
 
   @Post("reset-password")
   @StrictPaymentThrottle()
-  @UseGuards(CsrfGuard)
   async resetPassword(@Body(new ZodValidationPipe(resetPasswordSchema)) dto: ResetPasswordDto) {
     await this.authService.resetPassword(dto);
     return { message: "Password updated. Please log in again." };
   }
 
   @Post("verify-email")
-  @UseGuards(CsrfGuard)
   async verifyEmail(@Body(new ZodValidationPipe(verifyEmailSchema)) dto: VerifyEmailDto) {
     await this.authService.verifyEmail(dto);
     return { message: "Email verified." };
@@ -128,7 +135,6 @@ export class AuthController {
 
   @Post("resend-verification")
   @StrictPaymentThrottle()
-  @UseGuards(CsrfGuard)
   async resendVerification(@Body(new ZodValidationPipe(resendVerificationSchema)) dto: ResendVerificationDto) {
     await this.authService.resendVerification(dto);
     return { message: "If that account needs verification, a new link has been sent." };

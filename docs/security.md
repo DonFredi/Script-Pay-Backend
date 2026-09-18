@@ -39,10 +39,21 @@ Double-submit cookie pattern (`CsrfGuard` + `generateCsrfToken`): a
 non-httpOnly `csrf-token` cookie is set at login/signup, and reissued on every
 `/auth/refresh`; every POST/PUT/PATCH/DELETE to a `CsrfGuard`-protected route
 must echo that exact value in `X-CSRF-Token`. Applied on every
-cookie-authenticated, state-changing route with real consequences — password
-reset, tenant creation/status changes, Daraja credential updates, API key
+cookie-authenticated, state-changing route with real consequences — tenant
+creation/status changes, Daraja credential updates, API key
 issuance/revocation, dashboard payment initiation, logout, **and
 `/auth/refresh`**.
+
+**Not applied** to `forgot-password`/`reset-password`/`verify-email`/
+`resend-verification` (removed 2026-09-18, see `docs/decisions.md` entry 42):
+each of these is called by a visitor with no prior session, so no
+`csrf-token` cookie was ever issued to them for `CsrfGuard` to check against
+— the same "no session exists yet" reasoning as `signup`/`login`/`refresh`
+below, not an oversight. `reset-password`/`verify-email` are protected
+instead by the single-use, emailed token in the request body, which a forged
+cross-site request cannot supply; `forgot-password`/`resend-verification`
+change no account state, so the worst a forged call achieves is an extra
+email, already capped by `StrictPaymentThrottle`.
 
 `/auth/refresh` was the one exception until 2026-08-28, when it was brought in
 line with its siblings. It is worth stating why it belongs here rather than in

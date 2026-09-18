@@ -20,10 +20,10 @@ Base guard: `ThrottlerGuard` (default tier) on the whole controller.
 | POST | `/auth/signup` | — | `StrictPaymentThrottle` (10/min) | `{ username, email, password, confirmPassword }` |
 | POST | `/auth/login` | — | `StrictPaymentThrottle` | `{ email, password }` |
 | POST | `/auth/refresh` | — | default | none (reads `refresh_token` cookie) |
-| POST | `/auth/forgot-password` | `CsrfGuard` | `StrictPaymentThrottle` | `{ email }` |
-| POST | `/auth/reset-password` | `CsrfGuard` | `StrictPaymentThrottle` | `{ token, password, confirmPassword }` |
-| POST | `/auth/verify-email` | `CsrfGuard` | default | `{ token }` |
-| POST | `/auth/resend-verification` | `CsrfGuard` | `StrictPaymentThrottle` | `{ email }` |
+| POST | `/auth/forgot-password` | — | `StrictPaymentThrottle` | `{ email }` |
+| POST | `/auth/reset-password` | — | `StrictPaymentThrottle` | `{ token, password, confirmPassword }` |
+| POST | `/auth/verify-email` | — | default | `{ token }` |
+| POST | `/auth/resend-verification` | — | `StrictPaymentThrottle` | `{ email }` |
 
 `signup`/`login` set three cookies on success: `access_token` (httpOnly,
 15 min), `refresh_token` (httpOnly, path-scoped to `/api/backend/auth/refresh`,
@@ -31,6 +31,13 @@ Base guard: `ThrottlerGuard` (default tier) on the whole controller.
 `{ user, accessToken }` in the payload. `refresh` rotates the refresh token
 (old one revoked, `replacedByTokenId` set) and reissues both cookies. There is
 no `CsrfGuard` on `signup`/`login`/`refresh` — no session exists yet to forge.
+The same reasoning extends to `forgot-password`/`reset-password`/
+`verify-email`/`resend-verification` (see `docs/decisions.md` entry 42): a
+visitor calling any of these has no `csrf-token` cookie either, since only
+`signup`/`login`/`refresh` ever issue one. `reset-password`/`verify-email`
+are protected instead by the single-use, emailed token in the body;
+`forgot-password`/`resend-verification` change no account state, so a forged
+call only wastes an email — capped by `StrictPaymentThrottle`.
 
 ## Profile — `/profile`
 

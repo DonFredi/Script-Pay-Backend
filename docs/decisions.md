@@ -1340,3 +1340,38 @@ itself and the authoritative source is behind a login this assistant can't
 reach, a live sandbox call against a real, already-known-resolved record is
 faster and more reliable than reading five more mirrors — the API's own
 error message told us the correct field name outright.
+
+## 42. `CsrfGuard` removed from `forgot-password`/`reset-password`/`verify-email`/`resend-verification` — no session exists yet for any of them either
+
+**Problem**: password reset from the frontend failed with a CSRF-token-missing
+error. `CsrfGuard` implements the double-submit pattern: a non-httpOnly
+`csrf-token` cookie plus a matching `X-CSRF-Token` header, and it is only ever
+*issued* by `signup`/`login`/`refresh` (see entry 33 area of `docs/api.md`
+line 30-33 and `AuthController.setCsrfCookie`). A visitor arriving at
+`/auth/forgot-password` or clicking an emailed reset/verification link has no
+prior session with this backend at all — no `csrf-token` cookie was ever set
+for them — so `CsrfGuard` had nothing to compare the (absent) header against
+and rejected every legitimate call. This is the identical trap `RefreshCsrfGuard`
+already works around for `/auth/refresh` (a sessionless caller can't present a
+CSRF pair that was never issued to them); these four routes just had the plain
+guard instead of that exemption.
+
+**Chosen**: dropped `@UseGuards(CsrfGuard)` entirely from `forgotPassword`,
+`resetPassword`, `verifyEmail`, and `resendVerification` in
+`auth.controller.ts`, rather than giving them `RefreshCsrfGuard`'s
+conditional-exemption treatment — a CSRF token guards against a forged
+state-changing request riding an existing authenticated session, and none of
+these four routes changes anything a forged cross-origin request could
+exploit without also knowing the specific single-use, emailed token in the
+body:
+- `reset-password` and `verify-email` require the emailed token as proof of
+  email possession — that token, not a CSRF pair, is what a forged request
+  can't supply.
+- `forgot-password` and `resend-verification` change no account state; the
+  worst a forged call achieves is triggering an extra email to whatever
+  address the attacker supplies, which `StrictPaymentThrottle` already caps.
+
+**Not yet committed** as of 2026-09-18 — this fix is sitting in the working
+tree (`src/modules/auth/auth.controller.ts`) pending a commit. `docs/api.md`
+and `docs/security.md`'s guard-chain tables for these four routes need the
+same `CsrfGuard` column update once it lands.

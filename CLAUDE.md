@@ -40,10 +40,10 @@ src/
 │   ├── ledger/                 LedgerService — tenant balance computed from LedgerEntry; guards the payout spend path; GET /v1/ledger/balance for display
 │   ├── payments/               STK Push + B2C payouts (tenant + dashboard variants each), transaction reads, TransactionStateMachine
 │   ├── callbacks/               inbound Daraja webhook ingestion (WebhookIngestService) + Postgres-polling processor (WebhookPollerService)
-│   ├── reconciliation/          DriftDetectorService — active recovery for stuck collections, escalation for stuck payouts
+│   ├── reconciliation/          DriftDetectorService — active recovery for stuck collections, Stage 1 Transaction Status API auto-recovery query for stuck payouts (records only, doesn't yet drive TransactionStateMachine — decisions.md entry 41), PayoutResolutionService for manual override
 │   ├── reporting/                GET /v1/reporting/summary
 │   ├── audit-log/                 AuditLogService — every sensitive action + Daraja interaction
-│   └── alerts/                     Slack webhook alerts on failures
+│   └── alerts/                     Slack + email alerts on failures, POST /v1/alerts/test to fire one on demand
 ├── infrastructure/daraja/  the ONLY code that calls Safaricom (DarajaClient)
 └── common/                 guards, decorators, throttle tiers, pipes, filters, interceptors
 ```
@@ -56,7 +56,7 @@ There is no `apps/`, no `packages/`, no `k8s/`, no `docker-compose.yml`.
 |---|---|---|---|
 | POST | `/auth/signup`, `/auth/login` | Throttler | issues `access_token`/`refresh_token`/`csrf-token` httpOnly cookies |
 | POST | `/auth/refresh` | Throttler | rotates refresh token, reissues access token |
-| POST | `/auth/forgot-password`, `/auth/reset-password`, `/auth/verify-email`, `/auth/resend-verification` | Throttler, CsrfGuard | |
+| POST | `/auth/forgot-password`, `/auth/reset-password`, `/auth/verify-email`, `/auth/resend-verification` | Throttler | no `CsrfGuard` — none of the four has a prior session that could have received a `csrf-token` cookie; `reset-password`/`verify-email` are protected by the emailed single-use token instead (decisions.md entry 42, uncommitted as of 2026-09-18) |
 | GET | `/profile` | AccessTokenGuard | resolves role/tenantId for the dashboard |
 | POST | `/profile/logout` | AccessTokenGuard | |
 | POST/GET/PATCH | `/v1/tenants*` | AccessTokenGuard, CsrfGuard, RolesGuard, TenantAwareThrottlerGuard | SUPER_ADMIN for create/status. `POST /v1/tenants/:id/app-credentials` is TENANT_ADMIN+ (org-level consumer key/secret only) |
@@ -70,8 +70,11 @@ There is no `apps/`, no `packages/`, no `k8s/`, no `docker-compose.yml`.
 | GET | `/v1/reporting/summary` | AccessTokenGuard | success rate, per-status counts, drift count — collections only at top level, payouts under `payouts` |
 | GET | `/v1/ledger/balance` | AccessTokenGuard | `{ tenantId, availableMinorUnits }` — same computed figure the B2C payout balance check uses, read outside the spend path for display |
 | GET | `/v1/audit-logs` | AccessTokenGuard, RolesGuard | |
+| PATCH | `/v1/reconciliation/payouts/:id/resolve` | AccessTokenGuard, CsrfGuard, RolesGuard, TenantAwareThrottlerGuard | `@Roles("SUPER_ADMIN")` only — manual override for a payout Safaricom never answered, goes through the same `TransactionStateMachine` transitions a real callback would use. Deliberately narrower than every other payout route (decisions.md entry 40) |
+| POST | `/v1/alerts/test` | AccessTokenGuard, CsrfGuard, RolesGuard, TenantAwareThrottlerGuard | `@Roles("SUPER_ADMIN")` only — fires a real Slack/email alert on demand to verify the pipeline actually delivers, not just that it's configured (decisions.md entries 37, 38, 40) |
 | POST | `/v1/webhooks/daraja/stk-callback`, `/v1/webhooks/daraja/c2b-confirmation` | Throttler only | inbound from Safaricom; always returns 200, `@SkipResponseTransform` |
 | POST | `/v1/webhooks/daraja/b2c-result`, `/v1/webhooks/daraja/b2c-timeout` | Throttler only | payout outcome / queue timeout. The timeout is NOT a failure — it releases nothing (decisions.md entry 18) |
+| POST | `/v1/webhooks/daraja/transaction-status-result`, `/v1/webhooks/daraja/transaction-status-timeout` | Throttler only | async answer to `DriftDetectorService`'s Stage 1 auto-recovery query for a stuck payout — correlates by the query's own `PayoutStatusQuery` record, not the original payout's ids (decisions.md entry 41) |
 | GET | `/health` | Throttler only | liveness/readiness probe; pings Postgres, 503 if unreachable. Unauthenticated by necessity, reveals nothing but up/down |
 | POST | `/internal/jobs/process-webhooks`, `/internal/jobs/deliver-tenant-webhooks`, `/internal/jobs/detect-drift` | Throttler, InternalJobsSecretGuard | external-scheduler triggers for the background jobs, used when `JOB_SCHEDULER=external`. Secret in the `x-internal-jobs-secret` header; guard fails closed if unset (decisions.md entry 27) |
 
