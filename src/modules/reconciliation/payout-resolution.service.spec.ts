@@ -50,7 +50,7 @@ describe("PayoutResolutionService", () => {
   });
 
   it("throws NotFoundException for a transaction that doesn't exist", async () => {
-    jest.spyOn(prisma.transaction, "findUnique").mockResolvedValueOnce(null as any);
+    jest.spyOn(prisma.transaction, "findUnique").mockResolvedValueOnce(null);
 
     await expect(
       service.resolve("missing", { resolution: "FAILED", reason: "checked Safaricom portal" }, caller),
