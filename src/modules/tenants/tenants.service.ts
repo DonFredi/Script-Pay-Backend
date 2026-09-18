@@ -1,6 +1,6 @@
 import { ConflictException, ForbiddenException, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { Prisma } from "@prisma/client";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { PrismaService } from "../prisma/prisma.service";
 import { AuditLogService } from "../audit-log/audit-log.service";
 import { ApiKeysService } from "../api-keys/api-keys.service";
@@ -325,8 +325,22 @@ export class TenantsService {
     // of leaving an orphaned Tenant nothing points to. The initial shortcode is
     // created just after, once the tenant id this race decided on is final — see
     // createInitialShortcode's own comment for why it can't join this transaction.
-    const tenant = await this.prisma.$transaction(async (tx) => {
-      const created = await tx.tenant.create({ data: { name: dto.name, status: "pending_kyc" } });
+    //
+    // The transaction runs under withTenantContext with a client-generated id, not
+    // a bare this.prisma.$transaction: users' RLS policy is
+    // `"tenantId" IS NULL OR "tenantId" = current_setting('app.current_tenant_id')`,
+    // and with no USING-only policy Postgres reuses it as the UPDATE's WITH CHECK
+    // too — evaluated against the NEW row, whose tenantId is no longer null. With no
+    // session tenant context set, current_setting returns null, the check can never
+    // pass, and app_runtime's UPDATE was rejected outright with 42501 (not silently
+    // filtered) for every self-onboarding attempt. Pre-generating the id lets
+    // SET LOCAL app.current_tenant_id target the very tenant being created, inside
+    // the same transaction — Tenant itself carries no tenantId column and isn't
+    // RLS-scoped, so inserting it under that context is unaffected. See
+    // docs/decisions.md entry 44.
+    const tenantId = randomUUID();
+    const tenant = await this.prisma.withTenantContext(tenantId, async (tx) => {
+      const created = await tx.tenant.create({ data: { id: tenantId, name: dto.name, status: "pending_kyc" } });
 
       const linked = await tx.user.updateMany({
         where: { id: actor.id, tenantId: null },

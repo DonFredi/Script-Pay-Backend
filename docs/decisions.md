@@ -1415,3 +1415,60 @@ the app before committing, not by tests or the build passing. Added
 missing module import in this codebase — only booting the real app does.
 Worth doing at least once before committing any change that adds a new
 cross-module constructor dependency.
+
+## 44. Self-service tenant onboarding was completely broken by RLS — every attempt since 001 was applied would have failed
+
+**Problem**: found while creating a sandbox demo account to hand a prospective
+client — `POST /v1/tenants/onboard` returned a bare 500 on the very first real
+attempt against the live Render backend, reproduced identically against the
+shared production database from a local server. The real error, visible only
+in the server log (the global filter collapses it to "Internal server error"
+for the client): `new row violates row-level security policy for table
+"users"` (Postgres code `42501`).
+
+`TenantsService.onboardSelf` ran `tenant.create` + `user.updateMany` inside a
+bare `this.prisma.$transaction`, never setting `app.current_tenant_id`. The
+`users` RLS policy (`prisma/manual-sql/001_row_level_security.sql`) is
+`"tenantId" IS NULL OR "tenantId" = current_setting('app.current_tenant_id', true)`.
+With no `WITH CHECK` given explicitly, Postgres reuses that same `USING`
+clause as the `UPDATE`'s `WITH CHECK` — evaluated against the **new** row,
+whose `tenantId` is no longer null. With no session tenant context ever set,
+`current_setting` returns null, the check can never pass, and `app_runtime`'s
+`UPDATE` is rejected outright rather than silently filtered (that's what the
+distinct `42501` error code means here, as opposed to the row simply not
+showing up). This is the one operation in the entire codebase that moves a
+row from tenant-less to belonging to a specific tenant — every other
+RLS-scoped write already happens with that tenant's context already
+established.
+
+Since this is the exact code path used by `POST /auth/signup` →
+`POST /v1/tenants/onboard`, and this repo has zero production tenants to
+date, it is plausible **no self-service onboarding has ever succeeded** since
+RLS (`001_row_level_security.sql`) was applied to this database — the only
+tenants that exist were created via `TenantsService.create` (`SUPER_ADMIN`,
+which never touches the `users` table) or directly against the database.
+
+**Chosen**: generate the tenant's id client-side (`randomUUID()`) before the
+transaction, and run both writes inside `PrismaService.withTenantContext(tenantId, ...)`
+instead of a bare `$transaction` — `SET LOCAL app.current_tenant_id` is set to
+the very id being created, inside the same transaction, before either write
+runs. `Tenant` itself carries no `tenantId` column and isn't RLS-scoped, so
+inserting it with a pre-chosen id under that context is unaffected; the
+`user.updateMany`'s `WITH CHECK` now matches. The existing double-submit
+protection (`updateMany`'s `WHERE tenantId: null` re-check, throwing inside
+the transaction to roll the tenant row back with it) is unchanged.
+
+**Verified**: reproduced the 500 locally against the same (shared) production
+database, applied the fix, confirmed `POST /v1/tenants/onboard` returns 201
+and the tenant/user are correctly linked, updated
+`tenants.service.spec.ts`'s double-submit test (it asserted
+`prisma.$transaction` was called; now asserts `prisma.withTenantContext`),
+and ran the full suite (52 suites / 469 tests) green.
+
+**Lesson for next time**: this is the second time in this file (see entry
+43) that a bug was only caught by actually exercising the real path — an
+RLS `WITH CHECK` failure like this produces no signal at all from `npm test`
+(every service spec mocks `prisma.withTenantContext`/`$transaction` as a
+pass-through) or from `npm run build`. Any write that changes which tenant a
+row belongs to needs a real-database check, not just a unit test with a
+mocked Prisma client.

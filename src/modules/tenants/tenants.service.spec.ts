@@ -447,9 +447,10 @@ describe("TenantsService", () => {
         "Account is already associated with a tenant",
       );
 
-      // Both writes happened inside the same $transaction — in a real database this
-      // throw rolls the tenant.create back with it, rather than leaving it orphaned.
-      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      // Both writes happened inside the same withTenantContext transaction — in a
+      // real database this throw rolls the tenant.create back with it, rather than
+      // leaving it orphaned.
+      expect(prisma.withTenantContext).toHaveBeenCalledTimes(1);
       expect(prisma.tenantShortcode.create).not.toHaveBeenCalled();
       expect(auditLog.record).not.toHaveBeenCalled();
     });
