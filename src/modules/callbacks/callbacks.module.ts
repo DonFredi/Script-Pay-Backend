@@ -5,11 +5,13 @@ import { WebhookPollerService } from "./webhook-poller.service";
 import { TenantWebhookPollerService } from "./tenant-webhook-poller.service";
 import { PaymentsModule } from "../payments/payments.module";
 import { TenantsModule } from "../tenants/tenants.module";
+import { AuthModule } from "../auth/auth.module";
 
 @Module({
   // TenantsModule for CredentialsEncryptionService — TenantWebhookPollerService
-  // decrypts Tenant.webhookSecretEncrypted at delivery time.
-  imports: [PaymentsModule, TenantsModule],
+  // decrypts Tenant.webhookSecretEncrypted at delivery time. AuthModule for
+  // EmailService — WebhookPollerService sends a settlement receipt email.
+  imports: [PaymentsModule, TenantsModule, AuthModule],
   controllers: [DarajaWebhookController],
   providers: [WebhookIngestService, WebhookPollerService, TenantWebhookPollerService],
   // Exported for JobsModule's InternalJobsController, which triggers these same

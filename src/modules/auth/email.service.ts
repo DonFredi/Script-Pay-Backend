@@ -224,4 +224,49 @@ export class EmailService {
       `webhook secret staff notice to ${to}`,
     );
   }
+
+  /**
+   * Sent to a tenant's TENANT_ADMIN(s) the moment an inbound collection
+   * (STK push or C2B/Paybill-Till) settles — WebhookPollerService is the only
+   * caller, gated on TransactionStateMachine's settledNow return value so a
+   * redelivered Safaricom callback never sends this twice for the same
+   * settlement. amountMinorUnits is the ledger's unit; this is the one place
+   * it gets converted to a human KES figure for display.
+   */
+  async sendReceiptEmail(
+    to: string,
+    data: {
+      tenantName: string;
+      amountMinorUnits: number;
+      msisdn: string;
+      channel: string;
+      mpesaReceiptNumber: string | null;
+      settledAt: Date;
+    },
+  ): Promise<void> {
+    if (!this.resend || !this.from) {
+      this.logger.warn(`Receipt email skipped because email is not configured. To: ${to}`);
+      return;
+    }
+
+    const amount = (data.amountMinorUnits / 100).toLocaleString("en-KE", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    });
+
+    await this.deliver(
+      {
+        from: this.from,
+        to,
+        subject: `Payment received — KES ${amount}`,
+        html: `<p>A payment was received for <strong>${data.tenantName}</strong>.</p>
+               <p>Amount: <strong>KES ${amount}</strong><br/>
+               From: <code>${data.msisdn}</code><br/>
+               Channel: ${data.channel}<br/>
+               ${data.mpesaReceiptNumber ? `M-Pesa receipt: <code>${data.mpesaReceiptNumber}</code><br/>` : ""}
+               Settled: ${data.settledAt.toISOString()}</p>`,
+      },
+      `receipt email to ${to}`,
+    );
+  }
 }

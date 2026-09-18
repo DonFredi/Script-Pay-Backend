@@ -4,6 +4,7 @@ import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 import { TransactionStateMachine } from "../payments/transaction-state-machine";
 import { AuditLogService } from "../audit-log/audit-log.service";
 import { AlertsService } from "../alerts/alerts.service";
+import { EmailService } from "../auth/email.service";
 
 function c2bEvent(overrides: Partial<Record<string, unknown>> = {}) {
   return {
@@ -27,6 +28,7 @@ describe("WebhookPollerService — C2B shortcode resolution", () => {
   let stateMachine: TransactionStateMachine;
   let auditLog: AuditLogService;
   let alerts: AlertsService;
+  let emailService: EmailService;
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
@@ -38,11 +40,13 @@ describe("WebhookPollerService — C2B shortcode resolution", () => {
             webhookEvent: { findMany: jest.fn(), update: jest.fn() },
             tenantShortcode: { findMany: jest.fn() },
             transaction: { findUnique: jest.fn() },
+            user: { findMany: jest.fn().mockResolvedValue([{ email: "admin@tenant.test" }]) },
           },
         },
         { provide: TransactionStateMachine, useValue: { recordInboundSettlement: jest.fn() } },
         { provide: AuditLogService, useValue: { record: jest.fn() } },
         { provide: AlertsService, useValue: { send: jest.fn() } },
+        { provide: EmailService, useValue: { sendReceiptEmail: jest.fn() } },
       ],
     }).compile();
 
@@ -51,13 +55,14 @@ describe("WebhookPollerService — C2B shortcode resolution", () => {
     stateMachine = module.get(TransactionStateMachine);
     auditLog = module.get(AuditLogService);
     alerts = module.get(AlertsService);
+    emailService = module.get(EmailService);
   });
 
   it("settles against the single active tenant matching the shortcode", async () => {
     jest.spyOn(prisma.webhookEvent, "findMany").mockResolvedValueOnce([c2bEvent()] as any);
     jest
       .spyOn(prisma.tenantShortcode, "findMany")
-      .mockResolvedValueOnce([{ tenant: { id: "tenant-active" } }] as any);
+      .mockResolvedValueOnce([{ tenant: { id: "tenant-active", name: "Acme" } }] as any);
     jest.spyOn(stateMachine, "recordInboundSettlement").mockResolvedValueOnce({ id: "tx-1" } as any);
 
     await service.pollUnprocessedEvents();
@@ -70,6 +75,25 @@ describe("WebhookPollerService — C2B shortcode resolution", () => {
       expect.objectContaining({ tenantId: "tenant-active" }),
     );
     expect(alerts.send).not.toHaveBeenCalled();
+  });
+
+  it("emails a receipt to every TENANT_ADMIN once the C2B payment settles", async () => {
+    jest.spyOn(prisma.webhookEvent, "findMany").mockResolvedValueOnce([c2bEvent()] as any);
+    jest
+      .spyOn(prisma.tenantShortcode, "findMany")
+      .mockResolvedValueOnce([{ tenant: { id: "tenant-active", name: "Acme" } }] as any);
+    jest.spyOn(stateMachine, "recordInboundSettlement").mockResolvedValueOnce({ id: "tx-1" } as any);
+
+    await service.pollUnprocessedEvents();
+
+    expect(prisma.user.findMany).toHaveBeenCalledWith({
+      where: { tenantId: "tenant-active", role: "TENANT_ADMIN" },
+      select: { email: true },
+    });
+    expect(emailService.sendReceiptEmail).toHaveBeenCalledWith(
+      "admin@tenant.test",
+      expect.objectContaining({ tenantName: "Acme", channel: "PAYBILL", mpesaReceiptNumber: "TX123" }),
+    );
   });
 
   it("ignores a shortcode with no active tenant (e.g. two pending_kyc tenants sharing the sandbox shortcode)", async () => {
@@ -98,6 +122,121 @@ describe("WebhookPollerService — C2B shortcode resolution", () => {
       }),
     );
     expect(alerts.send).toHaveBeenCalledWith(expect.objectContaining({ severity: "critical" }));
+  });
+});
+
+function stkEvent(resultOverrides: Record<string, unknown> = {}) {
+  return {
+    id: "evt-stk",
+    source: "daraja_stk_callback",
+    attempts: 0,
+    payload: {
+      Body: {
+        stkCallback: {
+          CheckoutRequestID: "ws_CO_1",
+          ResultCode: 0,
+          ResultDesc: "The service request is processed successfully.",
+          CallbackMetadata: { Item: [{ Name: "MpesaReceiptNumber", Value: "REC123" }] },
+          ...resultOverrides,
+        },
+      },
+    },
+  };
+}
+
+describe("WebhookPollerService — STK push collection callbacks", () => {
+  let service: WebhookPollerService;
+  let prisma: PrismaPrivilegedService;
+  let stateMachine: TransactionStateMachine;
+  let alerts: AlertsService;
+  let emailService: EmailService;
+
+  const collectionRow = {
+    id: "tx-1",
+    tenantId: "tenant-1",
+    amountMinorUnits: 5000,
+    msisdn: "254712345678",
+    tenant: { name: "Acme" },
+  };
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        WebhookPollerService,
+        {
+          provide: PrismaPrivilegedService,
+          useValue: {
+            webhookEvent: { findMany: jest.fn(), update: jest.fn() },
+            transaction: { findUnique: jest.fn() },
+            user: { findMany: jest.fn().mockResolvedValue([{ email: "admin@tenant.test" }]) },
+          },
+        },
+        {
+          provide: TransactionStateMachine,
+          useValue: { transitionToSettled: jest.fn(), transitionToFailed: jest.fn() },
+        },
+        { provide: AuditLogService, useValue: { record: jest.fn() } },
+        { provide: AlertsService, useValue: { send: jest.fn() } },
+        { provide: EmailService, useValue: { sendReceiptEmail: jest.fn() } },
+      ],
+    }).compile();
+
+    service = module.get(WebhookPollerService);
+    prisma = module.get(PrismaPrivilegedService);
+    stateMachine = module.get(TransactionStateMachine);
+    alerts = module.get(AlertsService);
+    emailService = module.get(EmailService);
+  });
+
+  it("sends a receipt email once a real settlement happens", async () => {
+    jest.spyOn(prisma.webhookEvent, "findMany").mockResolvedValueOnce([stkEvent()] as any);
+    jest.spyOn(prisma.transaction, "findUnique").mockResolvedValueOnce(collectionRow as any);
+    jest.spyOn(stateMachine, "transitionToSettled").mockResolvedValueOnce(true);
+
+    await service.pollUnprocessedEvents();
+
+    expect(prisma.user.findMany).toHaveBeenCalledWith({
+      where: { tenantId: "tenant-1", role: "TENANT_ADMIN" },
+      select: { email: true },
+    });
+    expect(emailService.sendReceiptEmail).toHaveBeenCalledWith(
+      "admin@tenant.test",
+      expect.objectContaining({
+        tenantName: "Acme",
+        amountMinorUnits: 5000,
+        msisdn: "254712345678",
+        channel: "STK push",
+        mpesaReceiptNumber: "REC123",
+      }),
+    );
+  });
+
+  // The exact case transitionToSettled's settledNow return value exists for: Safaricom
+  // redelivers callbacks aggressively, and a redelivery of an already-settled
+  // transaction must not send a second receipt for the same payment.
+  it("does NOT send a receipt email on a redelivered/idempotent callback", async () => {
+    jest.spyOn(prisma.webhookEvent, "findMany").mockResolvedValueOnce([stkEvent()] as any);
+    jest.spyOn(prisma.transaction, "findUnique").mockResolvedValueOnce(collectionRow as any);
+    jest.spyOn(stateMachine, "transitionToSettled").mockResolvedValueOnce(false);
+
+    await service.pollUnprocessedEvents();
+
+    expect(emailService.sendReceiptEmail).not.toHaveBeenCalled();
+  });
+
+  it("does not send a receipt email on a failed STK push", async () => {
+    jest
+      .spyOn(prisma.webhookEvent, "findMany")
+      .mockResolvedValueOnce([stkEvent({ ResultCode: 1032, ResultDesc: "Request cancelled by user" })] as any);
+    jest.spyOn(prisma.transaction, "findUnique").mockResolvedValueOnce(collectionRow as any);
+
+    await service.pollUnprocessedEvents();
+
+    expect(stateMachine.transitionToFailed).toHaveBeenCalledWith("tx-1", {
+      failureReason: "Request cancelled by user",
+    });
+    expect(emailService.sendReceiptEmail).not.toHaveBeenCalled();
+    expect(alerts.send).toHaveBeenCalledWith(expect.objectContaining({ severity: "warning" }));
   });
 });
 
@@ -156,6 +295,7 @@ describe("WebhookPollerService — B2C payout callbacks", () => {
         },
         { provide: AuditLogService, useValue: { record: jest.fn() } },
         { provide: AlertsService, useValue: { send: jest.fn() } },
+        { provide: EmailService, useValue: { sendReceiptEmail: jest.fn() } },
       ],
     }).compile();
 

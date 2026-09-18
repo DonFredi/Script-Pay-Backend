@@ -5,6 +5,7 @@ import { PrismaPrivilegedService } from "../prisma/prisma-privileged.service";
 import { TransactionStateMachine } from "../payments/transaction-state-machine";
 import { AuditLogService } from "../audit-log/audit-log.service";
 import { AlertsService } from "../alerts/alerts.service";
+import { EmailService } from "../auth/email.service";
 
 const MAX_ATTEMPTS = 5;
 
@@ -29,7 +30,48 @@ export class WebhookPollerService {
     private readonly stateMachine: TransactionStateMachine,
     private readonly auditLog: AuditLogService,
     private readonly alerts: AlertsService,
+    private readonly emailService: EmailService,
   ) {}
+
+  /**
+   * Best-effort, same reasoning as TenantsService's API-key provisioning email
+   * (see docs/decisions.md entry 14): a receipt email failing to send must
+   * never fail — or retry-loop — the settlement itself, which has already
+   * been committed by the time this runs. Every TENANT_ADMIN on the account
+   * gets one, mirroring who receives the auto-provisioned API key.
+   */
+  private async sendReceiptEmail(
+    tenantId: string,
+    tenantName: string,
+    data: {
+      amountMinorUnits: number;
+      msisdn: string;
+      channel: string;
+      mpesaReceiptNumber: string | null;
+    },
+  ) {
+    try {
+      const admins = await this.prisma.user.findMany({
+        where: { tenantId, role: "TENANT_ADMIN" },
+        select: { email: true },
+      });
+
+      await Promise.all(
+        admins.map((admin) =>
+          this.emailService.sendReceiptEmail(admin.email, {
+            tenantName,
+            amountMinorUnits: data.amountMinorUnits,
+            msisdn: data.msisdn,
+            channel: data.channel,
+            mpesaReceiptNumber: data.mpesaReceiptNumber,
+            settledAt: new Date(),
+          }),
+        ),
+      );
+    } catch (error) {
+      this.logger.error(`Failed to send receipt email for tenant ${tenantId}`, error as Error);
+    }
+  }
 
   /**
    * Cron entry point. Thin on purpose: the real work stays in
@@ -108,7 +150,10 @@ export class WebhookPollerService {
     const checkoutRequestId = stkCallback?.CheckoutRequestID;
     const resultCode = stkCallback?.ResultCode;
 
-    const transaction = await this.prisma.transaction.findUnique({ where: { checkoutRequestId } });
+    const transaction = await this.prisma.transaction.findUnique({
+      where: { checkoutRequestId },
+      include: { tenant: { select: { name: true } } },
+    });
 
     if (!transaction) {
       this.logger.warn(`Callback for unknown CheckoutRequestID ${checkoutRequestId} — ignoring`);
@@ -123,7 +168,9 @@ export class WebhookPollerService {
     if (resultCode === 0) {
       const metadata = stkCallback.CallbackMetadata?.Item ?? [];
       const receiptItem = metadata.find((i: any) => i.Name === "MpesaReceiptNumber");
-      await this.stateMachine.transitionToSettled(transaction.id, { mpesaReceiptNumber: receiptItem?.Value });
+      const settledNow = await this.stateMachine.transitionToSettled(transaction.id, {
+        mpesaReceiptNumber: receiptItem?.Value,
+      });
       await this.auditLog.record({
         tenantId: transaction.tenantId,
         actorType: "system",
@@ -132,6 +179,17 @@ export class WebhookPollerService {
         targetId: transaction.id,
         metadata: { checkoutRequestId, mpesaReceiptNumber: receiptItem?.Value },
       });
+
+      // Gated on the real transition, not a redelivered/duplicate callback —
+      // see transitionToSettled's own doc comment.
+      if (settledNow && transaction.tenant) {
+        await this.sendReceiptEmail(transaction.tenantId, transaction.tenant.name, {
+          amountMinorUnits: transaction.amountMinorUnits,
+          msisdn: transaction.msisdn,
+          channel: "STK push",
+          mpesaReceiptNumber: receiptItem?.Value ?? null,
+        });
+      }
     } else {
       await this.stateMachine.transitionToFailed(transaction.id, {
         failureReason: stkCallback.ResultDesc ?? "unknown_failure",
@@ -453,6 +511,17 @@ export class WebhookPollerService {
       targetType: "Transaction",
       targetId: transaction.id,
       metadata: { transId, amountMinorUnits, channel },
+    });
+
+    // Always a fresh row (see recordInboundSettlement) — WebhookIngestService's
+    // naturalKey uniqueness on TransID already prevents this handler running
+    // twice for the same confirmation, so unlike the STK path there's no
+    // settledNow flag to gate on here.
+    await this.sendReceiptEmail(tenant.id, tenant.name, {
+      amountMinorUnits,
+      msisdn,
+      channel,
+      mpesaReceiptNumber: transId,
     });
   }
 }

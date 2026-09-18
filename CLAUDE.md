@@ -56,7 +56,7 @@ There is no `apps/`, no `packages/`, no `k8s/`, no `docker-compose.yml`.
 |---|---|---|---|
 | POST | `/auth/signup`, `/auth/login` | Throttler | issues `access_token`/`refresh_token`/`csrf-token` httpOnly cookies |
 | POST | `/auth/refresh` | Throttler | rotates refresh token, reissues access token |
-| POST | `/auth/forgot-password`, `/auth/reset-password`, `/auth/verify-email`, `/auth/resend-verification` | Throttler | no `CsrfGuard` — none of the four has a prior session that could have received a `csrf-token` cookie; `reset-password`/`verify-email` are protected by the emailed single-use token instead (decisions.md entry 42, uncommitted as of 2026-09-18) |
+| POST | `/auth/forgot-password`, `/auth/reset-password`, `/auth/verify-email`, `/auth/resend-verification` | Throttler | no `CsrfGuard` — none of the four has a prior session that could have received a `csrf-token` cookie; `reset-password`/`verify-email` are protected by the emailed single-use token instead (decisions.md entry 42) |
 | GET | `/profile` | AccessTokenGuard | resolves role/tenantId for the dashboard |
 | POST | `/profile/logout` | AccessTokenGuard | |
 | POST/GET/PATCH | `/v1/tenants*` | AccessTokenGuard, CsrfGuard, RolesGuard, TenantAwareThrottlerGuard | SUPER_ADMIN for create/status. `POST /v1/tenants/:id/app-credentials` is TENANT_ADMIN+ (org-level consumer key/secret only) |

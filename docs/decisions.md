@@ -1371,7 +1371,47 @@ body:
   worst a forged call achieves is triggering an extra email to whatever
   address the attacker supplies, which `StrictPaymentThrottle` already caps.
 
-**Not yet committed** as of 2026-09-18 — this fix is sitting in the working
-tree (`src/modules/auth/auth.controller.ts`) pending a commit. `docs/api.md`
-and `docs/security.md`'s guard-chain tables for these four routes need the
-same `CsrfGuard` column update once it lands.
+Committed 2026-09-18 (`bc374e3`, "reset password token fix") and pushed to
+`main`. `docs/api.md` and `docs/security.md`'s guard-chain tables for these
+four routes were updated in the same commit.
+
+## 43. `multer` DoS advisories closed with an `npm` override, not a NestJS major bump
+
+**Problem**: `npm audit --audit-level=high` (the CI `verify` job) started
+failing on 4 high-severity `multer` advisories (GHSA-wc9g-mqfw-jrwm,
+GHSA-qfvm-cv95-jqjf, GHSA-qvfw-j98x-7q72, GHSA-535w-7cp7-47q4). `multer` is a
+transitive dependency of `@nestjs/platform-express`, pulled in only because
+`@nestjs/core`/`common` need it — this codebase has no file-upload routes at
+all. Every `@nestjs/platform-express@11.x` release pins `multer` to exactly
+`2.2.0`; the only release with the patched `2.4.0` is `@nestjs/platform-express@12.0.3`,
+which requires `@nestjs/core@^12` — a full major bump across `core`,
+`common`, `platform-express`, `schedule`, `testing`, and `throttler`, none of
+which was otherwise warranted.
+
+**Chosen**: added `"multer": "^2.4.0"` to the existing `overrides` block in
+`package.json` (alongside the pre-existing `deepmerge-ts` override) instead of
+upgrading NestJS. `multer` 2.2.0 → 2.4.0 is a same-major, non-breaking bump
+per its own semver, and with no route in this repo touching `multer`
+directly there is no surface for the version bump to break — confirmed by a
+full build, boot, and `npm test` run (52 suites, 469 tests) with the override
+in place. `npm audit` now reports 0 vulnerabilities.
+
+**Also fixed while verifying**: `CallbacksModule` was missing an `AuthModule`
+import. A same-day, uncommitted change had added `EmailService` (from
+`AuthModule`) as a `WebhookPollerService` constructor dependency (a
+settlement receipt email, gated on `TransactionStateMachine.transitionToSettled`'s
+new boolean return so a redelivered Safaricom callback can't send it twice)
+without wiring the module import — `TenantsModule`, which `CallbacksModule`
+already imported, imports `AuthModule` itself but does not re-export it,
+so `EmailService` was invisible outside `AuthModule`/`TenantsModule`. This
+never surfaced in `npm test` (each spec constructs `WebhookPollerService`
+in an isolated `TestingModule` with `EmailService` mocked directly) or in
+`nest build` (a `tsc` compile, no DI graph check) — only a real `NestFactory.create`
+boot throws `UnknownDependenciesException`. Caught here by actually booting
+the app before committing, not by tests or the build passing. Added
+`AuthModule` to `CallbacksModule`'s `imports` array to fix it.
+
+**Lesson for next time**: neither `npm run build` nor `npm test` catches a
+missing module import in this codebase — only booting the real app does.
+Worth doing at least once before committing any change that adds a new
+cross-module constructor dependency.

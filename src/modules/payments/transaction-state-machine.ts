@@ -41,8 +41,18 @@ export class TransactionStateMachine {
    * handled by WebhookPollerService). A resultCode of 0 is Safaricom's own authoritative
    * success signal, so settlement must not be gated on a field that API can never supply.
    */
-  async transitionToSettled(transactionId: string, data: { mpesaReceiptNumber?: string }) {
-    await this.prisma.$transaction(async (tx) => {
+  /**
+   * Returns whether this call performed the actual PROCESSING -> SETTLED
+   * transition, as opposed to a no-op (idempotent duplicate delivery, or a
+   * pure receipt-number backfill on an already-settled row). Callers that
+   * trigger a one-time side effect on settlement — outbound webhook delivery
+   * below, and WebhookPollerService's receipt email — must gate on this,
+   * the same way enqueueWebhookDelivery already does inside this method:
+   * Safaricom redelivers callbacks aggressively, and a redelivery must never
+   * cause a second notification to go out for the same settlement.
+   */
+  async transitionToSettled(transactionId: string, data: { mpesaReceiptNumber?: string }): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
       // Lock BEFORE the read, not after: the point is that the status this method
       // decides on is the status at write time. A lock taken after the read leaves
       // the read itself unprotected, which is the race it exists to close.
@@ -65,10 +75,10 @@ export class TransactionStateMachine {
             where: { id: transactionId },
             data: { mpesaReceiptNumber: data.mpesaReceiptNumber },
           });
-          return;
+          return false;
         }
         if (!data.mpesaReceiptNumber || transaction.mpesaReceiptNumber === data.mpesaReceiptNumber) {
-          return; // idempotent duplicate delivery — nothing to do
+          return false; // idempotent duplicate delivery — nothing to do
         }
         throw new Error(
           `Transaction ${transactionId} already settled with a different receipt number ` +
@@ -118,6 +128,8 @@ export class TransactionStateMachine {
       // early-returns above — a redelivered Safaricom callback must never cause a
       // second settlement notification to go out to the tenant.
       await this.enqueueWebhookDelivery(tx, transaction, "SETTLED", data.mpesaReceiptNumber ?? null);
+
+      return true;
     });
   }
 
