@@ -296,6 +296,21 @@ export class TenantsService {
 
     const tenant = await this.prisma.tenant.findUnique({ where: { id } });
     if (!tenant) throw new NotFoundException("Tenant not found");
+
+    // Platform staff need a way to reach a tenant (KYC follow-up) and the tenant record
+    // has no contact column — the earliest-registered TENANT_ADMIN's login email is the
+    // contact. SUPER_ADMIN only: tenants reading their own record already know it.
+    // users is RLS-scoped, hence withTenantContext.
+    if (caller.role === "SUPER_ADMIN") {
+      const admin = await this.prisma.withTenantContext(id, (tx) =>
+        tx.user.findFirst({
+          where: { tenantId: id, role: "TENANT_ADMIN" },
+          orderBy: { createdAt: "asc" },
+          select: { email: true },
+        }),
+      );
+      return { ...tenant, contactEmail: admin?.email ?? null };
+    }
     return tenant;
   }
 
@@ -384,6 +399,7 @@ export class TenantsService {
           tenantId: tenant.id,
           name: tenant.name.replace(/[`<>&]/g, "").slice(0, 80),
           businessShortcode: dto.businessShortcode,
+          contactEmail: actor.email.replace(/[`<>&]/g, "").slice(0, 120),
         },
       })
       .catch((error: unknown) => this.logger.error("New-tenant alert failed", error as Error));

@@ -51,7 +51,7 @@ describe("TenantsService", () => {
       // Defaulted empty so tests that don't care about webhook/API-key notification
       // content (most of them) don't have to stub every lookup individually — only
       // the notification-focused tests below override this per-call.
-      user: { update: jest.fn(), updateMany: jest.fn(), findMany: jest.fn().mockResolvedValue([]) },
+      user: { update: jest.fn(), updateMany: jest.fn(), findMany: jest.fn().mockResolvedValue([]), findFirst: jest.fn() },
     };
     // onboardSelf runs tenant.create + user.updateMany inside $transaction — mirror
     // that by running the callback against this same mock instead of a real transaction,
@@ -385,9 +385,32 @@ describe("TenantsService", () => {
     it("lets SUPER_ADMIN read any tenant", async () => {
       jest.spyOn(prisma.tenant, "findUnique").mockResolvedValueOnce({ id: "other-tenant" } as any);
 
+      jest.spyOn(prisma.user, "findFirst").mockResolvedValueOnce({ email: "owner@acme.test" } as any);
+
       const result = await service.findOne("other-tenant", user({ role: "SUPER_ADMIN", tenantId: null }));
 
-      expect(result).toEqual({ id: "other-tenant" });
+      expect(result).toEqual({ id: "other-tenant", contactEmail: "owner@acme.test" });
+      expect(prisma.user.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { tenantId: "other-tenant", role: "TENANT_ADMIN" } }),
+      );
+    });
+
+    it("returns a null contactEmail to SUPER_ADMIN when the tenant has no admin user", async () => {
+      jest.spyOn(prisma.tenant, "findUnique").mockResolvedValueOnce({ id: "other-tenant" } as any);
+      jest.spyOn(prisma.user, "findFirst").mockResolvedValueOnce(null);
+
+      const result = await service.findOne("other-tenant", user({ role: "SUPER_ADMIN", tenantId: null }));
+
+      expect(result).toEqual({ id: "other-tenant", contactEmail: null });
+    });
+
+    it("does not look up or expose a contact email for a tenant reading its own record", async () => {
+      jest.spyOn(prisma.tenant, "findUnique").mockResolvedValueOnce({ id: "tenant-1" } as any);
+
+      const result = await service.findOne("tenant-1", user({ tenantId: "tenant-1" }));
+
+      expect(result).not.toHaveProperty("contactEmail");
+      expect(prisma.user.findFirst).not.toHaveBeenCalled();
     });
   });
 
@@ -451,7 +474,12 @@ describe("TenantsService", () => {
       expect(alert).toMatchObject({ severity: "info", email: true, title: "New tenant awaiting KYC review" });
       // detail is injected unescaped into Slack/email HTML, so it must carry nothing user-supplied.
       expect(alert.detail).not.toContain("Evil");
-      expect(alert.context).toEqual({ tenantId: "tenant-new", name: "Evil !channelbCo", businessShortcode: "174379" });
+      expect(alert.context).toEqual({
+        tenantId: "tenant-new",
+        name: "Evil !channelbCo",
+        businessShortcode: "174379",
+        contactEmail: "a@b.com",
+      });
     });
 
     it("still completes onboarding when the alert itself fails", async () => {

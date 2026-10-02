@@ -1504,8 +1504,15 @@ Two deliberate details:
 **Rejected**: a polling job over `pending_kyc` tenants (more moving parts, and delays the
 alert); alerting from `create` too (that path is `SUPER_ADMIN`-only — they already know).
 
-**Not done**: the alert carries no link or tenant contact details — the tenant record has
-no contact field. The `PLATFORM_NAME` default (alert and email subjects) was changed from
+**Contact details (added later the same day)**: `Tenant` has no contact column, so the
+sign-up alert's `context` carries the registering user's email (`contactEmail`, stripped
+like the name), and `GET /v1/tenants/:id` returns `contactEmail` to `SUPER_ADMIN` callers
+only — the earliest-registered `TENANT_ADMIN`'s login email, read under `withTenantContext`
+because `users` is RLS-scoped. Chosen over a new column/migration: no schema change, and
+the login email is the one address guaranteed to exist. Not returned by `GET /v1/tenants`
+(the list) — that would be an N+1 or a privileged cross-tenant query.
+
+**Not done**: the alert carries no link. The `PLATFORM_NAME` default (alert and email subjects) was changed from
 `"ScriptPay"` to `"ScriptPesa"` to match the 2026-10-02 product rename; the
 `X-ScriptPay-Signature` header on tenant webhooks is deliberately unchanged, since renaming it
 would break every tenant's signature verification.
