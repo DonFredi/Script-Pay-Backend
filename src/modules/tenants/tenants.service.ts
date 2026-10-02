@@ -5,6 +5,7 @@ import { PrismaService } from "../prisma/prisma.service";
 import { AuditLogService } from "../audit-log/audit-log.service";
 import { ApiKeysService } from "../api-keys/api-keys.service";
 import { EmailService } from "../auth/email.service";
+import { AlertsService } from "../alerts/alerts.service";
 import type { AuthenticatedUser } from "../../common/decorators/current-user.decorator";
 import type { CreateTenantDto, UpdateTenantStatusDto } from "./tenant.dto";
 import type { SetAppCredentialsDto } from "./tenants.schema";
@@ -23,6 +24,7 @@ export class TenantsService {
     private readonly apiKeysService: ApiKeysService,
     private readonly emailService: EmailService,
     private readonly daraja: DarajaClient,
+    private readonly alerts: AlertsService,
   ) {}
 
   /** SUPER_ADMIN only — enforced at the controller via @Roles(), not re-checked here on purpose:
@@ -363,6 +365,28 @@ export class TenantsService {
       targetId: tenant.id,
       metadata: { name: tenant.name, businessShortcode: dto.businessShortcode },
     });
+
+    // A self-registered tenant sits in pending_kyc until a SUPER_ADMIN reviews it, and
+    // nothing told staff one had arrived — a sign-up could wait unnoticed for days.
+    // Not awaited: AlertsService.send makes a network call (Slack/Resend) with no
+    // timeout, and a slow or hung channel must never delay the sign-up response.
+    // `detail` stays static (it is injected unescaped into Slack/email HTML); the
+    // user-supplied name goes in `context`, stripped of the characters that could break
+    // out of Slack's code block or the email's <pre>.
+    void this.alerts
+      .send({
+        title: "New tenant awaiting KYC review",
+        detail:
+          "A new tenant self-registered and is waiting in pending_kyc. Review it in the admin dashboard before activating.",
+        severity: "info",
+        email: true,
+        context: {
+          tenantId: tenant.id,
+          name: tenant.name.replace(/[`<>&]/g, "").slice(0, 80),
+          businessShortcode: dto.businessShortcode,
+        },
+      })
+      .catch((error: unknown) => this.logger.error("New-tenant alert failed", error as Error));
 
     return tenant;
   }

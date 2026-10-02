@@ -7,6 +7,7 @@ import { AuditLogService } from "../audit-log/audit-log.service";
 import { CredentialsEncryptionService } from "./credentials-encryption.service";
 import { ApiKeysService } from "../api-keys/api-keys.service";
 import { EmailService } from "../auth/email.service";
+import { AlertsService } from "../alerts/alerts.service";
 import { DarajaClient } from "../../infrastructure/daraja/daraja.client";
 import type { AuthenticatedUser } from "../../common/decorators/current-user.decorator";
 
@@ -29,6 +30,7 @@ describe("TenantsService", () => {
   let apiKeysService: ApiKeysService;
   let emailService: EmailService;
   let daraja: DarajaClient;
+  let alerts: AlertsService;
 
   beforeEach(async () => {
     const prismaMock: any = {
@@ -75,6 +77,7 @@ describe("TenantsService", () => {
             sendWebhookSecretStaffNotice: jest.fn(),
           },
         },
+        { provide: AlertsService, useValue: { send: jest.fn().mockResolvedValue(undefined) } },
         {
           provide: DarajaClient,
           useValue: {
@@ -92,6 +95,7 @@ describe("TenantsService", () => {
     apiKeysService = module.get(ApiKeysService);
     emailService = module.get(EmailService);
     daraja = module.get(DarajaClient);
+    alerts = module.get(AlertsService);
   });
 
   describe("setAppCredentials", () => {
@@ -433,6 +437,36 @@ describe("TenantsService", () => {
       });
       expect(auditLog.record).toHaveBeenCalledWith(expect.objectContaining({ action: "tenant.onboarded_self" }));
       expect(result.id).toBe("tenant-new");
+    });
+
+    it("alerts staff by email that a new tenant is awaiting KYC, with the name only in the sanitised context", async () => {
+      jest
+        .spyOn(prisma.tenant, "create")
+        .mockResolvedValueOnce({ id: "tenant-new", name: "Evil ```<!channel><b>Co" } as any);
+      jest.spyOn(prisma.user, "updateMany").mockResolvedValueOnce({ count: 1 });
+
+      await service.onboardSelf(dto, user({ tenantId: null, role: "TENANT_ADMIN" }));
+
+      const alert = (alerts.send as jest.Mock).mock.calls[0][0];
+      expect(alert).toMatchObject({ severity: "info", email: true, title: "New tenant awaiting KYC review" });
+      // detail is injected unescaped into Slack/email HTML, so it must carry nothing user-supplied.
+      expect(alert.detail).not.toContain("Evil");
+      expect(alert.context).toEqual({ tenantId: "tenant-new", name: "Evil !channelbCo", businessShortcode: "174379" });
+    });
+
+    it("still completes onboarding when the alert itself fails", async () => {
+      jest.spyOn(prisma.tenant, "create").mockResolvedValueOnce({ id: "tenant-new", name: "Acme" } as any);
+      jest.spyOn(prisma.user, "updateMany").mockResolvedValueOnce({ count: 1 });
+      (alerts.send as jest.Mock).mockRejectedValueOnce(new Error("slack down"));
+
+      await expect(service.onboardSelf(dto, user({ tenantId: null, role: "TENANT_ADMIN" }))).resolves.toMatchObject({
+        id: "tenant-new",
+      });
+    });
+
+    it("does not alert when onboarding is rejected", async () => {
+      await expect(service.onboardSelf(dto, user({ tenantId: "tenant-1" }))).rejects.toThrow(ForbiddenException);
+      expect(alerts.send).not.toHaveBeenCalled();
     });
 
     it("rejects a double-submit that races the tenantId:null check, instead of creating an orphaned tenant", async () => {

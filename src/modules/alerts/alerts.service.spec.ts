@@ -65,7 +65,7 @@ describe("AlertsService", () => {
       await service.send({ title: "Daraja unreachable", detail: "STK push failing", severity: "critical" });
 
       expect(sendMock).toHaveBeenCalledWith(
-        expect.objectContaining({ to: "ops@scriptpay.test", subject: "[ScriptPay] Daraja unreachable" }),
+        expect.objectContaining({ to: "ops@scriptpay.test", subject: "[ScriptPesa] Daraja unreachable" }),
       );
     });
 
@@ -78,6 +78,37 @@ describe("AlertsService", () => {
       await service.send({ title: "Minor hiccup", detail: "Not urgent", severity: "warning" });
 
       expect(sendMock).not.toHaveBeenCalled();
+    });
+
+    it("emails a non-critical alert when it asks for email, so it still reaches a person without Slack", async () => {
+      process.env.RESEND_API_KEY = "re_test";
+      process.env.EMAIL_FROM = "alerts@scriptpay.test";
+      process.env.ALERTS_EMAIL_TO = "ops@scriptpay.test";
+      delete process.env.SLACK_WEBHOOK_URL;
+      const service = new AlertsService();
+
+      await service.send({
+        title: "New tenant awaiting KYC review",
+        detail: "A new tenant self-registered.",
+        severity: "info",
+        email: true,
+        context: { name: "Hills" },
+      });
+
+      expect(sendMock).toHaveBeenCalledWith(
+        expect.objectContaining({ to: "ops@scriptpay.test", subject: "[ScriptPesa] New tenant awaiting KYC review" }),
+      );
+    });
+
+    it("marks an info alert with its own Slack emoji, not the warning one", async () => {
+      process.env.SLACK_WEBHOOK_URL = "https://hooks.slack.test/webhook";
+      const service = new AlertsService();
+
+      await service.send({ title: "New tenant", detail: "Hello", severity: "info" });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.text).toContain("🔵");
+      expect(body.text).not.toContain("🟠");
     });
 
     it("skips the email channel silently when ALERTS_EMAIL_TO isn't set, even for critical", async () => {

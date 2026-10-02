@@ -11,7 +11,7 @@ export class EmailService {
   // allow-list (can include localhost for dev) and is the wrong value to build a
   // user-facing email link from. See env.schema.ts for the distinction.
   private readonly appUrl = process.env.PUBLIC_APP_URL;
-  private readonly platformName = process.env.PLATFORM_NAME || "ScriptPay";
+  private readonly platformName = process.env.PLATFORM_NAME || "ScriptPesa";
 
   constructor() {
     if (process.env.RESEND_API_KEY) {

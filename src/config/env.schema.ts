@@ -185,7 +185,7 @@ export const envSchema = z.object({
   ALERTS_EMAIL_TO: optionalEmail(),
 
   // Product name used in outbound email subject lines (verification, password
-  // reset). Optional — unset behaves exactly like today (defaults to "ScriptPay"
+  // reset). Optional — unset behaves exactly like today (defaults to "ScriptPesa"
   // in EmailService itself, not here, since process.env isn't rewritten with
   // zod defaults after validateEnv() runs — see main.ts). Exists so a
   // differently-branded deployment of this codebase doesn't have to edit source

@@ -1472,3 +1472,40 @@ RLS `WITH CHECK` failure like this produces no signal at all from `npm test`
 pass-through) or from `npm run build`. Any write that changes which tenant a
 row belongs to needs a real-database check, not just a unit test with a
 mocked Prisma client.
+
+## 45. Staff are alerted when a tenant self-registers
+
+**Problem**: `POST /v1/tenants/onboard` leaves the new tenant in `pending_kyc` until a
+`SUPER_ADMIN` reviews it, but nothing told staff one had arrived. A real sign-up (a
+tenant that then fired five STK pushes against missing credentials within three
+minutes) was only noticed because an admin happened to open the tenants list.
+
+**Chosen**: `TenantsService.onboardSelf` sends an `AlertsService` alert after the audit
+record is written. Two supporting changes to `AlertPayload`:
+
+- a new `"info"` severity, for events a person should see that are not failures — using
+  `"warning"` would paint every sign-up as a problem, and `"critical"` would page for it;
+- an `email?: boolean` flag, because the email channel was `critical`-only. This
+  deployment has `ALERTS_EMAIL_TO` + Resend configured but **no `SLACK_WEBHOOK_URL`**, so
+  an alert that only went to Slack would have been a log line nobody reads.
+
+Two deliberate details:
+
+- **Not awaited** (`void ...catch(log)`): `AlertsService.send` makes network calls with
+  no timeout, and a hung Slack/Resend must not delay or fail a sign-up. `send` already
+  swallows its own errors; the `.catch` is a second guard.
+- **The tenant's name never goes in `detail`.** `detail` is interpolated unescaped into
+  the Slack message and the alert email's HTML, and the name is user-supplied — a name
+  like `<!channel>` or one containing a code fence is injection into a staff channel. The
+  name goes in `context` (escaped in the email, in a code block in Slack), with
+  `` ` < > & `` stripped and a length cap, since a backtick-fence in the name could still
+  close Slack's code block early.
+
+**Rejected**: a polling job over `pending_kyc` tenants (more moving parts, and delays the
+alert); alerting from `create` too (that path is `SUPER_ADMIN`-only — they already know).
+
+**Not done**: the alert carries no link or tenant contact details — the tenant record has
+no contact field. The `PLATFORM_NAME` default (alert and email subjects) was changed from
+`"ScriptPay"` to `"ScriptPesa"` to match the 2026-10-02 product rename; the
+`X-ScriptPay-Signature` header on tenant webhooks is deliberately unchanged, since renaming it
+would break every tenant's signature verification.

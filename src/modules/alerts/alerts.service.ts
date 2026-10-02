@@ -3,8 +3,19 @@ import { Resend } from "resend";
 
 export interface AlertPayload {
   title: string;
+  /**
+   * Inserted into the Slack message and the alert email's HTML UNESCAPED — keep it a
+   * static string. Anything user-supplied (a tenant's name, say) belongs in `context`,
+   * which is escaped for email and rendered inside a code block in Slack.
+   */
   detail: string;
-  severity: "warning" | "critical";
+  /** "info" is for events a human should see but that aren't failures (e.g. a new sign-up). */
+  severity: "info" | "warning" | "critical";
+  /**
+   * Also email ALERTS_EMAIL_TO. Critical alerts always do; set this for a non-critical
+   * one that must still reach a person when Slack isn't configured.
+   */
+  email?: boolean;
   context?: Record<string, unknown>;
 }
 
@@ -21,7 +32,7 @@ export class AlertsService {
   private readonly slackWebhookUrl = process.env.SLACK_WEBHOOK_URL;
   private readonly alertsEmailTo = process.env.ALERTS_EMAIL_TO;
   private readonly emailFrom = process.env.EMAIL_FROM;
-  private readonly platformName = process.env.PLATFORM_NAME || "ScriptPay";
+  private readonly platformName = process.env.PLATFORM_NAME || "ScriptPesa";
   private readonly resend?: Resend;
 
   constructor() {
@@ -33,7 +44,7 @@ export class AlertsService {
   async send(alert: AlertPayload): Promise<void> {
     await this.sendSlack(alert);
 
-    if (alert.severity === "critical" && this.alertsEmailTo) {
+    if ((alert.severity === "critical" || alert.email) && this.alertsEmailTo) {
       await this.sendEmail(
         this.alertsEmailTo,
         `[${this.platformName}] ${alert.title}`,
@@ -55,7 +66,7 @@ export class AlertsService {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          text: `${alert.severity === "critical" ? "🔴" : "🟠"} *${alert.title}*\n${alert.detail}${
+          text: `${{ critical: "🔴", warning: "🟠", info: "🔵" }[alert.severity]} *${alert.title}*\n${alert.detail}${
             alert.context ? `\n\`\`\`${JSON.stringify(alert.context, null, 2)}\`\`\`` : ""
           }`,
         }),
