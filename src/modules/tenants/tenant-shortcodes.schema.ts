@@ -86,5 +86,16 @@ export type CreateShortcodeDto = z.infer<typeof createShortcodeSchema>;
 // Same field set as create, but every field is optional — updating a shortcode is a
 // partial patch (e.g. rotating just the passkey), and `type`/`shortcode` themselves
 // are also editable since a typo'd shortcode shouldn't require delete-and-recreate.
-export const updateShortcodeSchema = shortcodeBaseSchema.partial();
+//
+// initiatorName and securityCredential must arrive together. The credential is the
+// initiator's password encrypted, so one without the other is meaningless — and
+// update() only writes them as a pair, so a half pair used to be dropped silently
+// while the request still returned 200 and audit-logged an update. Rejecting it
+// here turns "I saved it but nothing changed" into an error at save time.
+export const updateShortcodeSchema = shortcodeBaseSchema
+  .partial()
+  .refine((v) => Boolean(v.initiatorName) === Boolean(v.securityCredential), {
+    message: "Initiator name and security credential must be updated together",
+    path: ["securityCredential"],
+  });
 export type UpdateShortcodeDto = z.infer<typeof updateShortcodeSchema>;

@@ -1,4 +1,4 @@
-import { createShortcodeSchema } from "./tenant-shortcodes.schema";
+import { createShortcodeSchema, updateShortcodeSchema } from "./tenant-shortcodes.schema";
 
 /**
  * Regression coverage for docs/decisions.md entry 39: a Daraja security credential
@@ -52,5 +52,28 @@ describe("createShortcodeSchema credential normalisation", () => {
 
   it("treats a credential of only quotes as absent, failing the B2C requirement", () => {
     expect(() => createShortcodeSchema.parse(b2c({ securityCredential: '""' }))).toThrow();
+  });
+});
+
+describe("updateShortcodeSchema", () => {
+  it("accepts an initiator name and security credential updated together", () => {
+    expect(updateShortcodeSchema.safeParse({ initiatorName: "testapi", securityCredential: "Ab3d==" }).success).toBe(true);
+  });
+
+  it("rejects a security credential without its initiator name, instead of silently dropping it", () => {
+    expect(updateShortcodeSchema.safeParse({ securityCredential: "Ab3d==" }).success).toBe(false);
+  });
+
+  it("rejects an initiator name without its security credential", () => {
+    expect(updateShortcodeSchema.safeParse({ initiatorName: "testapi" }).success).toBe(false);
+  });
+
+  it("still accepts patches that touch neither, like make-default or a passkey rotation", () => {
+    expect(updateShortcodeSchema.safeParse({ isDefault: true }).success).toBe(true);
+    expect(updateShortcodeSchema.safeParse({ passkey: "new-passkey" }).success).toBe(true);
+  });
+
+  it("treats empty strings as absent, so an untouched form field doesn't count as half a pair", () => {
+    expect(updateShortcodeSchema.safeParse({ initiatorName: "", securityCredential: "" }).success).toBe(true);
   });
 });

@@ -151,6 +151,18 @@ export class TenantShortcodesService {
         const existing = await tx.tenantShortcode.findFirst({ where: { id: shortcodeId, tenantId } });
         if (!existing) throw new NotFoundException("Shortcode not found");
 
+        // Same type rule createShortcodeSchema enforces, checked here because only
+        // the stored row knows the type when the patch doesn't change it. Without
+        // this a passkey sent to a B2C row (or B2C credentials to a Till) was
+        // encrypted and stored on a row that can never use it.
+        const effectiveType = dto.type ?? existing.type;
+        if (effectiveType === "B2C" && dto.passkey) {
+          throw new BadRequestException("A B2C shortcode does not take a passkey");
+        }
+        if (effectiveType !== "B2C" && (dto.initiatorName || dto.securityCredential)) {
+          throw new BadRequestException("Only a B2C shortcode takes an initiator name and security credential");
+        }
+
         // Same one-default-per-type rule as create(), enforced here too since this
         // is the route "Make default" on an existing shortcode actually hits.
         // dto.type covers the (rare) case type is being changed in the same patch.

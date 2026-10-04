@@ -132,3 +132,58 @@ describe("TenantShortcodesService.registerC2bUrl", () => {
     expect(daraja.registerC2bUrl).not.toHaveBeenCalled();
   });
 });
+
+describe("TenantShortcodesService.update credential/type rules", () => {
+  let service: TenantShortcodesService;
+  let tx: { tenantShortcode: { findFirst: jest.Mock; update: jest.Mock; updateMany: jest.Mock } };
+
+  const B2C_ROW = { id: "sc-2", tenantId: "tenant-1", type: "B2C", shortcode: "600992", isDefault: false };
+
+  beforeEach(async () => {
+    tx = {
+      tenantShortcode: {
+        findFirst: jest.fn(),
+        update: jest.fn((args: { data: Record<string, unknown> }) => ({ ...B2C_ROW, ...args.data })),
+        updateMany: jest.fn(),
+      },
+    };
+    const prisma = { withTenantContext: jest.fn((_id: string, fn: (t: unknown) => unknown) => fn(tx)) };
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        TenantShortcodesService,
+        { provide: PrismaService, useValue: prisma },
+        { provide: DarajaClient, useValue: {} },
+        { provide: AuditLogService, useValue: { record: jest.fn() } },
+        { provide: CredentialsEncryptionService, useValue: { encrypt: (v: string) => `enc(${v})`, decrypt: (v: string) => v } },
+      ],
+    }).compile();
+    service = module.get(TenantShortcodesService);
+  });
+
+  it("stores new B2C credentials on a B2C shortcode", async () => {
+    tx.tenantShortcode.findFirst.mockResolvedValue(B2C_ROW);
+    const result = await service.update("tenant-1", "sc-2", { initiatorName: "testapi", securityCredential: "Ab3d==" }, user());
+
+    expect(tx.tenantShortcode.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ mpesaInitiatorName: "testapi", mpesaSecurityCredentialEncrypted: "enc(Ab3d==)" }),
+      }),
+    );
+    expect(result.payoutConfigured).toBe(true);
+  });
+
+  it("rejects a passkey sent to a B2C shortcode without writing anything", async () => {
+    tx.tenantShortcode.findFirst.mockResolvedValue(B2C_ROW);
+    await expect(service.update("tenant-1", "sc-2", { passkey: "pk" }, user())).rejects.toThrow(BadRequestException);
+    expect(tx.tenantShortcode.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects B2C credentials sent to a Paybill shortcode without writing anything", async () => {
+    tx.tenantShortcode.findFirst.mockResolvedValue(PAYBILL);
+    await expect(
+      service.update("tenant-1", "sc-1", { initiatorName: "testapi", securityCredential: "Ab3d==" }, user()),
+    ).rejects.toThrow(BadRequestException);
+    expect(tx.tenantShortcode.update).not.toHaveBeenCalled();
+  });
+});
