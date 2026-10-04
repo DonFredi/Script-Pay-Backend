@@ -162,6 +162,9 @@ avoid" below for why that verification matters here specifically):
   themselves.
 - `docs/database.md` — table-by-table Prisma schema reference and the
   Row-Level Security setup.
+- `docs/runbook.md` — operations runbook: what to do when a payout is
+  stuck, a payment is missing, Safaricom or the backend is down, or a
+  credential leaks. Business-owned gaps are marked `TODO(owner)`.
 - `docs/security.md` — consolidated security posture: auth, CSRF, rate
   limiting, secrets at rest, the webhook trust boundary, known gaps.
 
