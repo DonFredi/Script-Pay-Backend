@@ -1516,3 +1516,27 @@ the login email is the one address guaranteed to exist. Not returned by `GET /v1
 `"ScriptPay"` to `"ScriptPesa"` to match the 2026-10-02 product rename; the
 `X-ScriptPay-Signature` header on tenant webhooks is deliberately unchanged, since renaming it
 would break every tenant's signature verification.
+
+## 46. `braces` advisory closed by a Jest 29 → 30 bump; `fast-uri`/`brace-expansion` by `npm audit fix`
+
+**Problem**: CI's `npm audit --audit-level=high` step failed on both
+2026-10-02 pushes, first on two `fast-uri` advisories (GHSA-qw65-cvwx-89v3,
+GHSA-58mr-gqgx-xq4g, GHSA-hrr3-gc8f-f4qj; via `@nestjs/cli` → `@angular-devkit/core`
+→ `ajv`), and by 2026-10-04 also on `brace-expansion` (GHSA-q2hr-2g5m-vwhr,
+GHSA-qhr7-859c-m2p7, GHSA-6j4f-fj2g-mc7p) and `braces` (GHSA-vfj7-8cjw-p6xm),
+30 high in total once every dependent is counted. All four sit under
+dev-only tooling (Nest CLI, ESLint, Jest); none ships in the runtime image.
+
+**Chosen**: `npm audit fix` (non-breaking) moved `fast-uri` to 3.1.8 and
+`brace-expansion` to 1.1.21 / 5.0.12. `braces` has **no** patched release:
+the advisory covers every version, so neither an override nor a minor bump
+can close it. Its only path in was `jest@29` → `@jest/core` → `micromatch`
+→ `braces`. Jest 30 replaced `micromatch` with `picomatch`, so bumping
+`jest` to `^30.5.2` takes `braces` out of the tree completely. `ts-jest`
+29.4 already declares `jest ^29 || ^30` as a peer, and `@types/jest` was
+already on 30, so `jest.config.js` needed no change. Verified with the
+full CI sequence locally: `npm audit` 0 vulnerabilities, `tsc --noEmit`,
+eslint (0 errors), `jest --ci` (52 suites, 476 tests), `nest build`. The
+lockfile diff touches no runtime package version. The only non-dev change
+is `cjs-module-lexer@2.2.1` being hoisted out of `import-in-the-middle`'s
+nested `node_modules`, at the same version.
